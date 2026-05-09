@@ -133,6 +133,8 @@ def _app_dir() -> Path:
 
 def _repo_root() -> Path:
     """pyJianYingDraft 仓库根（内含 pyJianYingDraft 包与 readme_assets）。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", _app_dir()))
     here = _app_dir()
     if (here / "pyJianYingDraft" / "__init__.py").is_file():
         return here
@@ -144,6 +146,8 @@ def _repo_root() -> Path:
 
 def _ensure_local_pyjianyingdraft_on_path() -> None:
     """优先使用本仓库里的包，避免 site-packages 中旧版 wheel 缺少 IntroType 等导出。"""
+    if getattr(sys, "frozen", False):
+        return
     root = str(_repo_root())
     if root not in sys.path:
         sys.path.insert(0, root)
