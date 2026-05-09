@@ -1,7 +1,10 @@
 """草稿文件夹管理器"""
 
 import os
+import json
 import shutil
+import time
+import uuid
 
 from typing import List
 
@@ -84,11 +87,30 @@ class DraftFolder:
 
         # 创建草稿文件夹
         os.makedirs(draft_path)
-        shutil.copy(assets.get_asset_path("DRAFT_META_TEMPLATE"), os.path.join(draft_path, "draft_meta_info.json"))
+        meta_path = os.path.join(draft_path, "draft_meta_info.json")
+        shutil.copy(assets.get_asset_path("DRAFT_META_TEMPLATE"), meta_path)
 
         # 创建草稿文件
         script_file = ScriptFile(width, height, fps, maintrack_adsorb)
         script_file.save_path = os.path.join(draft_path, "draft_content.json")
+
+        # 为草稿生成唯一draft_id并尽可能补齐meta信息（即使某些版本会加密该文件）
+        draft_id = str(uuid.uuid4()).upper()
+        setattr(script_file, "draft_id", draft_id)
+        setattr(script_file, "draft_name", draft_name)
+        setattr(script_file, "tm_draft_create", int(time.time() * 1_000_000))
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            meta["draft_id"] = draft_id
+            meta["draft_name"] = draft_name
+            meta["draft_root_path"] = self.folder_path.replace("\\", "/")
+            meta["draft_fold_path"] = draft_path.replace("\\", "/")
+            meta["tm_duration"] = 0
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=4)
+        except Exception:
+            pass
 
         return script_file
 

@@ -1,6 +1,8 @@
 import os
 import json
 import math
+import time
+import uuid
 from copy import deepcopy
 
 from typing import Optional, Literal, Union, overload
@@ -206,6 +208,10 @@ class ScriptFile:
 
         with open(assets.get_asset_path('DRAFT_CONTENT_TEMPLATE'), "r", encoding="utf-8") as f:
             self.content = json.load(f)
+
+        # 为新草稿生成唯一ID与创建时间，避免多个草稿共享模板ID导致剪映/CapCut 侧索引冲突
+        self.content["id"] = str(uuid.uuid4()).upper()
+        self.content["create_time"] = int(time.time() * 1_000_000)
 
     @staticmethod
     def load_template(json_path: str) -> "ScriptFile":
@@ -824,3 +830,68 @@ class ScriptFile:
         if self.save_path is None:
             raise ValueError("没有设置保存路径, 可能不在模板模式下")
         self.dump(self.save_path)
+
+        # 尝试更新根目录的root_meta_info.json，以便剪映专业版在草稿列表中识别新草稿
+        # 仅在根索引文件存在时进行（不同版本/平台可能不存在）
+        try:
+            draft_folder = os.path.dirname(self.save_path)
+            root_folder = os.path.dirname(draft_folder)
+            root_meta_path = os.path.join(root_folder, "root_meta_info.json")
+            if not os.path.exists(root_meta_path):
+                return
+
+            with open(root_meta_path, "r", encoding="utf-8") as f:
+                root_meta = json.load(f)
+
+            all_store = root_meta.get("all_draft_store", [])
+            draft_fold_path_uri = draft_folder.replace("\\", "/")
+            root_path_uri = root_folder.replace("\\", "/")
+
+            # 组装/更新条目
+            now_us = int(time.time() * 1_000_000)
+            draft_id = getattr(self, "draft_id", None) or str(uuid.uuid4()).upper()
+            draft_name = getattr(self, "draft_name", os.path.basename(draft_folder))
+            entry = {
+                "draft_cloud_last_action_download": False,
+                "draft_cloud_purchase_info": "",
+                "draft_cloud_template_id": "",
+                "draft_cloud_tutorial_info": "",
+                "draft_cloud_videocut_purchase_info": "",
+                "draft_cover": f"{draft_fold_path_uri}\\draft_cover.jpg",
+                "draft_fold_path": draft_fold_path_uri,
+                "draft_id": draft_id,
+                "draft_is_ai_shorts": False,
+                "draft_is_invisible": False,
+                "draft_json_file": f"{draft_fold_path_uri}\\draft_content.json",
+                "draft_name": draft_name,
+                "draft_new_version": "",
+                "draft_root_path": root_path_uri,
+                "draft_timeline_materials_size": 0,
+                "draft_type": "",
+                "tm_draft_cloud_completed": "",
+                "tm_draft_cloud_modified": 0,
+                "tm_draft_create": getattr(self, "tm_draft_create", now_us),
+                "tm_draft_modified": now_us,
+                "tm_draft_removed": 0,
+                "tm_duration": int(self.duration),
+            }
+
+            updated = False
+            for i, old in enumerate(all_store):
+                if old.get("draft_fold_path") == draft_fold_path_uri:
+                    all_store[i] = {**old, **entry}
+                    updated = True
+                    break
+            if not updated:
+                all_store.append(entry)
+
+            root_meta["all_draft_store"] = all_store
+            root_meta.setdefault("root_path", root_path_uri)
+            root_meta.setdefault("draft_ids", len(all_store))
+            root_meta["draft_ids"] = len(all_store)
+
+            with open(root_meta_path, "w", encoding="utf-8") as f:
+                json.dump(root_meta, f, ensure_ascii=False)
+        except Exception:
+            # 索引更新失败不应影响草稿文件本身的保存
+            return
