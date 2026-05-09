@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: 当前文件（cwd=文件目录）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${fileDirname}",
+      "justMyCode": true
+    },
+    {
+      "name": "爆款智剪 draft_browser_app",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/draft_browser_app.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    }
+  ]
+}
