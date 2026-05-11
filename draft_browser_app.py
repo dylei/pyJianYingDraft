@@ -4,7 +4,7 @@
 片段可单独设置「导出用素材目录」；导出 MP4 前会先复制当前草稿为「父模板名_N」子草稿（挂在推断出的父模板下）、在子草稿上套素材再导出，不改动你选中的底稿文件夹。
 单个文件替换同样写入新子草稿。父子关系索引在 %LOCALAPPDATA%\\pyJianYingDraft_browser\\，草稿文件夹仍在剪映根目录下平铺。
 音频槽选视频时自动用 ffmpeg 抽音轨为 MP3。
-运行: pip install customtkinter Send2Trash && python draft_browser_app.py
+运行: pip install customtkinter Send2Trash requests && python draft_browser_app.py
 """
 
 from __future__ import annotations
@@ -772,11 +772,40 @@ def _open_containing_folder(path: str) -> None:
         pass
 
 
-def _find_jianying_pro_exe() -> Optional[str]:
-    """查找剪映专业版主程序路径（Windows 常见安装布局）。"""
-    if sys.platform != "win32":
+def _jianying_exe_pref_path() -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "jianying_exe_preference.json"
+
+
+def load_jianying_exe_preference() -> Optional[str]:
+    path = _jianying_exe_pref_path()
+    if not path.is_file():
         return None
-    found: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        exe = str((data or {}).get("exe") or "").strip()
+        return exe if exe else None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def save_jianying_exe_preference(exe: str) -> None:
+    path = _jianying_exe_pref_path()
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"exe": os.path.normpath(exe)}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def list_jianying_pro_installations() -> List[Tuple[str, str]]:
+    """枚举本机剪映专业版安装：(展示名, JianyingPro.exe 绝对路径)，按文件夹 mtime 新→旧。"""
+    if sys.platform != "win32":
+        return []
+    seen: set[str] = set()
+    rows: List[Tuple[str, str, float]] = []
     local = os.environ.get("LOCALAPPDATA", "")
     if local:
         apps_root = os.path.join(local, "JianyingPro", "Apps")
@@ -787,29 +816,167 @@ def _find_jianying_pro_exe() -> Optional[str]:
                     if not os.path.isdir(sub):
                         continue
                     exe = os.path.join(sub, "JianyingPro.exe")
-                    if os.path.isfile(exe):
-                        found.append(exe)
+                    if not os.path.isfile(exe):
+                        continue
+                    key = os.path.normcase(os.path.abspath(exe))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        mt = os.path.getmtime(exe)
+                    except OSError:
+                        mt = 0.0
+                    label = f"剪映 {name}" if (name or "").strip() else "剪映（Apps）"
+                    rows.append((label, os.path.abspath(exe), mt))
             except OSError:
                 pass
         flat = os.path.join(local, "JianyingPro", "JianyingPro.exe")
         if os.path.isfile(flat):
-            found.append(flat)
-    for envkey in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+            key = os.path.normcase(os.path.abspath(flat))
+            if key not in seen:
+                seen.add(key)
+                try:
+                    mt = os.path.getmtime(flat)
+                except OSError:
+                    mt = 0.0
+                rows.append(("剪映（本地单目录）", os.path.abspath(flat), mt))
+    for envkey, tag in (("PROGRAMFILES", "Program Files"), ("PROGRAMFILES(X86)", "Program Files (x86)")):
         base = os.environ.get(envkey, "")
         if not base:
             continue
         exe = os.path.join(base, "JianyingPro", "JianyingPro.exe")
-        if os.path.isfile(exe):
-            found.append(exe)
-    if not found:
+        if not os.path.isfile(exe):
+            continue
+        key = os.path.normcase(os.path.abspath(exe))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            mt = os.path.getmtime(exe)
+        except OSError:
+            mt = 0.0
+        rows.append((f"剪映（{tag}）", os.path.abspath(exe), mt))
+    rows.sort(key=lambda x: x[2], reverse=True)
+    return [(a, b) for a, b, _ in rows]
+
+
+def _find_jianying_pro_exe() -> Optional[str]:
+    """默认使用的剪映 exe：有有效「记住的版本」则用其，否则用最新修改时间的安装。"""
+    inst = list_jianying_pro_installations()
+    if not inst:
         return None
-    found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return found[0]
+    pref = load_jianying_exe_preference()
+    if pref:
+        pn = os.path.normcase(os.path.normpath(pref))
+        for _lb, ep in inst:
+            if os.path.normcase(os.path.normpath(ep)) == pn:
+                return ep
+    return inst[0][1]
 
 
-def launch_jianying_pro() -> bool:
+def show_jianying_install_picker(parent: Any, installs: List[Tuple[str, str]]) -> Optional[str]:
+    """多版本时弹出选择；确定返回 exe 路径，取消返回 None。依赖 CustomTkinter。"""
+    try:
+        import customtkinter as ctk_p
+    except ImportError:
+        return installs[0][1] if installs else None
+
+    from tkinter import IntVar
+
+    picked: List[Optional[str]] = [None]
+    win = ctk_p.CTkToplevel(parent)
+    win.title("选择剪映版本")
+    win.transient(parent)
+    win.resizable(False, False)
+    dlg_w, dlg_h = 420, min(120 + len(installs) * 44, 420)
+    win.geometry(f"{dlg_w}x{dlg_h}")
+
+    ctk_p.CTkLabel(
+        win,
+        text="检测到多个剪映安装，请选择用于「打开剪映 / 导出 MP4」的版本：",
+        wraplength=380,
+        font=ctk_p.CTkFont(size=12),
+        anchor="w",
+        justify="left",
+    ).pack(fill="x", padx=18, pady=(16, 10))
+
+    body = ctk_p.CTkScrollableFrame(win, height=min(len(installs) * 40 + 8, 220))
+    body.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+    var = IntVar(value=0)
+    pref = load_jianying_exe_preference()
+    for i, (_lb, ep) in enumerate(installs):
+        if pref and os.path.normcase(os.path.normpath(ep)) == os.path.normcase(os.path.normpath(pref)):
+            var.set(i)
+            break
+
+    for i, (lbl, ep) in enumerate(installs):
+        row = ctk_p.CTkFrame(body, fg_color="transparent")
+        row.pack(fill="x", pady=4)
+        ctk_p.CTkRadioButton(row, text=lbl, variable=var, value=i, font=ctk_p.CTkFont(size=12)).pack(anchor="w")
+        ctk_p.CTkLabel(row, text=ep, font=ctk_p.CTkFont(size=10), text_color=("gray40", "gray60"), anchor="w").pack(
+            fill="x", padx=(24, 0)
+        )
+
+    def on_ok() -> None:
+        i = int(var.get())
+        if 0 <= i < len(installs):
+            picked[0] = installs[i][1]
+        try:
+            win.grab_release()
+        except tk.TclError:
+            pass
+        win.destroy()
+
+    def on_cancel() -> None:
+        try:
+            win.grab_release()
+        except tk.TclError:
+            pass
+        win.destroy()
+
+    btn_row = ctk_p.CTkFrame(win, fg_color="transparent")
+    btn_row.pack(fill="x", padx=18, pady=(8, 14))
+    ctk_p.CTkButton(btn_row, text="取消", width=100, fg_color=("gray70", "gray38"), command=on_cancel).pack(
+        side="left", padx=(0, 8)
+    )
+    ctk_p.CTkButton(btn_row, text="确定", width=100, command=on_ok).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", on_cancel)
+    _center_toplevel_on_root(win, parent, dlg_w, dlg_h)
+    win.lift()
+    win.focus_force()
+    try:
+        win.grab_set()
+    except tk.TclError:
+        pass
+    parent.wait_window(win)
+    return picked[0]
+
+
+def ensure_jianying_exe_for_ui(parent: Any, *, force_dialog: bool = False) -> Optional[str]:
+    """主线程调用：解析要启动的 JianyingPro.exe；多版本时弹窗或沿用已保存选择。"""
+    inst = list_jianying_pro_installations()
+    if not inst:
+        return None
+    if len(inst) == 1:
+        save_jianying_exe_preference(inst[0][1])
+        return inst[0][1]
+    pref = load_jianying_exe_preference()
+    if not force_dialog and pref:
+        pn = os.path.normcase(os.path.normpath(pref))
+        for _lb, ep in inst:
+            if os.path.normcase(os.path.normpath(ep)) == pn:
+                return ep
+    choice = show_jianying_install_picker(parent, inst)
+    if choice:
+        save_jianying_exe_preference(choice)
+    return choice
+
+
+def launch_jianying_pro(exe_path: Optional[str] = None) -> bool:
     """启动本机剪映专业版；成功返回 True。"""
-    exe = _find_jianying_pro_exe()
+    exe = exe_path or _find_jianying_pro_exe()
     if not exe:
         return False
     try:
@@ -819,9 +986,9 @@ def launch_jianying_pro() -> bool:
         return False
 
 
-def start_jianying_pro_process() -> bool:
+def start_jianying_pro_process(exe_path: Optional[str] = None) -> bool:
     """用子进程启动剪映（便于在启动后继续等待窗口并自动化）；成功返回 True。"""
-    exe = _find_jianying_pro_exe()
+    exe = exe_path or _find_jianying_pro_exe()
     if not exe:
         return False
     try:
@@ -830,6 +997,25 @@ def start_jianying_pro_process() -> bool:
         return True
     except OSError:
         return False
+
+
+def wait_jianying_controller_or_launch_process(
+    *,
+    first_wait_s: float = 5.0,
+    after_launch_wait_s: float = 90.0,
+    exe_path: Optional[str] = None,
+) -> Any:
+    """先等待已运行的剪映窗口；若未找到（剪映未开）则拉起指定安装后再等到窗口可用。"""
+    _ensure_local_pyjianyingdraft_on_path()
+    from pyJianYingDraft.exceptions import AutomationError
+    from pyJianYingDraft.jianying_controller import wait_for_jianying_controller
+
+    try:
+        return wait_for_jianying_controller(timeout=first_wait_s, poll=0.4)
+    except AutomationError:
+        if not start_jianying_pro_process(exe_path):
+            raise AutomationError("无法启动剪映进程。")
+        return wait_for_jianying_controller(timeout=after_launch_wait_s, poll=0.5)
 
 
 def list_draft_folders(root: str) -> List[Tuple[str, float]]:
@@ -958,22 +1144,11 @@ def _pool_export_presets_store_path(draft_root: str) -> Path:
     return root / f"export_pool_presets_{digest}.json"
 
 
-def load_export_pool_presets(draft_root: str) -> Dict[str, Any]:
-    """按草稿根目录读取导出槽「素材目录」预设（多组命名配置）。"""
-    path = _pool_export_presets_store_path(draft_root)
-    if not path.is_file():
-        return {"version": 1, "draft_root": _normalized_draft_root_key(draft_root), "presets": {}}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {"version": 1, "draft_root": _normalized_draft_root_key(draft_root), "presets": {}}
-    if not isinstance(data, dict):
-        return {"version": 1, "draft_root": _normalized_draft_root_key(draft_root), "presets": {}}
-    raw = data.get("presets")
+def _clean_export_pool_presets_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """规范化预设名 -> { segment_export_pool, export_pool_sequential_cursor }。"""
     if not isinstance(raw, dict):
-        raw = {}
-    clean: Dict[str, Any] = {}
+        return {}
+    clean: Dict[str, Dict[str, Any]] = {}
     for pname, blob in raw.items():
         name = str(pname).strip()
         if not name or name == POOL_EXPORT_PRESET_KEEP:
@@ -1002,24 +1177,184 @@ def load_export_pool_presets(draft_root: str) -> Dict[str, Any]:
                 except (TypeError, ValueError):
                     cur[str(ck)] = 0
         clean[name] = {"segment_export_pool": seg, "export_pool_sequential_cursor": cur}
-    return {"version": 1, "draft_root": _normalized_draft_root_key(draft_root), "presets": clean}
+    return clean
 
 
-def save_export_pool_presets(draft_root: str, data: Dict[str, Any]) -> None:
+def _merge_export_pool_preset_dicts(a: Dict[str, Dict[str, Any]], b: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out = dict(a)
+    out.update(b)
+    return out
+
+
+def _filter_export_pool_preset_blob_for_draft(blob: Dict[str, Any], draft_name: str) -> Dict[str, Any]:
+    """只保留 segment 键属于指定草稿文件夹名的条目（键前缀为 draft_name + NUL）。"""
+    dn = (draft_name or "").strip()
+    if not dn:
+        return {"segment_export_pool": {}, "export_pool_sequential_cursor": {}}
+    prefix = dn + "\0"
+    seg_in = blob.get("segment_export_pool") or {}
+    cur_in = blob.get("export_pool_sequential_cursor") or {}
+    seg: Dict[str, Any] = {}
+    if isinstance(seg_in, dict):
+        for k, v in seg_in.items():
+            if isinstance(k, str) and k.startswith(prefix) and isinstance(v, dict):
+                seg[k] = dict(v)
+    cur: Dict[str, Any] = {}
+    if isinstance(cur_in, dict):
+        for k, v in cur_in.items():
+            if isinstance(k, str) and k.startswith(prefix):
+                try:
+                    cur[k] = int(v)
+                except (TypeError, ValueError):
+                    cur[k] = 0
+    return {"segment_export_pool": seg, "export_pool_sequential_cursor": cur}
+
+
+def load_export_pool_store(draft_root: str) -> Dict[str, Any]:
+    """读取槽位预设存储：v2 按草稿文件夹分桶；兼容 v1 顶层 presets 为 legacy_presets。"""
+    rk = _normalized_draft_root_key(draft_root)
     path = _pool_export_presets_store_path(draft_root)
-    presets = data.get("presets")
-    if not isinstance(presets, dict):
-        presets = {}
+    if not path.is_file():
+        return {"version": 2, "draft_root": rk, "legacy_presets": {}, "by_draft": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {"version": 2, "draft_root": rk, "legacy_presets": {}, "by_draft": {}}
+    if not isinstance(data, dict):
+        return {"version": 2, "draft_root": rk, "legacy_presets": {}, "by_draft": {}}
+
+    by_draft: Dict[str, Any] = {}
+    raw_bd = data.get("by_draft")
+    if isinstance(raw_bd, dict):
+        for dn, bucket in raw_bd.items():
+            dname = str(dn).strip()
+            if not dname:
+                continue
+            if not isinstance(bucket, dict):
+                continue
+            presets_raw = bucket.get("presets")
+            clean_pr = _clean_export_pool_presets_dict(presets_raw if isinstance(presets_raw, dict) else {})
+            lp = bucket.get("last_preset")
+            if not isinstance(lp, str) or not lp.strip():
+                lp = POOL_EXPORT_PRESET_KEEP
+            by_draft[dname] = {"presets": clean_pr, "last_preset": lp}
+
+    legacy = _clean_export_pool_presets_dict(data.get("legacy_presets") if isinstance(data.get("legacy_presets"), dict) else {})
+    top_presets = data.get("presets")
+    if isinstance(top_presets, dict):
+        legacy = _merge_export_pool_preset_dicts(legacy, _clean_export_pool_presets_dict(top_presets))
+
+    return {"version": 2, "draft_root": rk, "legacy_presets": legacy, "by_draft": by_draft}
+
+
+def save_export_pool_store(draft_root: str, data: Dict[str, Any]) -> None:
+    path = _pool_export_presets_store_path(draft_root)
+    rk = _normalized_draft_root_key(draft_root)
+    by_in = data.get("by_draft")
+    if not isinstance(by_in, dict):
+        by_in = {}
+    leg_in = data.get("legacy_presets")
+    if not isinstance(leg_in, dict):
+        leg_in = {}
+    out_by: Dict[str, Any] = {}
+    for dn, bucket in by_in.items():
+        dname = str(dn).strip()
+        if not dname:
+            continue
+        if not isinstance(bucket, dict):
+            continue
+        pr = _clean_export_pool_presets_dict(bucket.get("presets") if isinstance(bucket.get("presets"), dict) else {})
+        lp = bucket.get("last_preset")
+        if not isinstance(lp, str) or not lp.strip():
+            lp = POOL_EXPORT_PRESET_KEEP
+        out_by[dname] = {"presets": pr, "last_preset": lp}
     payload = {
-        "version": 1,
-        "draft_root": _normalized_draft_root_key(draft_root),
-        "presets": presets,
+        "version": 2,
+        "draft_root": rk,
+        "legacy_presets": _clean_export_pool_presets_dict(leg_in),
+        "by_draft": out_by,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def _export_pool_by_draft_bucket_mut(store: Dict[str, Any], draft_folder_name: str) -> Dict[str, Any]:
+    bd = store.setdefault("by_draft", {})
+    if not isinstance(bd, dict):
+        store["by_draft"] = {}
+        bd = store["by_draft"]
+    b = bd.setdefault(draft_folder_name, {})
+    if not isinstance(b, dict):
+        b = {}
+        bd[draft_folder_name] = b
+    pr = b.setdefault("presets", {})
+    if not isinstance(pr, dict):
+        b["presets"] = {}
+    if "last_preset" not in b or not isinstance(b.get("last_preset"), str):
+        b["last_preset"] = POOL_EXPORT_PRESET_KEEP
+    return b
+
+
+def export_pool_preset_names_for_draft(draft_root: str, draft_folder_name: str) -> List[str]:
+    """当前草稿可选预设名：本稿保存的；旧版全局预设仅当其中含本稿槽位键时才出现（避免每个草稿都看到同一批名字）。"""
+    if not draft_root or not os.path.isdir(draft_root):
+        return []
+    store = load_export_pool_store(draft_root)
+    names: set[str] = set()
+    dn = (draft_folder_name or "").strip()
+    if dn:
+        b = (store.get("by_draft") or {}).get(dn) or {}
+        pr = b.get("presets") if isinstance(b, dict) else None
+        if isinstance(pr, dict):
+            names.update(k for k in pr if isinstance(k, str) and k.strip() and k != POOL_EXPORT_PRESET_KEEP)
+    leg = store.get("legacy_presets") or {}
+    if isinstance(leg, dict) and dn:
+        for k, lb in leg.items():
+            if not isinstance(k, str) or not k.strip() or k == POOL_EXPORT_PRESET_KEEP:
+                continue
+            if not isinstance(lb, dict):
+                continue
+            filtered = _filter_export_pool_preset_blob_for_draft(lb, dn)
+            if filtered.get("segment_export_pool"):
+                names.add(k)
+    return sorted(names)
+
+
+def get_export_pool_preset_blob_for_draft(draft_root: str, draft_folder_name: str, choice: str) -> Optional[Dict[str, Any]]:
+    """取某草稿下要应用的预设数据；本稿优先，其次 legacy 中按草稿名过滤后的条目。"""
+    if not choice or choice == POOL_EXPORT_PRESET_KEEP:
+        return None
+    dn = (draft_folder_name or "").strip()
+    if not dn or not draft_root or not os.path.isdir(draft_root):
+        return None
+    store = load_export_pool_store(draft_root)
+    b = (store.get("by_draft") or {}).get(dn) or {}
+    pr = b.get("presets") if isinstance(b, dict) else None
+    blob = pr.get(choice) if isinstance(pr, dict) else None
+    if isinstance(blob, dict) and blob.get("segment_export_pool"):
+        return blob
+    leg = store.get("legacy_presets") or {}
+    lb = leg.get(choice) if isinstance(leg, dict) else None
+    if not isinstance(lb, dict):
+        return None
+    filtered = _filter_export_pool_preset_blob_for_draft(lb, dn)
+    if not (filtered.get("segment_export_pool") or {}):
+        return None
+    return filtered
+
+
+def persist_export_pool_last_preset_choice(draft_root: str, draft_folder_name: str, choice: str) -> None:
+    dn = (draft_folder_name or "").strip()
+    if not dn or not draft_root or not os.path.isdir(draft_root):
+        return
+    store = load_export_pool_store(draft_root)
+    b = _export_pool_by_draft_bucket_mut(store, dn)
+    b["last_preset"] = choice
+    save_export_pool_store(draft_root, store)
 
 
 def prune_draft_families(draft_root: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1759,11 +2094,207 @@ def run_app() -> None:
     root.update_idletasks()
     _center_window_on_screen(root, win_w, win_h)
 
+    _ensure_local_pyjianyingdraft_on_path()
+    auth_client: Any = None
+    _auth_api_error_message: Any = None
+    try:
+        from shared.browser_auth_client import BrowserAuthClient as _BAC
+        from shared.browser_auth_client import auth_api_error_message as _auth_api_error_message
+
+        auth_client = _BAC()
+    except ImportError:
+        auth_client = None
+        _auth_api_error_message = None
+
+    top_bar = ctk.CTkFrame(root, fg_color="transparent")
+    top_bar.pack(fill="x", padx=12, pady=(8, 0))
+    auth_status_var = ctk.StringVar(value="未登录（导出 MP4 需登录）")
+
+    def open_auth_dialog(*, mandatory: bool = False) -> bool:
+        """打开登录对话框。mandatory=True 时模态阻塞，主窗在背后且无法操作；取消或关窗返回 False。成功登录返回 True。"""
+        from tkinter import messagebox
+
+        if not auth_client:
+            messagebox.showerror("登录", "认证模块不可用（请从仓库根目录运行，并 pip install requests）。")
+            return False
+        win = ctk.CTkToplevel(root)
+        win.title("登录 - 爆款智剪" if mandatory else "登录 / 注册")
+        win.transient(root)
+        win.resizable(False, False)
+        dlg_w, dlg_h = 400, 380 if mandatory else 360
+        win.geometry(f"{dlg_w}x{dlg_h}")
+        mode_var = ctk.StringVar(value="login")
+
+        ctk.CTkLabel(win, text="账号", anchor="w").pack(fill="x", padx=20, pady=(18, 4))
+        user_e = ctk.CTkEntry(win, placeholder_text="用户名", height=34)
+        user_e.pack(fill="x", padx=20)
+        ctk.CTkLabel(win, text="密码", anchor="w").pack(fill="x", padx=20, pady=(12, 4))
+        pwd_e = ctk.CTkEntry(win, placeholder_text="密码", height=34, show="*")
+        pwd_e.pack(fill="x", padx=20)
+        remember_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(win, text="记住账号密码（本地加密存储）", variable=remember_var).pack(anchor="w", padx=20, pady=(14, 8))
+        hint = ctk.CTkLabel(win, text="", text_color=("gray40", "gray65"), font=ctk.CTkFont(size=11))
+        hint.pack(pady=(0, 6))
+
+        def apply_mode() -> None:
+            m = mode_var.get()
+            hint.configure(text="使用 leiyuantech 账号登录" if m == "login" else "注册新账号（成功后自动登录）")
+
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(4, 0))
+        ctk.CTkRadioButton(row, text="登录", variable=mode_var, value="login", command=apply_mode).pack(
+            side="left", padx=(0, 16)
+        )
+        ctk.CTkRadioButton(row, text="注册", variable=mode_var, value="register", command=apply_mode).pack(side="left")
+        apply_mode()
+
+        su, sp = auth_client.load_credentials()
+        if su:
+            user_e.insert(0, su)
+        if sp:
+            pwd_e.insert(0, sp)
+
+        def _release_grab() -> None:
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+
+        def on_cancel_mandatory() -> None:
+            _release_grab()
+            win.destroy()
+
+        if mandatory:
+
+            def on_wm_close() -> None:
+                on_cancel_mandatory()
+
+            win.protocol("WM_DELETE_WINDOW", on_wm_close)
+        else:
+
+            def on_wm_close_optional() -> None:
+                _release_grab()
+                win.destroy()
+
+            win.protocol("WM_DELETE_WINDOW", on_wm_close_optional)
+
+        def do_action() -> None:
+            u = user_e.get().strip()
+            p = pwd_e.get()
+            if not u or not p:
+                messagebox.showwarning("登录", "请输入用户名和密码。", parent=win)
+                return
+            if mode_var.get() == "login":
+                res = auth_client.login(u, p)
+            else:
+                res = auth_client.register(u, p)
+            if res is None:
+                messagebox.showerror("登录", "无法连接服务器或无响应。", parent=win)
+                return
+            if isinstance(res, dict) and res.get("user_id") is not None:
+                auth_client.user_id = res.get("user_id")
+                auth_client.username = res.get("username") or u
+                auth_client.gold_beans = res.get("gold_beans")
+                auth_client.load_gold_config()
+                if remember_var.get():
+                    auth_client.save_credentials(u, p)
+                else:
+                    auth_client.clear_credentials()
+                refresh_auth_bar()
+                if mandatory:
+                    _release_grab()
+                win.destroy()
+                return
+            em = _auth_api_error_message(res) if _auth_api_error_message else None
+            messagebox.showerror("登录", em or str((res or {}).get("error") or "登录失败"), parent=win)
+
+        if mandatory:
+            tip = ctk.CTkLabel(
+                win,
+                text="须登录后才能使用本程序。点「取消」将退出。",
+                text_color=("gray35", "gray60"),
+                font=ctk.CTkFont(size=11),
+                wraplength=360,
+            )
+            tip.pack(fill="x", padx=20, pady=(0, 4))
+            btn_row = ctk.CTkFrame(win, fg_color="transparent")
+            btn_row.pack(fill="x", padx=20, pady=(12, 14))
+            ctk.CTkButton(btn_row, text="取消", height=36, fg_color=("gray70", "gray38"), command=on_cancel_mandatory).pack(
+                side="left", expand=True, fill="x", padx=(0, 8)
+            )
+            ctk.CTkButton(btn_row, text="确定", height=36, command=do_action).pack(side="right", expand=True, fill="x")
+        else:
+            ctk.CTkButton(win, text="确定", height=36, command=do_action).pack(fill="x", padx=20, pady=(16, 12))
+
+        _center_toplevel_on_root(win, root, dlg_w, dlg_h)
+        root.lift()
+        win.lift()
+        win.focus_force()
+        win.attributes("-topmost", True)
+        win.after(150, lambda: win.attributes("-topmost", False))
+        if mandatory:
+            try:
+                win.grab_set()
+            except tk.TclError:
+                pass
+            root.wait_window(win)
+            return bool(auth_client.user_id)
+        return False
+
+    def on_refresh_gold() -> None:
+        from tkinter import messagebox
+
+        if not auth_client or not auth_client.user_id:
+            messagebox.showinfo("豆子", "请先登录。")
+            return
+        r = auth_client.ping_gold_beans()
+        em = _auth_api_error_message(r) if _auth_api_error_message else None
+        if em:
+            messagebox.showerror("豆子", em)
+        else:
+            refresh_auth_bar()
+
+    def on_login_toggle() -> None:
+        if not auth_client:
+            open_auth_dialog(mandatory=False)
+            return
+        if auth_client.user_id:
+            auth_client.user_id = None
+            auth_client.username = None
+            auth_client.gold_beans = None
+            refresh_auth_bar()
+        else:
+            open_auth_dialog(mandatory=False)
+
+    auth_lbl = ctk.CTkLabel(top_bar, textvariable=auth_status_var, font=ctk.CTkFont(size=12), anchor="w")
+    auth_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8))
+    ctk.CTkButton(top_bar, text="刷新豆子", width=88, height=28, command=on_refresh_gold).pack(side="right", padx=(4, 0))
+    login_btn = ctk.CTkButton(top_bar, text="登录", width=88, height=28, command=on_login_toggle)
+    login_btn.pack(side="right")
+
+    def refresh_auth_bar() -> None:
+        if not auth_client:
+            auth_status_var.set("认证未加载（请安装 requests 并从仓库根目录运行）")
+            try:
+                login_btn.configure(text="登录")
+            except tk.TclError:
+                pass
+            return
+        if auth_client.user_id:
+            u = auth_client.username or ""
+            g = auth_client.gold_beans
+            gtxt = str(g) if g is not None else "—"
+            auth_status_var.set(f"已登录: {u}  |  豆子: {gtxt}")
+            login_btn.configure(text="退出登录")
+        else:
+            auth_status_var.set("未登录（导出 MP4 需登录）")
+            login_btn.configure(text="登录")
+
     draft_root = ctk.StringVar(value=_default_draft_roots()[0] if _default_draft_roots() else "")
     selected_name: Optional[str] = None
 
     main = ctk.CTkFrame(root, fg_color="transparent")
-    main.pack(fill="both", expand=True, padx=12, pady=12)
+    main.pack(fill="both", expand=True, padx=12, pady=(4, 12))
 
     left = ctk.CTkFrame(main, width=280, corner_radius=12)
     left.pack(side="left", fill="y", padx=(0, 10))
@@ -2362,22 +2893,17 @@ def run_app() -> None:
     preset_toolbar = ctk.CTkFrame(preset_toolbar_host, fg_color="transparent")
     preset_toolbar.pack(anchor="ne")
 
-    def _export_pool_preset_name_list(base_s: str) -> List[str]:
-        if not base_s or not os.path.isdir(base_s):
-            return []
-        data = load_export_pool_presets(base_s)
-        pr = data.get("presets") or {}
-        if not isinstance(pr, dict):
-            return []
-        return sorted(k for k in pr if isinstance(k, str) and k.strip() and k != POOL_EXPORT_PRESET_KEEP)
+    def _export_pool_preset_name_list(base_s: str, draft_folder_name: str) -> List[str]:
+        return export_pool_preset_names_for_draft(base_s, draft_folder_name)
 
     def _apply_export_pool_preset_choice(choice: str) -> None:
         base_s = draft_root.get().strip()
+        dn = (selected_name or "").strip()
         if choice == POOL_EXPORT_PRESET_KEEP:
             replace_state["segment_export_pool"] = {}
             replace_state["export_pool_sequential_cursor"] = {}
         else:
-            blob = ((load_export_pool_presets(base_s).get("presets") or {}) if base_s else {}).get(choice)
+            blob = get_export_pool_preset_blob_for_draft(base_s, dn, choice) if base_s and dn else None
             if not isinstance(blob, dict):
                 replace_state["segment_export_pool"] = {}
                 replace_state["export_pool_sequential_cursor"] = {}
@@ -2407,10 +2933,11 @@ def run_app() -> None:
         if pool_preset_suppress["v"]:
             return
         _apply_export_pool_preset_choice(choice)
+        persist_export_pool_last_preset_choice(draft_root.get().strip(), (selected_name or "").strip(), choice)
 
     ctk.CTkLabel(
         preset_toolbar,
-        text="槽位预设",
+        text="槽位预设（按草稿）",
         font=ctk.CTkFont(size=11),
         anchor="w",
         text_color=("gray30", "gray70"),
@@ -2428,7 +2955,8 @@ def run_app() -> None:
 
     def refresh_export_pool_preset_bar(*, reset_memory: bool = False) -> None:
         base_s = draft_root.get().strip()
-        names = _export_pool_preset_name_list(base_s)
+        dn = (selected_name or "").strip()
+        names = _export_pool_preset_name_list(base_s, dn)
         vals = [POOL_EXPORT_PRESET_KEEP] + names
         pool_preset_suppress["v"] = True
         try:
@@ -2439,6 +2967,29 @@ def run_app() -> None:
             pool_preset_suppress["v"] = False
         if reset_memory or not base_s or not os.path.isdir(base_s):
             _apply_export_pool_preset_choice(POOL_EXPORT_PRESET_KEEP)
+
+    def sync_export_pool_preset_for_draft(draft_folder_name: str) -> None:
+        """切换草稿后：按该稿记录恢复下拉项与上次选用的预设。"""
+        base_s = draft_root.get().strip()
+        if not base_s or not os.path.isdir(base_s):
+            return
+        dn = (draft_folder_name or "").strip()
+        if not dn:
+            return
+        names = export_pool_preset_names_for_draft(base_s, dn)
+        vals = [POOL_EXPORT_PRESET_KEEP] + names
+        store = load_export_pool_store(base_s)
+        b = (store.get("by_draft") or {}).get(dn) or {}
+        last = b.get("last_preset") if isinstance(b, dict) else None
+        if not isinstance(last, str) or last.strip() not in vals:
+            last = POOL_EXPORT_PRESET_KEEP
+        pool_preset_suppress["v"] = True
+        try:
+            pool_preset_menu.configure(values=vals)
+            pool_preset_var.set(last)
+        finally:
+            pool_preset_suppress["v"] = False
+        _apply_export_pool_preset_choice(last)
 
     def on_save_export_pool_preset() -> None:
         from customtkinter import CTkInputDialog
@@ -2480,6 +3031,10 @@ def run_app() -> None:
         if re.search(r'[<>:"/\\|?*]', name):
             messagebox.showwarning("名称无效", "预设名不能包含下列字符：< > : \" / \\ | ? *")
             return
+        dn = (selected_name or "").strip()
+        if not dn:
+            messagebox.showwarning("无法保存", "请先在左侧列表中选择一个草稿。")
+            return
         seg = replace_state.get("segment_export_pool") or {}
         if not isinstance(seg, dict) or not seg:
             messagebox.showinfo(
@@ -2487,13 +3042,14 @@ def run_app() -> None:
                 "当前没有可保存的「素材目录」槽位配置。\n请在「替换素材…」弹窗中选择「素材目录」并为至少一个片段指定目录后再保存。",
             )
             return
-        data = load_export_pool_presets(base_s)
-        presets = data.setdefault("presets", {})
+        store = load_export_pool_store(base_s)
+        bucket = _export_pool_by_draft_bucket_mut(store, dn)
+        presets = bucket.setdefault("presets", {})
         if not isinstance(presets, dict):
-            presets = {}
-            data["presets"] = presets
+            bucket["presets"] = {}
+            presets = bucket["presets"]
         if name in presets:
-            if not messagebox.askyesno("覆盖预设", f"已存在预设「{name}」，是否覆盖？"):
+            if not messagebox.askyesno("覆盖预设", f"当前草稿下已存在预设「{name}」，是否覆盖？"):
                 return
         cur = replace_state.get("export_pool_sequential_cursor") or {}
         cur_out: Dict[str, int] = {}
@@ -2507,7 +3063,8 @@ def run_app() -> None:
             "segment_export_pool": _segment_export_pool_for_preset_disk(dict(seg)),
             "export_pool_sequential_cursor": cur_out,
         }
-        save_export_pool_presets(base_s, data)
+        bucket["last_preset"] = name
+        save_export_pool_store(base_s, store)
         refresh_export_pool_preset_bar(reset_memory=False)
         pool_preset_suppress["v"] = True
         try:
@@ -2526,13 +3083,36 @@ def run_app() -> None:
         if cur == POOL_EXPORT_PRESET_KEEP:
             messagebox.showinfo("删除预设", "请先在列表中选择一个已保存的预设（非「保持原样」）。")
             return
+        dn = (selected_name or "").strip()
+        if not dn:
+            messagebox.showwarning("无法删除", "请先在左侧列表中选择一个草稿。")
+            return
         if not messagebox.askyesno("删除预设", f"确定删除预设「{cur}」吗？\n（仅删除本地保存的配置，不影响草稿文件）"):
             return
-        data = load_export_pool_presets(base_s)
-        pr = data.setdefault("presets", {})
-        if isinstance(pr, dict):
+        store = load_export_pool_store(base_s)
+        removed = False
+        b = (store.get("by_draft") or {}).get(dn) or {}
+        pr = b.get("presets") if isinstance(b, dict) else None
+        if isinstance(pr, dict) and cur in pr:
             pr.pop(cur, None)
-        save_export_pool_presets(base_s, data)
+            removed = True
+        if not removed:
+            leg = store.get("legacy_presets") or {}
+            if isinstance(leg, dict) and cur in leg:
+                if not messagebox.askyesno(
+                    "删除旧版全局预设",
+                    f"「{cur}」来自旧版全局列表（所有草稿共用）。删除后所有草稿的下拉菜单中都不再显示该项。\n\n确定删除？",
+                ):
+                    return
+                leg.pop(cur, None)
+                removed = True
+        if removed:
+            bkt = _export_pool_by_draft_bucket_mut(store, dn)
+            bkt["last_preset"] = POOL_EXPORT_PRESET_KEEP
+            save_export_pool_store(base_s, store)
+        else:
+            messagebox.showinfo("删除预设", "未找到可删除的预设（可能已被删除）。")
+            return
         refresh_export_pool_preset_bar(reset_memory=False)
         pool_preset_suppress["v"] = True
         try:
@@ -2565,15 +3145,16 @@ def run_app() -> None:
     export_row = ctk.CTkFrame(bottom_actions, fg_color="transparent")
     export_row.pack(fill="x", pady=(0, 0))
 
-    export_actions = ctk.CTkFrame(export_row, fg_color="transparent")
-    export_actions.pack(side="right")
+    export_jianying_cell = ctk.CTkFrame(export_row, fg_color="transparent")
+    export_jianying_cell.pack(side="left", anchor="n", padx=(0, 28))
 
-    jianying_row = ctk.CTkFrame(bottom_actions, fg_color="transparent")
-    jianying_row.pack(fill="x", pady=(8, 0))
+    export_actions = ctk.CTkFrame(export_row, fg_color="transparent")
+    export_actions.pack(side="right", anchor="n")
 
     backup_before_export = ctk.BooleanVar(value=False)
     export_repeat_var = ctk.StringVar(value="1")
     export_name_prefix_var = ctk.StringVar(value="video_")
+    _export_busy_widgets: List[Any] = []
 
     def on_export_mp4() -> None:
         from tkinter import filedialog, messagebox
@@ -2642,14 +3223,48 @@ def run_app() -> None:
                 messagebox.showerror("备份失败", f"无法复制明文草稿（将中止导出，以免丢失可编辑副本）：\n{e}")
                 return
 
-        export_btn.configure(state="disabled")
+        jianying_exe_pick = ensure_jianying_exe_for_ui(root)
+        if not jianying_exe_pick:
+            if not list_jianying_pro_installations():
+                messagebox.showerror(
+                    "未找到剪映",
+                    "未在常见安装路径找到剪映专业版（JianyingPro.exe）。\n"
+                    "请确认已安装剪映专业版。",
+                )
+            else:
+                messagebox.showinfo("导出", "已取消选择剪映版本。")
+            return
+
+        if not auth_client or not getattr(auth_client, "user_id", None):
+            messagebox.showwarning("请先登录", "导出 MP4 需要登录账号。\n请点击窗口顶部「登录」。")
+            return
+        unit = int(auth_client.get_gold_cost("导出为MP4", default_cost=1))
+        total_cost = unit * n_export
+        if not messagebox.askyesno("豆子确认", f"将扣除 {total_cost} 豆子。"):
+            return
+        deduct_res = auth_client.record_operation(
+            "导出为MP4",
+            -total_cost,
+            {"draft_name": name, "export_count": n_export, "name_prefix": preview_prefix},
+        )
+        err_deduct = _auth_api_error_message(deduct_res) if _auth_api_error_message else None
+        if err_deduct:
+            messagebox.showerror("扣减豆子失败", err_deduct)
+            return
+        refresh_auth_bar()
+
+        for _bw in _export_busy_widgets:
+            try:
+                _bw.configure(state="disabled")
+            except tk.TclError:
+                pass
 
         def worker() -> None:
             err: Optional[Exception] = None
             try:
-                from pyJianYingDraft import DraftFolder, ExportFramerate, ExportResolution, JianyingController
+                from pyJianYingDraft import DraftFolder, ExportFramerate, ExportResolution
 
-                ctrl = JianyingController()
+                ctrl = wait_jianying_controller_or_launch_process(exe_path=jianying_exe_pick)
                 df = DraftFolder(base)
                 need_refresh = False
                 last_child: Optional[str] = None
@@ -2702,7 +3317,11 @@ def run_app() -> None:
                 err = e
 
             def finish() -> None:
-                export_btn.configure(state="normal")
+                for _bw in _export_busy_widgets:
+                    try:
+                        _bw.configure(state="normal")
+                    except tk.TclError:
+                        pass
                 if err is not None:
                     messagebox.showerror("导出失败", str(err))
                 else:
@@ -2760,6 +3379,137 @@ def run_app() -> None:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_generate_child_drafts() -> None:
+        """按「条数」仅复制底稿为子草稿并套用槽位目录，不选导出目录、不导出 MP4。"""
+        from tkinter import messagebox
+
+        name = selected_name
+        if not name:
+            messagebox.showwarning("未选择草稿", "请先在左侧列表中点击要作为模板的草稿。")
+            return
+
+        base = draft_root.get().strip()
+        if not base or not os.path.isdir(base):
+            messagebox.showerror("无法生成", "草稿根目录无效。")
+            return
+
+        content_json = os.path.join(base, name, "draft_content.json")
+        if _file_exists_nonempty(content_json) and _looks_like_jianying_encrypted(content_json):
+            if not messagebox.askyesno(
+                "可能已是密文",
+                "当前草稿的 draft_content.json 看起来已被剪映加密，复制后子稿可能无法在时间轴中编辑。\n\n是否仍要继续生成子草稿？",
+            ):
+                return
+
+        raw_n = export_repeat_var.get().strip()
+        if not raw_n:
+            n_gen = 1
+        else:
+            try:
+                n_gen = int(raw_n)
+            except ValueError:
+                messagebox.showwarning("条数无效", "生成条数请填写正整数（留空为 1）。")
+                return
+        if n_gen < 1:
+            messagebox.showwarning("条数无效", "至少生成 1 条。")
+            return
+        if n_gen > 200:
+            messagebox.showwarning("条数过大", "单次最多生成 200 个子草稿，请改小后重试。")
+            return
+
+        if not auth_client or not getattr(auth_client, "user_id", None):
+            messagebox.showwarning("请先登录", "生成子草稿需要登录账号。")
+            return
+        unit = int(auth_client.get_gold_cost("生成草稿", default_cost=1))
+        total_cost = unit * n_gen
+        if not messagebox.askyesno("豆子确认", f"将扣除 {total_cost} 豆子。"):
+            return
+        deduct_res = auth_client.record_operation(
+            "生成草稿",
+            -total_cost,
+            {"draft_name": name, "child_count": n_gen},
+        )
+        err_deduct = _auth_api_error_message(deduct_res) if _auth_api_error_message else None
+        if err_deduct:
+            messagebox.showerror("扣减豆子失败", err_deduct)
+            return
+        refresh_auth_bar()
+
+        for _bw in _export_busy_widgets:
+            try:
+                _bw.configure(state="disabled")
+            except tk.TclError:
+                pass
+
+        def worker_gen() -> None:
+            err: Optional[Exception] = None
+            created: List[str] = []
+            try:
+                from pyJianYingDraft import DraftFolder
+
+                df = DraftFolder(base)
+                for _i in range(n_gen):
+                    lineage_parent = resolve_lineage_parent_for_nested_draft(base, name)
+                    child_name = _next_generated_child_name(base, lineage_parent)
+                    df.duplicate_as_template(name, child_name, allow_replace=False)
+                    content_json_c = os.path.join(base, child_name, "draft_content.json")
+                    seg_pool: Dict[str, Dict[str, Any]] = dict(replace_state.get("segment_export_pool") or {})
+                    remapped_pool = remap_draft_keyed_map(seg_pool, name, child_name)
+                    raw_cur = remap_draft_keyed_map(
+                        replace_state.get("export_pool_sequential_cursor") or {}, name, child_name
+                    )
+                    cursor_ints: Dict[str, int] = {}
+                    for k, v in raw_cur.items():
+                        try:
+                            cursor_ints[k] = int(v)
+                        except (TypeError, ValueError):
+                            cursor_ints[k] = 0
+                    ok_n, _sk, pool_errs, exp_n = apply_per_segment_export_pools_to_draft(
+                        content_json_c,
+                        child_name,
+                        remapped_pool,
+                        cursor_ints,
+                    )
+                    if exp_n > 0:
+                        if ok_n == 0:
+                            if pool_errs:
+                                raise RuntimeError("从目录套素材失败：\n" + "\n".join(pool_errs[:12]))
+                            raise RuntimeError(
+                                "已有片段配置了导出素材目录，但未能替换任何槽。"
+                                "请确认明文草稿，且各片段对应目录内有与槽类型匹配后缀的素材。"
+                            )
+                        if pool_errs:
+                            raise RuntimeError("从目录套素材失败：\n" + "\n".join(pool_errs[:12]))
+                    register_child_draft(base, lineage_parent, child_name)
+                    merge_remapped_pool_and_cursor_into_replace_state(replace_state, remapped_pool, cursor_ints)
+                    created.append(child_name)
+                if created:
+                    last_child = created[-1]
+                    root.after(0, refresh_list)
+                    root.after(0, lambda c=last_child: show_draft(c))
+            except Exception as e:
+                err = e
+
+            def finish_gen() -> None:
+                for _bw in _export_busy_widgets:
+                    try:
+                        _bw.configure(state="normal")
+                    except tk.TclError:
+                        pass
+                if err is not None:
+                    messagebox.showerror("生成失败", str(err))
+                else:
+                    preview_lines = "\n".join(f"  · {n}" for n in created[:24])
+                    more = f"\n  … 共 {len(created)} 个" if len(created) > 24 else ""
+                    messagebox.showinfo(
+                        "生成完成",
+                        f"已生成 {len(created)} 个子草稿：\n{preview_lines}{more}",
+                    )
+
+            root.after(0, finish_gen)
+
+        threading.Thread(target=worker_gen, daemon=True).start()
+
     def on_replace_material_bar() -> None:
         from tkinter import messagebox
 
@@ -2785,17 +3535,21 @@ def run_app() -> None:
         except tk.TclError:
             pass
 
-    replace_material_bar_btn = ctk.CTkButton(
-        export_actions,
-        text="替换素材…",
-        height=34,
-        width=112,
-        state="disabled",
-        fg_color=("#3B8ED0", "#1F538D"),
-        hover_color=("#2E7CB8", "#163A6E"),
-        command=on_replace_material_bar,
-    )
-    replace_material_bar_btn.pack(side="left", padx=(0, 12))
+    def on_pick_jianying_version() -> None:
+        from tkinter import messagebox
+
+        if sys.platform != "win32":
+            messagebox.showinfo("剪映版本", "当前仅在 Windows 下支持。")
+            return
+        if not list_jianying_pro_installations():
+            messagebox.showerror(
+                "未找到剪映",
+                "未在常见安装路径找到剪映专业版（JianyingPro.exe）。",
+            )
+            return
+        exe = ensure_jianying_exe_for_ui(root, force_dialog=True)
+        if exe:
+            messagebox.showinfo("剪映版本", f"已保存将使用的程序：\n{exe}")
 
     def on_launch_jianying() -> None:
         from tkinter import messagebox
@@ -2803,12 +3557,17 @@ def run_app() -> None:
         if sys.platform != "win32":
             messagebox.showinfo("打开剪映", "当前仅在 Windows 下支持从本程序启动剪映专业版。")
             return
-        if not _find_jianying_pro_exe():
+        if not list_jianying_pro_installations():
             messagebox.showerror(
                 "未找到剪映",
                 "未在常见安装路径找到剪映专业版（JianyingPro.exe）。\n"
                 "请确认已安装剪映专业版，或从系统开始菜单手动启动。",
             )
+            return
+
+        jy_exe = ensure_jianying_exe_for_ui(root)
+        if not jy_exe:
+            messagebox.showinfo("打开剪映", "已取消。")
             return
 
         draft_open = (selected_name or "").strip()
@@ -2818,22 +3577,16 @@ def run_app() -> None:
             try:
                 _ensure_local_pyjianyingdraft_on_path()
                 from pyJianYingDraft.exceptions import AutomationError, DraftNotFound
-                from pyJianYingDraft.jianying_controller import wait_for_jianying_controller
 
                 if draft_open:
-                    try:
-                        ctrl = wait_for_jianying_controller(timeout=5.0, poll=0.4)
-                    except AutomationError:
-                        if not start_jianying_pro_process():
-                            raise AutomationError("无法启动剪映进程。")
-                        ctrl = wait_for_jianying_controller(timeout=90.0, poll=0.5)
+                    ctrl = wait_jianying_controller_or_launch_process(exe_path=jy_exe)
                     ctrl.open_draft_by_name(
                         draft_open,
                         after_click_sleep=8.0,
                         locate_timeout=3.0,
                     )
                 else:
-                    if not launch_jianying_pro():
+                    if not launch_jianying_pro(jy_exe):
                         raise OSError("无法启动剪映。")
             except DraftNotFound:
                 err = (
@@ -2855,20 +3608,44 @@ def run_app() -> None:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    jy_btn_col = ctk.CTkFrame(export_jianying_cell, fg_color="transparent")
+    jy_btn_col.pack(side="left", padx=(0, 0))
     ctk.CTkButton(
-        jianying_row,
+        jy_btn_col,
         text="打开剪映",
-        height=32,
+        height=34,
         width=112,
         fg_color=("#3B8ED0", "#1F538D"),
         hover_color=("#2E7CB8", "#163A6E"),
         command=on_launch_jianying,
-    ).pack(side="right")
+    ).pack(anchor="w", pady=(0, 6))
+    ctk.CTkButton(
+        jy_btn_col,
+        text="剪映版本",
+        height=28,
+        width=112,
+        font=ctk.CTkFont(size=11),
+        fg_color=("gray70", "gray35"),
+        hover_color=("gray60", "gray28"),
+        command=on_pick_jianying_version,
+    ).pack(anchor="w")
+
+    replace_material_bar_btn = ctk.CTkButton(
+        export_actions,
+        text="替换素材…",
+        height=34,
+        width=112,
+        state="disabled",
+        fg_color=("#3B8ED0", "#1F538D"),
+        hover_color=("#2E7CB8", "#163A6E"),
+        command=on_replace_material_bar,
+    )
+    replace_material_bar_btn.pack(side="left", anchor="n", padx=(0, 12))
 
     replace_state["_on_timeline_selection_ui"] = sync_replace_material_bar_btn
 
     export_count_row = ctk.CTkFrame(export_actions, fg_color="transparent")
-    export_count_row.pack(side="left", padx=(0, 10))
+    export_count_row.pack(side="left", anchor="n", padx=(0, 10))
     ctk.CTkLabel(export_count_row, text="条数", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
     ctk.CTkEntry(
         export_count_row,
@@ -2886,23 +3663,46 @@ def run_app() -> None:
         placeholder_text="video_",
     ).pack(side="left")
 
+    _gen_btn_w = 96
+    _mp4_btn_w = 188
+    _export_btn_row_w = _gen_btn_w + 8 + _mp4_btn_w
+    export_mp4_col = ctk.CTkFrame(export_actions, fg_color="transparent")
+    export_mp4_col.pack(side="left", anchor="n", padx=(0, 0))
+    export_btn_row = ctk.CTkFrame(export_mp4_col, fg_color="transparent")
+    export_btn_row.pack(anchor="w", pady=(0, 4))
+    generate_drafts_btn = ctk.CTkButton(
+        export_btn_row,
+        text="生成草稿",
+        height=34,
+        width=_gen_btn_w,
+        fg_color=("#3B8ED0", "#1F538D"),
+        hover_color=("#2E7CB8", "#163A6E"),
+        command=on_generate_child_drafts,
+    )
+    generate_drafts_btn.pack(side="left", padx=(0, 8))
     export_btn = ctk.CTkButton(
-        export_actions,
+        export_btn_row,
         text="导出为 MP4…",
-        height=38,
-        width=200,
+        height=34,
+        width=_mp4_btn_w,
         fg_color=("#C45C26", "#A34A1E"),
         hover_color=("#A34A1E", "#8B3E18"),
         command=on_export_mp4,
     )
-    export_btn.pack(side="left", padx=(0, 14))
-
+    export_btn.pack(side="left", padx=(0, 0))
+    _export_busy_widgets.extend([generate_drafts_btn, export_btn])
+    backup_chk_align = ctk.CTkFrame(export_mp4_col, fg_color="transparent", width=_export_btn_row_w, height=32)
+    backup_chk_align.pack(anchor="w")
+    try:
+        backup_chk_align.pack_propagate(False)
+    except tk.TclError:
+        pass
     ctk.CTkCheckBox(
-        export_actions,
+        backup_chk_align,
         text="导出前备份明文",
         variable=backup_before_export,
         font=ctk.CTkFont(size=12),
-    ).pack(side="left", padx=(0, 4))
+    ).pack(side="right")
 
     draft_buttons: List[Any] = []
     collapsed_parents: set[str] = set()
@@ -3152,6 +3952,7 @@ def run_app() -> None:
         if summary.content_ok and _file_exists_nonempty(content_path) and not encrypted:
             raw_timeline = _safe_read_json(content_path)
         refresh_timeline_panel_data(raw_timeline)
+        sync_export_pool_preset_for_draft(folder_name)
 
     def _redraw_list_scroll(*, reset_scroll: bool = False) -> None:
         """CTkScrollableFrame 在子控件批量 destroy/pack 后，内部 Canvas 的 scrollregion 可能不更新，导致列表看起来没刷新。"""
@@ -3314,6 +4115,22 @@ def run_app() -> None:
     refresh_list()
     refresh_export_pool_preset_bar(reset_memory=True)
 
+    from tkinter import messagebox as _mb_startup
+
+    root.update()
+    root.update_idletasks()
+    if not auth_client:
+        _mb_startup.showerror(
+            "无法启动",
+            "认证模块不可用。\n请执行 pip install requests，并从仓库根目录运行本程序。",
+            parent=root,
+        )
+        root.destroy()
+        return
+    if not open_auth_dialog(mandatory=True):
+        root.destroy()
+        return
+    refresh_auth_bar()
     root.mainloop()
 
 

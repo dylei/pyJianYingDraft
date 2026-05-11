@@ -18,6 +18,12 @@ hiddenimports = list(_hi_ctk)
 hiddenimports.extend(collect_submodules("pyJianYingDraft"))
 for h in (
     "send2trash",
+    "requests",
+    "urllib3",
+    "certifi",
+    "charset_normalizer",
+    "idna",
+    "shared.browser_auth_client",
     "pymediainfo",
     "imageio",
     "uiautomation",
