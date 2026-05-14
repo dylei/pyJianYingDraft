@@ -1,16 +1,19 @@
 """
 爆款智剪 — 左侧草稿列表，右侧详情与时间轴预览（轨道与片段按时间排列）；
 明文 draft_content.json 下可在时间轴音视频片段上右键「替换素材…」弹窗替换（按原片段时长截断或缩短）；
-片段可单独设置「导出用素材目录」；导出 MP4 前会先复制当前草稿为「父模板名_N」子草稿（挂在推断出的父模板下）、在子草稿上套素材再导出，不改动你选中的底稿文件夹。
-单个文件替换同样写入新子草稿。父子关系索引在 %LOCALAPPDATA%\\pyJianYingDraft_browser\\，草稿文件夹仍在剪映根目录下平铺。
+Windows 下可将单个素材文件或素材文件夹从资源管理器拖到时间轴片段彩色条上，效果与弹窗中保存「单个文件」或「素材目录」一致（需安装 windnd）；
+每个导出槽位仅保留最后一次配置：「单个文件」与「素材目录」互斥，后保存的生效；可设新素材截取起点（片头 / 随机 / 自定义秒）。
+下拉「(默认)」表示使用本稿槽位工作台（working_pool），与命名预设一样可编辑并持久化到本地；旧版曾显示为「(保持原样)」，程序会自动识别。命名预设下改动会写回该预设。「导出生成子草稿」默认勾选：导出 MP4 时复制为子草稿并在子稿上套用预设，底稿不动；取消勾选时仍会在**每次导出前**对当前草稿临时套用槽位再导出，随后**自动还原** draft_content.json，不增加子文件夹（与「生成草稿」按钮无关，该按钮仍会复制子稿）。
+父子关系索引与导出 MP4 区选项（备份、字幕、子草稿、条数、文件名前缀等）记忆在 %LOCALAPPDATA%\\pyJianYingDraft_browser\\（export_mp4_ui_preference.json），草稿文件夹仍在剪映根目录下平铺。
 音频槽选视频时自动用 ffmpeg 抽音轨为 MP3。
-运行: pip install customtkinter Send2Trash requests && python draft_browser_app.py
+运行: pip install customtkinter Send2Trash requests windnd && python draft_browser_app.py
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import copy
 import os
 import random
 import re
@@ -73,6 +76,8 @@ class MediaSegmentRef:
     track_id: str = ""
     # 同类型导入轨道中的顺序下标（与 ScriptFile.get_imported_track 的 index 一致，0 为最下层）
     track_type_index: int = 0
+    # draft_content「tracks」数组中第几条音视频轨道（仅 video/audio），与时间轴 dict 引用对齐用
+    media_ordinal: int = -1
 
 
 def segment_export_pool_key(draft_name: str, ref: MediaSegmentRef) -> str:
@@ -81,6 +86,27 @@ def segment_export_pool_key(draft_name: str, ref: MediaSegmentRef) -> str:
     if tid:
         return f"{draft_name}\0{tid}\0{ref.segment_index}"
     return f"{draft_name}\0{ref.track_type}\0{ref.track_name}\0{ref.track_type_index}\0{ref.segment_index}"
+
+
+VIDEO_REPLACE_SOURCE_HEAD = "head"
+VIDEO_REPLACE_SOURCE_RANDOM = "random"
+VIDEO_REPLACE_SOURCE_CUSTOM = "custom"
+
+
+def normalize_replace_source_start_mode(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if s in (VIDEO_REPLACE_SOURCE_RANDOM, "随机"):
+        return VIDEO_REPLACE_SOURCE_RANDOM
+    if s in (VIDEO_REPLACE_SOURCE_CUSTOM, "自定义"):
+        return VIDEO_REPLACE_SOURCE_CUSTOM
+    return VIDEO_REPLACE_SOURCE_HEAD
+
+
+def parse_replace_source_start_sec(raw: Any) -> float:
+    try:
+        return float(str(raw).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def segment_replace_status_lines(
@@ -102,6 +128,33 @@ def segment_replace_status_lines(
         out.append(f"替换目录：{d}（导出时选取：{oz}）")
     if rf:
         out.append(f"替换文件：{rf}")
+    sm = normalize_replace_source_start_mode(cfg.get("replace_source_start_mode"))
+    if (d or rf) and sm != VIDEO_REPLACE_SOURCE_HEAD:
+        if sm == VIDEO_REPLACE_SOURCE_RANDOM:
+            out.append("素材起点：随机（整秒）")
+        else:
+            out.append(f"素材起点：自定义 {parse_replace_source_start_sec(cfg.get('replace_source_start_sec')):g} 秒")
+    return out
+
+
+def segment_export_pool_enforce_exclusive_sources(pool: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """每个槽只保留一种来源：单文件与素材目录互斥。
+
+    写入 UI 已保证「最后一次」只留一类；若历史数据仍并存，与导出逻辑一致保留 replace_file 并去掉 dir/order。
+    """
+    if not isinstance(pool, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for k, v in pool.items():
+        if not isinstance(v, dict):
+            continue
+        d = str(v.get("dir", "") or "").strip()
+        rf = str(v.get("replace_file", "") or "").strip()
+        piece = dict(v)
+        if rf and d:
+            piece.pop("dir", None)
+            piece.pop("order", None)
+        out[str(k)] = piece
     return out
 
 
@@ -111,19 +164,48 @@ def segment_has_replace_config(
     return bool(segment_replace_status_lines(draft_name, ref, pool))
 
 
+def draft_has_any_segment_export_pool(draft_name: str, pool: Optional[Dict[str, Any]]) -> bool:
+    """该草稿在 segment_export_pool 中是否配置了替换目录或单个替换文件（导出 MP4 时可套用）。"""
+    dn = (draft_name or "").strip()
+    if not dn or not isinstance(pool, dict):
+        return False
+    pfx = dn + "\0"
+    for sk, sv in pool.items():
+        if not isinstance(sk, str) or not sk.startswith(pfx):
+            continue
+        if not isinstance(sv, dict):
+            continue
+        if str(sv.get("dir", "") or "").strip() or str(sv.get("replace_file", "") or "").strip():
+            return True
+    return False
+
+
 def _segment_export_pool_for_preset_disk(seg_in: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """写入预设文件时只保留「素材目录」配置，忽略 replace_file 等仅界面用的键。"""
+    """写入命名预设时保留「素材目录」与「单个替换文件」路径（供导出/生成子稿套用）。"""
     out: Dict[str, Dict[str, Any]] = {}
     for sk, sv in (seg_in or {}).items():
         if not isinstance(sv, dict):
             continue
+        piece: Dict[str, Any] = {}
         d = str(sv.get("dir", "") or "").strip()
-        if not d:
-            continue
-        od = sv.get("order", "random")
-        if od not in ("random", "sequential"):
-            od = "random"
-        out[str(sk)] = {"dir": d, "order": od}
+        if d:
+            od = sv.get("order", "random")
+            if od not in ("random", "sequential"):
+                od = "random"
+            piece["dir"] = d
+            piece["order"] = od
+        rf = str(sv.get("replace_file", "") or "").strip()
+        if rf:
+            piece["replace_file"] = rf
+        if piece:
+            sm = normalize_replace_source_start_mode(sv.get("replace_source_start_mode"))
+            piece["replace_source_start_mode"] = sm
+            piece["replace_source_start_sec"] = (
+                float(parse_replace_source_start_sec(sv.get("replace_source_start_sec")))
+                if sm == VIDEO_REPLACE_SOURCE_CUSTOM
+                else 0.0
+            )
+            out[str(sk)] = piece
     return out
 
 
@@ -255,6 +337,22 @@ def _safe_read_json(path: str) -> Optional[Dict[str, Any]]:
             return json.load(f)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
+
+
+def _write_draft_content_json(path: str, data: Dict[str, Any]) -> None:
+    """将 ``draft_content.json`` 写回磁盘（UTF-8，带缩进），用于导出后还原底稿。"""
+    parent = os.path.dirname(path)
+    tmp = os.path.join(parent, f".draft_content_tmp_{os.getpid()}_{random.randint(0, 1_000_000_000)}.json")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _file_exists_nonempty(path: str) -> bool:
@@ -396,21 +494,22 @@ def _fmt_tc_us(start_us: int, end_us: int) -> str:
     return f"{part(start_us)} – {part(end_us)}"
 
 
-def list_replaceable_media_segments(content_json_path: str) -> List[MediaSegmentRef]:
-    """从明文 draft_content.json 解析可替换的音视频片段列表。"""
+def list_replaceable_media_segments_from_script(script: Any) -> List[MediaSegmentRef]:
+    """从已加载的 ``ScriptFile`` 解析可替换音视频片段（与 ``load_template`` / ``load_from_parsed_json`` 均可）。"""
     _ensure_local_pyjianyingdraft_on_path()
-    from pyJianYingDraft.script_file import ScriptFile
-    from pyJianYingDraft.template_mode import ImportedMediaTrack
+    # 注意：本函数会先 _ensure_local_pyjianyingdraft_on_path() 并可能卸载重载 pyJianYingDraft，
+    # 不得再用 isinstance(..., ImportedMediaTrack)，否则与 ScriptFile 加载时创建的轨道类对象不一致，导致列表恒为空。
 
-    script = ScriptFile.load_template(content_json_path)
     out: List[MediaSegmentRef] = []
     mats = script.imported_materials
     vi, ai = 0, 0
+    media_ordinal = 0
 
     for tr in script.imported_tracks:
-        if not isinstance(tr, ImportedMediaTrack):
+        tt = getattr(tr, "track_type", None)
+        kind = getattr(tt, "name", "") if tt is not None else ""
+        if kind not in ("video", "audio"):
             continue
-        kind = tr.track_type.name
         tix = vi if kind == "video" else ai
         if kind == "video":
             vi += 1
@@ -441,9 +540,20 @@ def list_replaceable_media_segments(content_json_path: str) -> List[MediaSegment
                     material_id=mid,
                     track_id=tid,
                     track_type_index=tix,
+                    media_ordinal=media_ordinal,
                 )
             )
+        media_ordinal += 1
     return out
+
+
+def list_replaceable_media_segments(content_json_path: str) -> List[MediaSegmentRef]:
+    """从明文 draft_content.json 解析可替换的音视频片段列表。"""
+    _ensure_local_pyjianyingdraft_on_path()
+    from pyJianYingDraft.script_file import ScriptFile
+
+    script = ScriptFile.load_template(content_json_path)
+    return list_replaceable_media_segments_from_script(script)
 
 
 def find_ffmpeg() -> Optional[str]:
@@ -510,10 +620,107 @@ def _extract_audio_to_mp3_with_ffmpeg(ffmpeg_exe: str, src: str) -> str:
     return dst
 
 
+_SPATIAL_CLIP_KF_TYPES = frozenset(
+    {
+        "KFTypeScaleX",
+        "KFTypeScaleY",
+        "UNIFORM_SCALE",
+        "KFTypePositionX",
+        "KFTypePositionY",
+    }
+)
+
+
+def _compute_cover_uniform_zoom(canvas_w: int, canvas_h: int, mat_w: int, mat_h: int) -> float:
+    """相对剪映默认「整段素材完整放进画布」的缩放，再放大到 **cover 铺满** 所需的等比倍数。
+
+    即 ``max(cw/mw, ch/mh) / min(cw/mw, ch/mh)``，与 ``object-fit: cover`` / contain 的缩放比一致；
+    宽高比已与画布一致时为 ``1.0``。不依赖「先按宽铺满」的假设，避免与部分草稿/版本语义不一致。
+    """
+    cw, ch = float(canvas_w), float(canvas_h)
+    mw, mh = float(mat_w), float(mat_h)
+    if cw <= 0 or ch <= 0 or mw <= 0 or mh <= 0:
+        return 1.0
+    rw = cw / mw
+    rh = ch / mh
+    lo = min(rw, rh)
+    hi = max(rw, rh)
+    if lo <= 1e-12:
+        return 1.0
+    return float(hi / lo)
+
+
+def _apply_clip_cover_scale_transform(
+    clip: Dict[str, Any],
+    zoom: float,
+    *,
+    transform_x: float = 0.0,
+    transform_y: float = 0.0,
+) -> None:
+    """写入 ``clip`` 的等比缩放与位移。兼容剪映草稿中两种常见结构：
+
+    - 库/py 常用：顶层 ``clip.scale`` + ``clip.transform`` 仅 ``x/y``；
+    - 部分版本/轨道：缩放写在 ``clip.transform.scale`` 里；若只写顶层 ``scale`` 会导致仍读旧嵌套值而出现「缩小、错位」。
+    """
+    tf = clip.get("transform")
+    if isinstance(tf, dict) and isinstance(tf.get("scale"), dict):
+        nd = dict(tf)
+        nd["scale"] = {"x": float(zoom), "y": float(zoom)}
+        nd["x"] = float(transform_x)
+        nd["y"] = float(transform_y)
+        clip["transform"] = nd
+        clip.pop("scale", None)
+    else:
+        clip["scale"] = {"x": float(zoom), "y": float(zoom)}
+        clip["transform"] = {"x": float(transform_x), "y": float(transform_y)}
+
+
+def _patch_replaced_video_segment_clip_center_cover(
+    seg: Any,
+    *,
+    canvas_w: int,
+    canvas_h: int,
+    mat_w: int,
+    mat_h: int,
+) -> None:
+    """替换素材后重写片段 ``clip``：等比铺满画布（cover）；旋转归零；去掉与缩放/位置冲突的关键帧。
+
+    缩放取相对「完整放入」的倍数，位移默认 ``0``（由剪映按 cover 裁切居中）；若仍错位可再调位移公式。
+    """
+    raw = getattr(seg, "raw_data", None)
+    if not isinstance(raw, dict):
+        return
+    zoom = _compute_cover_uniform_zoom(canvas_w, canvas_h, mat_w, mat_h)
+    old_clip = raw.get("clip")
+    clip: Dict[str, Any] = dict(old_clip) if isinstance(old_clip, dict) else {}
+    flip = clip.get("flip")
+    if not isinstance(flip, dict):
+        flip = {"horizontal": False, "vertical": False}
+    al = clip.get("alpha", 1.0)
+    if not isinstance(al, (int, float)):
+        al = 1.0
+    clip["alpha"] = float(al)
+    clip["flip"] = dict(flip)
+    clip["rotation"] = 0.0
+    _apply_clip_cover_scale_transform(clip, zoom, transform_x=0.0, transform_y=0.0)
+    raw["clip"] = clip
+    raw["uniform_scale"] = {"on": True, "value": 1.0}
+    kfs = raw.get("common_keyframes")
+    if isinstance(kfs, list):
+        raw["common_keyframes"] = [
+            k
+            for k in kfs
+            if isinstance(k, dict) and str(k.get("property_type") or "") not in _SPATIAL_CLIP_KF_TYPES
+        ]
+
+
 def apply_single_material_replace(
     content_json_path: str,
     ref: MediaSegmentRef,
     new_file_path: str,
+    *,
+    source_start_mode: str = VIDEO_REPLACE_SOURCE_HEAD,
+    source_start_sec: float = 0.0,
 ) -> Optional[str]:
     """将指定片段的素材替换为本地文件。
 
@@ -521,7 +728,11 @@ def apply_single_material_replace(
     新素材**更长**时，只使用素材前段，轨道上片段时长仍与原片段一致（截断素材尾部）；
     新素材**更短**时，轨道上该片段的**目标时长会缩短**为与素材长度一致（不是拉长时间轴上的空白）。
 
+    ``source_start_mode``：``head`` 从片头截取；``random`` 在合法范围内按**整秒**随机起点（0s、1s、…）；``custom`` 从 ``source_start_sec`` 秒处起算（超出则钳位）。
+
     若替换的是**音频轨**且所选文件带视频画面，则自动调用 ffmpeg 生成同目录下的 ``*_jy_audio.mp3`` 再引用。
+
+    **视频轨**：替换后会按画布与素材像素尺寸重写 ``clip``（**cover**：相对「完整放入」的等比放大倍数；兼容 ``transform.scale`` 嵌套结构；位移默认 0；旋转归零并清理冲突关键帧）。
 
     Returns:
         若有自动转码，返回提示文案；否则返回 None。
@@ -530,11 +741,11 @@ def apply_single_material_replace(
     from pyJianYingDraft import AudioMaterial, VideoMaterial
     from pyJianYingDraft.script_file import ScriptFile
     from pyJianYingDraft.template_mode import ExtendMode, ShrinkMode
+    from pyJianYingDraft.time_util import SEC, Timerange
     from pyJianYingDraft.track import TrackType
 
     script = ScriptFile.load_template(content_json_path)
     tt = TrackType.video if ref.track_type == "video" else TrackType.audio
-    # 多条同类型且轨道名为空时，按 name 会歧义；仅用「同类导入轨道中的顺序 index」与 list_replaceable 枚举一致。
     track = script.get_imported_track(tt, name=None, index=ref.track_type_index)
 
     extra_note: Optional[str] = None
@@ -561,14 +772,52 @@ def apply_single_material_replace(
             )
         material = AudioMaterial(audio_path)
 
+    mode = normalize_replace_source_start_mode(source_start_mode)
+    src_tr: Optional[Timerange] = None
+    if ref.track_type == "video" and isinstance(material, VideoMaterial) and material.material_type == "photo":
+        src_tr = None
+    else:
+        seg = track.segments[ref.segment_index]
+        clip_us = int(seg.duration)
+        mat_dur = int(material.duration)
+        max_start = max(0, mat_dur - clip_us)
+        if mode == VIDEO_REPLACE_SOURCE_RANDOM:
+            if max_start <= 0:
+                start_us = 0
+            else:
+                max_sec = int(max_start // SEC)
+                sec_pick = random.randint(0, max_sec)
+                start_us = min(sec_pick * SEC, max_start)
+        elif mode == VIDEO_REPLACE_SOURCE_CUSTOM:
+            start_us = int(round(float(source_start_sec) * SEC))
+            start_us = max(0, min(start_us, max_start))
+        else:
+            start_us = 0
+        src_tr = Timerange(start_us, clip_us)
+
     script.replace_material_by_seg(
         track,
         ref.segment_index,
         material,
-        source_timerange=None,
+        source_timerange=src_tr,
         handle_shrink=ShrinkMode.cut_tail,
         handle_extend=ExtendMode.cut_material_tail,
     )
+    if ref.track_type == "video" and isinstance(material, VideoMaterial):
+        try:
+            mw = int(material.width)
+            mh = int(material.height)
+        except (TypeError, ValueError):
+            mw, mh = 0, 0
+        if mw > 0 and mh > 0:
+            seg_done = track.segments[ref.segment_index]
+            _patch_replaced_video_segment_clip_center_cover(
+                seg_done,
+                canvas_w=int(script.width),
+                canvas_h=int(script.height),
+                mat_w=mw,
+                mat_h=mh,
+            )
     script.save()
     return extra_note
 
@@ -579,7 +828,7 @@ def apply_per_segment_export_pools_to_draft(
     segment_pool: Dict[str, Dict[str, Any]],
     sequential_cursor: Dict[str, int],
 ) -> Tuple[int, int, List[str], int]:
-    """仅对已在 segment_pool 中配置「dir」的片段，从各自目录选一文件套用。
+    """对 segment_pool 中已配置的片段套用素材：单文件与目录二选一；有 replace_file 则用文件，否则从 dir 目录按规则选一文件。
 
     每个片段可配置 order: "random" | "sequential"；顺序模式用 sequential_cursor[片段键] 在多轮导出间延续。
     返回 (成功数, 因目录内无匹配文件跳过数, 错误信息列表, 已配置目录的片段数)。
@@ -589,9 +838,32 @@ def apply_per_segment_export_pools_to_draft(
     ok = 0
     skip = 0
     configured = 0
+    pool_use = segment_export_pool_enforce_exclusive_sources(
+        dict(segment_pool) if isinstance(segment_pool, dict) else {}
+    )
     for ref in refs:
         key = segment_export_pool_key(draft_name, ref)
-        cfg = segment_pool.get(key) or {}
+        cfg = pool_use.get(key) or {}
+        sm = normalize_replace_source_start_mode(cfg.get("replace_source_start_mode"))
+        sec = parse_replace_source_start_sec(cfg.get("replace_source_start_sec"))
+        repl_file = str(cfg.get("replace_file") or "").strip()
+        if repl_file:
+            if not os.path.isfile(repl_file):
+                errs.append(f"{ref.combo_label}: 预设替换文件不存在或已不是文件\n{repl_file}")
+                continue
+            try:
+                apply_single_material_replace(
+                    content_json_path,
+                    ref,
+                    repl_file,
+                    source_start_mode=sm,
+                    source_start_sec=sec,
+                )
+                ok += 1
+            except Exception as e:
+                errs.append(f"{ref.combo_label}: {e}")
+            continue
+
         pool_dir = (cfg.get("dir") or "").strip()
         if not pool_dir:
             continue
@@ -613,7 +885,13 @@ def apply_per_segment_export_pools_to_draft(
         else:
             pick = random.choice(files)
         try:
-            apply_single_material_replace(content_json_path, ref, pick)
+            apply_single_material_replace(
+                content_json_path,
+                ref,
+                pick,
+                source_start_mode=sm,
+                source_start_sec=sec,
+            )
             ok += 1
         except Exception as e:
             errs.append(f"{ref.combo_label}: {e}")
@@ -621,17 +899,14 @@ def apply_per_segment_export_pools_to_draft(
 
 
 def backup_plaintext_draft(draft_root: str, draft_name: str) -> str:
-    """将草稿整夹复制到草稿根目录的上一级下的 pyJianYingDraft_plain_backups，避免剪映导出保存后加密覆盖原稿。
+    """将草稿整夹复制到草稿根目录下「<草稿文件夹名>_bak」，避免剪映导出保存后加密覆盖原稿。
 
     返回备份目录路径。
     """
     src = os.path.join(draft_root, draft_name)
     if not os.path.isdir(src):
         raise FileNotFoundError(f"找不到草稿目录:\n{src}")
-    parent = os.path.dirname(os.path.normpath(draft_root))
-    backup_root = os.path.join(parent, "pyJianYingDraft_plain_backups")
-    os.makedirs(backup_root, exist_ok=True)
-    dest = os.path.join(backup_root, draft_name)
+    dest = os.path.join(draft_root, f"{draft_name}_bak")
     if os.path.isdir(dest):
         shutil.rmtree(dest)
     shutil.copytree(src, dest)
@@ -798,6 +1073,117 @@ def save_jianying_exe_preference(exe: str) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"exe": os.path.normpath(exe)}, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def _draft_root_pref_path() -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "draft_root_preference.json"
+
+
+def load_draft_root_preference() -> Optional[str]:
+    path = _draft_root_pref_path()
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        root_p = str((data or {}).get("draft_root") or "").strip()
+        return root_p if root_p else None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def save_draft_root_preference(root_p: str) -> None:
+    path = _draft_root_pref_path()
+    tmp = path.with_suffix(".json.tmp")
+    norm = os.path.normpath(str(root_p).strip())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"draft_root": norm}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _export_mp4_ui_pref_path() -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "export_mp4_ui_preference.json"
+
+
+def load_export_mp4_ui_preferences() -> Dict[str, Any]:
+    """读取导出 MP4 区已保存的 UI 选项（无效或缺失的键由调用方用默认值处理）。"""
+    path = _export_mp4_ui_pref_path()
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return dict(data) if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _export_ui_pref_bool(blob: Dict[str, Any], key: str, default: bool) -> bool:
+    v = blob.get(key)
+    return bool(v) if isinstance(v, bool) else default
+
+
+def _export_ui_pref_repeat(blob: Dict[str, Any]) -> str:
+    v = blob.get("export_repeat", "1")
+    if isinstance(v, bool):
+        return "1"
+    if isinstance(v, int):
+        n = v
+    else:
+        s = str(v).strip() if v is not None else ""
+        if not s:
+            return "1"
+        try:
+            n = int(s)
+        except ValueError:
+            return "1"
+    if n < 1:
+        return "1"
+    if n > 200:
+        return "200"
+    return str(n)
+
+
+def _export_ui_pref_name_prefix(blob: Dict[str, Any]) -> str:
+    v = blob.get("name_prefix")
+    if isinstance(v, str):
+        return v
+    return "video_"
+
+
+def save_export_mp4_ui_preferences(updates: Dict[str, Any]) -> None:
+    """合并写入 export_mp4_ui_preference.json（只覆盖 updates 中的键）。"""
+    path = _export_mp4_ui_pref_path()
+    merged: Dict[str, Any] = {}
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+            if isinstance(prev, dict):
+                merged = dict(prev)
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    for k, v in updates.items():
+        merged[k] = v
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def initial_draft_root_for_ui() -> str:
+    """启动时草稿根目录：上次保存的路径优先，否则常见剪映/CapCut 默认目录中第一个存在的。"""
+    saved = load_draft_root_preference()
+    if saved:
+        return saved
+    defaults = _default_draft_roots()
+    return defaults[0] if defaults else ""
 
 
 def list_jianying_pro_installations() -> List[Tuple[str, str]]:
@@ -1133,7 +1519,28 @@ def save_draft_families(draft_root: str, data: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-POOL_EXPORT_PRESET_KEEP = "(保持原样)"
+POOL_EXPORT_PRESET_DEFAULT = "(默认)"
+_LEGACY_POOL_EXPORT_PRESET_MENU_NAMES = frozenset({"(保持原样)"})
+
+
+def is_pool_export_default_menu_preset(choice: Optional[str]) -> bool:
+    """下拉中的「默认」项；兼容磁盘里仍存为「(保持原样)」的旧数据。"""
+    s = (str(choice).strip() if choice is not None else "") or ""
+    if not s:
+        return True
+    if s == POOL_EXPORT_PRESET_DEFAULT:
+        return True
+    if s in _LEGACY_POOL_EXPORT_PRESET_MENU_NAMES:
+        return True
+    return False
+
+
+def normalize_pool_export_last_preset_value(choice: Any) -> str:
+    """写入 last_preset 时统一为「(默认)」，旧名映射过来。"""
+    if is_pool_export_default_menu_preset(choice):
+        return POOL_EXPORT_PRESET_DEFAULT
+    t = str(choice).strip() if choice is not None else ""
+    return t if t else POOL_EXPORT_PRESET_DEFAULT
 
 
 def _pool_export_presets_store_path(draft_root: str) -> Path:
@@ -1151,7 +1558,7 @@ def _clean_export_pool_presets_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
     clean: Dict[str, Dict[str, Any]] = {}
     for pname, blob in raw.items():
         name = str(pname).strip()
-        if not name or name == POOL_EXPORT_PRESET_KEEP:
+        if not name or is_pool_export_default_menu_preset(name):
             continue
         if not isinstance(blob, dict):
             continue
@@ -1162,13 +1569,19 @@ def _clean_export_pool_presets_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
             for sk, sv in seg_in.items():
                 if not isinstance(sv, dict):
                     continue
+                piece: Dict[str, Any] = {}
                 d = str(sv.get("dir", "") or "").strip()
-                if not d:
-                    continue
-                od = sv.get("order", "random")
-                if od not in ("random", "sequential"):
-                    od = "random"
-                seg[str(sk)] = {"dir": d, "order": od}
+                if d:
+                    od = sv.get("order", "random")
+                    if od not in ("random", "sequential"):
+                        od = "random"
+                    piece["dir"] = d
+                    piece["order"] = od
+                rf = str(sv.get("replace_file", "") or "").strip()
+                if rf:
+                    piece["replace_file"] = rf
+                if piece:
+                    seg[str(sk)] = piece
         cur: Dict[str, int] = {}
         if isinstance(cur_in, dict):
             for ck, cv in cur_in.items():
@@ -1237,8 +1650,14 @@ def load_export_pool_store(draft_root: str) -> Dict[str, Any]:
             clean_pr = _clean_export_pool_presets_dict(presets_raw if isinstance(presets_raw, dict) else {})
             lp = bucket.get("last_preset")
             if not isinstance(lp, str) or not lp.strip():
-                lp = POOL_EXPORT_PRESET_KEEP
-            by_draft[dname] = {"presets": clean_pr, "last_preset": lp}
+                lp = POOL_EXPORT_PRESET_DEFAULT
+            else:
+                lp = normalize_pool_export_last_preset_value(lp.strip())
+            entry: Dict[str, Any] = {"presets": clean_pr, "last_preset": lp}
+            wp = bucket.get("working_pool")
+            if isinstance(wp, dict):
+                entry["working_pool"] = wp
+            by_draft[dname] = entry
 
     legacy = _clean_export_pool_presets_dict(data.get("legacy_presets") if isinstance(data.get("legacy_presets"), dict) else {})
     top_presets = data.get("presets")
@@ -1267,8 +1686,14 @@ def save_export_pool_store(draft_root: str, data: Dict[str, Any]) -> None:
         pr = _clean_export_pool_presets_dict(bucket.get("presets") if isinstance(bucket.get("presets"), dict) else {})
         lp = bucket.get("last_preset")
         if not isinstance(lp, str) or not lp.strip():
-            lp = POOL_EXPORT_PRESET_KEEP
-        out_by[dname] = {"presets": pr, "last_preset": lp}
+            lp = POOL_EXPORT_PRESET_DEFAULT
+        else:
+            lp = normalize_pool_export_last_preset_value(lp.strip())
+        out_entry: Dict[str, Any] = {"presets": pr, "last_preset": lp}
+        wp = bucket.get("working_pool")
+        if isinstance(wp, dict):
+            out_entry["working_pool"] = wp
+        out_by[dname] = out_entry
     payload = {
         "version": 2,
         "draft_root": rk,
@@ -1280,6 +1705,37 @@ def save_export_pool_store(draft_root: str, data: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def _normalize_export_pool_cursor_dict(cur_in: Any) -> Dict[str, int]:
+    cur_out: Dict[str, int] = {}
+    if isinstance(cur_in, dict):
+        for ck, cv in cur_in.items():
+            try:
+                cur_out[str(ck)] = int(cv)
+            except (TypeError, ValueError):
+                cur_out[str(ck)] = 0
+    return cur_out
+
+
+def persist_working_export_pool_snapshot(draft_root: str, draft_folder_name: str, replace_state: Dict[str, Any]) -> None:
+    """将当前草稿的槽位配置（含单个文件替换）写入本地 store，供下拉「(默认)」时恢复。"""
+    dn = (draft_folder_name or "").strip()
+    dr = (draft_root or "").strip()
+    if not dn or not dr:
+        return
+    store = load_export_pool_store(dr)
+    b = _export_pool_by_draft_bucket_mut(store, dn)
+    seg_raw = replace_state.get("segment_export_pool") or {}
+    seg = segment_export_pool_enforce_exclusive_sources(seg_raw if isinstance(seg_raw, dict) else {})
+    replace_state["segment_export_pool"] = seg
+    b["working_pool"] = {
+        "segment_export_pool": dict(seg),
+        "export_pool_sequential_cursor": _normalize_export_pool_cursor_dict(
+            replace_state.get("export_pool_sequential_cursor")
+        ),
+    }
+    save_export_pool_store(dr, store)
 
 
 def _export_pool_by_draft_bucket_mut(store: Dict[str, Any], draft_folder_name: str) -> Dict[str, Any]:
@@ -1295,7 +1751,7 @@ def _export_pool_by_draft_bucket_mut(store: Dict[str, Any], draft_folder_name: s
     if not isinstance(pr, dict):
         b["presets"] = {}
     if "last_preset" not in b or not isinstance(b.get("last_preset"), str):
-        b["last_preset"] = POOL_EXPORT_PRESET_KEEP
+        b["last_preset"] = POOL_EXPORT_PRESET_DEFAULT
     return b
 
 
@@ -1310,11 +1766,13 @@ def export_pool_preset_names_for_draft(draft_root: str, draft_folder_name: str) 
         b = (store.get("by_draft") or {}).get(dn) or {}
         pr = b.get("presets") if isinstance(b, dict) else None
         if isinstance(pr, dict):
-            names.update(k for k in pr if isinstance(k, str) and k.strip() and k != POOL_EXPORT_PRESET_KEEP)
+            names.update(
+                k for k in pr if isinstance(k, str) and k.strip() and not is_pool_export_default_menu_preset(k)
+            )
     leg = store.get("legacy_presets") or {}
     if isinstance(leg, dict) and dn:
         for k, lb in leg.items():
-            if not isinstance(k, str) or not k.strip() or k == POOL_EXPORT_PRESET_KEEP:
+            if not isinstance(k, str) or not k.strip() or is_pool_export_default_menu_preset(k):
                 continue
             if not isinstance(lb, dict):
                 continue
@@ -1326,7 +1784,7 @@ def export_pool_preset_names_for_draft(draft_root: str, draft_folder_name: str) 
 
 def get_export_pool_preset_blob_for_draft(draft_root: str, draft_folder_name: str, choice: str) -> Optional[Dict[str, Any]]:
     """取某草稿下要应用的预设数据；本稿优先，其次 legacy 中按草稿名过滤后的条目。"""
-    if not choice or choice == POOL_EXPORT_PRESET_KEEP:
+    if not choice or is_pool_export_default_menu_preset(choice):
         return None
     dn = (draft_folder_name or "").strip()
     if not dn or not draft_root or not os.path.isdir(draft_root):
@@ -1353,8 +1811,51 @@ def persist_export_pool_last_preset_choice(draft_root: str, draft_folder_name: s
         return
     store = load_export_pool_store(draft_root)
     b = _export_pool_by_draft_bucket_mut(store, dn)
-    b["last_preset"] = choice
+    b["last_preset"] = normalize_pool_export_last_preset_value(choice)
     save_export_pool_store(draft_root, store)
+
+
+def persist_active_named_export_pool_preset(
+    draft_root: str,
+    draft_folder_name: str,
+    preset_choice: str,
+    replace_state: Dict[str, Any],
+) -> None:
+    """下拉里为已命名预设时，把当前槽位与顺序光标写回该预设，避免只写入 working_pool 后切换预设丢失。"""
+    if is_pool_export_default_menu_preset(preset_choice):
+        return
+    dn = (draft_folder_name or "").strip()
+    dr = (draft_root or "").strip()
+    if not dn or not dr or not os.path.isdir(dr):
+        return
+    seg = replace_state.get("segment_export_pool") or {}
+    if not isinstance(seg, dict):
+        return
+    seg = segment_export_pool_enforce_exclusive_sources(seg)
+    replace_state["segment_export_pool"] = seg
+    has_slot = False
+    for _k, sv in seg.items():
+        if not isinstance(sv, dict):
+            continue
+        if str(sv.get("dir", "") or "").strip() or str(sv.get("replace_file", "") or "").strip():
+            has_slot = True
+            break
+    if not has_slot:
+        return
+    store = load_export_pool_store(dr)
+    bucket = _export_pool_by_draft_bucket_mut(store, dn)
+    presets = bucket.setdefault("presets", {})
+    if not isinstance(presets, dict):
+        bucket["presets"] = {}
+        presets = bucket["presets"]
+    presets[preset_choice] = {
+        "segment_export_pool": _segment_export_pool_for_preset_disk(dict(seg)),
+        "export_pool_sequential_cursor": _normalize_export_pool_cursor_dict(
+            replace_state.get("export_pool_sequential_cursor")
+        ),
+    }
+    bucket["last_preset"] = preset_choice
+    save_export_pool_store(dr, store)
 
 
 def prune_draft_families(draft_root: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1489,6 +1990,8 @@ def merge_remapped_pool_and_cursor_into_replace_state(
     cur = replace_state.setdefault("export_pool_sequential_cursor", {})
     if isinstance(cur, dict):
         cur.update(cursor_ints)
+    coerced = segment_export_pool_enforce_exclusive_sources(replace_state.get("segment_export_pool") or {})
+    replace_state["segment_export_pool"] = coerced
 
 
 def _next_generated_child_name(draft_root: str, parent_name: str) -> str:
@@ -1545,20 +2048,86 @@ def _track_render_index(tr: Dict[str, Any]) -> int:
         return 0
 
 
+def _track_index_in_content(content: Dict[str, Any], track: Dict[str, Any]) -> Optional[int]:
+    """定位 ``track`` 在 ``content['tracks']`` 中的下标（优先同一 dict 引用，否则按 id）。"""
+    trs = content.get("tracks") or []
+    for i, tr in enumerate(trs):
+        if tr is track:
+            return i
+    tid = track.get("id")
+    if tid is None or tid == "":
+        return None
+    ts = str(tid)
+    for i, tr in enumerate(trs):
+        if str(tr.get("id", "") or "") == ts:
+            return i
+    return None
+
+
+def _media_track_ordinal_at_index(content: Dict[str, Any], track_idx: int) -> Optional[int]:
+    """``tracks`` 数组中第 ``track_idx`` 条若为 video/audio，返回其为第几条音视频轨（0-based）。"""
+    trs = content.get("tracks") or []
+    if track_idx < 0 or track_idx >= len(trs):
+        return None
+    if str(trs[track_idx].get("type", "")) not in ("video", "audio"):
+        return None
+    mo = 0
+    for j in range(track_idx):
+        if str(trs[j].get("type", "")) in ("video", "audio"):
+            mo += 1
+    return mo
+
+
 def find_replace_ref_for_timeline_segment(
-    refs: List[MediaSegmentRef], track: Dict[str, Any], segment_index_raw: int
+    refs: List[MediaSegmentRef],
+    track: Dict[str, Any],
+    segment_index_raw: int,
+    content: Optional[Dict[str, Any]] = None,
 ) -> Optional[MediaSegmentRef]:
     """时间轴轨道片段（JSON 内 segment 下标）与下方「素材槽」列表项对应。"""
     tid = str(track.get("id", "") or "").strip()
     if tid:
         for r in refs:
-            if (r.track_id or "").strip() == tid and r.segment_index == segment_index_raw:
+            rt = str(r.track_id or "").strip()
+            if rt and rt == tid and r.segment_index == segment_index_raw:
                 return r
-    tname = str(track.get("name", ""))
-    ttype = str(track.get("type", ""))
+    nm_raw = track.get("name", "")
+    tname = "" if nm_raw is None else (nm_raw if isinstance(nm_raw, str) else str(nm_raw))
+    tname = tname.strip()
+    ty_raw = track.get("type", "")
+    ttype = str(ty_raw).strip().lower() if ty_raw is not None else ""
     for r in refs:
-        if r.track_name == tname and r.track_type == ttype and r.segment_index == segment_index_raw:
+        rn = (r.track_name or "").strip()
+        rt = (r.track_type or "").strip().lower()
+        if rn == tname and rt == ttype and r.segment_index == segment_index_raw:
             return r
+    if content and isinstance(content, dict):
+        tidx = _track_index_in_content(content, track)
+        if tidx is not None:
+            mo = _media_track_ordinal_at_index(content, tidx)
+            if mo is not None:
+                for r in refs:
+                    if r.media_ordinal == mo and r.segment_index == segment_index_raw:
+                        return r
+    raw_segs = list(track.get("segments") or [])
+    if 0 <= segment_index_raw < len(raw_segs):
+        seg = raw_segs[segment_index_raw]
+        if isinstance(seg, dict):
+            mid = str((seg.get("material_id") or "")).strip()
+            if mid:
+                same = [
+                    r
+                    for r in refs
+                    if r.segment_index == segment_index_raw
+                    and str((r.material_id or "")).strip() == mid
+                ]
+                if len(same) == 1:
+                    return same[0]
+                for r in same:
+                    if (r.track_type or "").strip().lower() == ttype:
+                        return r
+                if same:
+                    return same[0]
     return None
 
 
@@ -1604,7 +2173,7 @@ def timeline_segment_selection_status_parts(
         return None
     lab = _timeline_segment_label(seg, materials)
     refs_list = replace_state.get("refs") or []
-    ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i)
+    ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i, content)
     draft_nm = (replace_state.get("timeline_draft_name") or "").strip()
     pool_ui: Dict[str, Any] = replace_state.get("segment_export_pool") or {}
     if not isinstance(pool_ui, dict):
@@ -1631,6 +2200,30 @@ def timeline_segment_selection_status_parts(
     return (main, highlight)
 
 
+def _ctk_readonly_text_set(widget: Any, text: str) -> None:
+    """将 ``CTkTextbox`` 设为只读并替换全文（按控件宽度自动换行，避免与右侧工具条重叠）。"""
+    try:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+    except Exception:
+        pass
+
+
+def _timeline_status_set_text(widget: Any, text: str, *, ctk_mod: Any) -> None:
+    """时间轴说明区：支持 ``CTkTextbox`` 与旧版 ``CTkLabel``。"""
+    if widget is None:
+        return
+    try:
+        if isinstance(widget, ctk_mod.CTkTextbox):
+            _ctk_readonly_text_set(widget, text)
+        else:
+            widget.configure(text=text)
+    except Exception:
+        pass
+
+
 def populate_timeline_panel(
     parent: Any,
     content: Optional[Dict[str, Any]],
@@ -1653,16 +2246,8 @@ def populate_timeline_panel(
 
     def _set_status(text: str, *, replace_highlight: str = "") -> None:
         sel["summary"] = text + (f"\n\n{replace_highlight}" if replace_highlight else "")
-        if status_label is not None:
-            try:
-                status_label.configure(text=text)
-            except Exception:
-                pass
-        if status_replace_highlight_label is not None:
-            try:
-                status_replace_highlight_label.configure(text=replace_highlight)
-            except Exception:
-                pass
+        _timeline_status_set_text(status_label, text, ctk_mod=ctk_mod)
+        _timeline_status_set_text(status_replace_highlight_label, replace_highlight, ctk_mod=ctk_mod)
 
     if not content:
         ctk_mod.CTkLabel(parent, text="（无明文草稿，无法显示时间轴）", text_color=("gray45", "gray60")).pack(
@@ -1731,6 +2316,7 @@ def populate_timeline_panel(
         scrollregion=(0, 0, canvas_w, canvas_h),
         height=view_h,
         width=860,
+        takefocus=True,
     )
     if need_vscroll:
         vbar = tk.Scrollbar(body, orient="vertical", command=canvas.yview)
@@ -1857,6 +2443,11 @@ def populate_timeline_panel(
 
     label_rect_ids: Dict[int, int] = {}
     seg_rect_ids: Dict[Tuple[int, int], int] = {}
+    # 同轨重叠片段时，后绘制的在上层 —— 拖放命中取 paint 序最大者
+    seg_hit_z: Dict[Tuple[int, int], int] = {}
+    seg_paint_counter: List[int] = [0]
+    # 每轨按时间排序的可见片段 (vis_i, orig_i)，供方向键左右与上下（按条序对齐）
+    track_visible_segs: Dict[int, List[Tuple[int, int]]] = {}
 
     def _x_for_us(us: int) -> float:
         return label_w + pad + (us / total_us) * time_px
@@ -1907,7 +2498,7 @@ def populate_timeline_panel(
         sel["vis_i"] = vis_i
         sel["orig_i"] = orig_i
         refs_list = rs.get("refs") or []
-        ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i)
+        ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i, content)
         if ref is not None:
             sel["replace_ref"] = ref
         else:
@@ -1926,7 +2517,7 @@ def populate_timeline_panel(
 
         tr = tracks_sorted[ti]
         refs_list = rs.get("refs") or []
-        ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i)
+        ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i, content)
         m = Menu(canvas, tearoff=0, bg="#2b2b2b", fg="#e0e0e0", activebackground="#3d3d3d")
 
         def _open_replace_win() -> None:
@@ -1972,6 +2563,7 @@ def populate_timeline_panel(
 
     y0 = ruler_h + row_gap
     for ti, tr in enumerate(tracks_sorted):
+        track_visible_segs[ti] = []
         y = y0 + ti * (row_h + row_gap)
         tname = str(tr.get("name", "?"))
         ttype = str(tr.get("type", "?"))
@@ -2029,7 +2621,7 @@ def populate_timeline_panel(
                 x2 = x1 + 2
             tag_s = f"sid{ti}_{orig_i}"
             seg_fill, seg_text = fill_c, text_c
-            r_here = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i)
+            r_here = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i, content)
             if draft_nm and segment_has_replace_config(draft_nm, r_here, pool_ui):
                 seg_fill, seg_text = ("#257a42", "#d4ffe3")
             rid = canvas.create_rectangle(
@@ -2043,6 +2635,9 @@ def populate_timeline_panel(
                 tags=("sseg", tag_s),
             )
             seg_rect_ids[(ti, orig_i)] = rid
+            seg_hit_z[(ti, orig_i)] = seg_paint_counter[0]
+            seg_paint_counter[0] += 1
+            track_visible_segs[ti].append((vis_i, orig_i))
             lab = _timeline_segment_label(seg, materials)
             title = f"#{vis_i + 1} {lab}"
             if x2 - x1 > 52:
@@ -2065,13 +2660,318 @@ def populate_timeline_panel(
             canvas.tag_bind(tag_s, "<Enter>", lambda _e: canvas.configure(cursor="hand2"))
             canvas.tag_bind(tag_s, "<Leave>", lambda _e: canvas.configure(cursor=""))
 
+    def _timeline_canvas_vscrolls() -> bool:
+        try:
+            sr = canvas.cget("scrollregion")
+            parts = sr.split()
+            if len(parts) >= 4:
+                total_h = int(float(parts[3]))
+                ch = int(canvas.winfo_height())
+                return total_h > ch + 2
+        except (tk.TclError, ValueError, TypeError):
+            pass
+        return False
+
+    def _timeline_focus_canvas(_event: Optional[tk.Event] = None) -> None:
+        try:
+            canvas.focus_set()
+        except tk.TclError:
+            pass
+
+    shell.bind("<Button-1>", _timeline_focus_canvas, add="+")
+    hbar.bind("<Button-1>", _timeline_focus_canvas, add="+")
+    canvas.bind("<Button-1>", _timeline_focus_canvas, add="+")
+    if need_vscroll:
+        try:
+            vbar.bind("<Button-1>", _timeline_focus_canvas, add="+")
+        except tk.TclError:
+            pass
+
+    def _scroll_seg_into_view(ti_v: int, orig_v: int) -> None:
+        key_v = (ti_v, orig_v)
+        if key_v not in seg_rect_ids:
+            return
+        bb = canvas.bbox(seg_rect_ids[key_v])
+        if not bb or len(bb) < 4:
+            return
+        x1, _y1, x2, _y2 = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+        try:
+            w = max(1, int(canvas.winfo_width()))
+        except tk.TclError:
+            return
+        margin = 48.0
+        total = float(max(1, canvas_w))
+        cleft = float(canvas.canvasx(0))
+        cright = float(canvas.canvasx(w))
+        if x1 < cleft + margin:
+            fr = max(0.0, min(1.0, (x1 - margin) / total))
+            try:
+                canvas.xview_moveto(fr)
+            except tk.TclError:
+                pass
+        elif x2 > cright - margin:
+            fr = max(0.0, min(1.0, (x2 - float(w) + margin) / total))
+            try:
+                canvas.xview_moveto(fr)
+            except tk.TclError:
+                pass
+
+    def _scroll_seg_left_edge_into_view(ti_v: int, orig_v: int) -> None:
+        """上下换轨时横向滚到当前片段矩形左缘（时间轴上素材起点一侧），与 _scroll_seg_into_view 的保守滚动不同。"""
+        key_v = (ti_v, orig_v)
+        if key_v not in seg_rect_ids:
+            return
+        bb = canvas.bbox(seg_rect_ids[key_v])
+        if not bb or len(bb) < 4:
+            return
+        x1 = float(bb[0])
+        margin = 8.0
+        total = float(max(1, canvas_w))
+        fr = max(0.0, min(1.0, (x1 - margin) / total))
+        try:
+            canvas.xview_moveto(fr)
+        except tk.TclError:
+            pass
+
+    def _scroll_track_row_into_view(ti_v: int) -> None:
+        if not _timeline_canvas_vscrolls():
+            return
+        try:
+            total_h = float(canvas_h)
+            ch = max(1, int(canvas.winfo_height()))
+        except tk.TclError:
+            return
+        y_row = float(ruler_h + row_gap + ti_v * (row_h + row_gap))
+        y_bot = y_row + float(row_h)
+        try:
+            top_frac, bot_frac = canvas.yview()
+        except tk.TclError:
+            return
+        vis_top = top_frac * total_h
+        vis_bot = bot_frac * total_h
+        margin = 8.0
+        if y_row < vis_top + margin:
+            fr = max(0.0, (y_row - margin) / max(1.0, total_h))
+            try:
+                canvas.yview_moveto(fr)
+            except tk.TclError:
+                pass
+        elif y_bot > vis_bot - margin:
+            span = max(1.0, total_h - ch)
+            fr = max(0.0, min(1.0, (y_bot - float(ch) + margin) / span))
+            try:
+                canvas.yview_moveto(fr)
+            except tk.TclError:
+                pass
+
+    def on_timeline_arrow_key(event: Any) -> str:
+        ks = str(getattr(event, "keysym", "") or "")
+        if ks not in ("Up", "Down", "Left", "Right"):
+            return ""
+        ntr = len(tracks_sorted)
+        if ntr <= 0:
+            return "break"
+
+        def _first_nonempty_seg() -> Optional[Tuple[int, int, int]]:
+            for ti_a in range(ntr):
+                lst_a = track_visible_segs.get(ti_a) or []
+                if lst_a:
+                    v0, o0 = lst_a[0]
+                    return (ti_a, v0, o0)
+            return None
+
+        def _last_nonempty_seg() -> Optional[Tuple[int, int, int]]:
+            for ti_a in range(ntr - 1, -1, -1):
+                lst_a = track_visible_segs.get(ti_a) or []
+                if lst_a:
+                    v0, o0 = lst_a[-1]
+                    return (ti_a, v0, o0)
+            return None
+
+        knd = str(sel.get("kind", "none") or "none")
+        if knd == "none":
+            hit = _first_nonempty_seg() if ks in ("Down", "Right") else _last_nonempty_seg()
+            if hit:
+                on_select_seg(hit[0], hit[1], hit[2])
+                _scroll_seg_into_view(hit[0], hit[2])
+            else:
+                ti0 = 0 if ks in ("Down", "Right") else max(0, ntr - 1)
+                on_select_track(ti0)
+                _scroll_track_row_into_view(ti0)
+            return "break"
+
+        if knd == "track":
+            try:
+                ti = int(sel.get("ti", 0))
+            except (TypeError, ValueError):
+                ti = 0
+            ti = max(0, min(ntr - 1, ti))
+            if ks == "Up":
+                if ti > 0:
+                    on_select_track(ti - 1)
+                    _scroll_track_row_into_view(ti - 1)
+            elif ks == "Down":
+                if ti + 1 < ntr:
+                    on_select_track(ti + 1)
+                    _scroll_track_row_into_view(ti + 1)
+            elif ks == "Right":
+                lst = track_visible_segs.get(ti) or []
+                if lst:
+                    v0, o0 = lst[0]
+                    on_select_seg(ti, v0, o0)
+                    _scroll_seg_into_view(ti, o0)
+            elif ks == "Left":
+                lst = track_visible_segs.get(ti) or []
+                if lst:
+                    v0, o0 = lst[-1]
+                    on_select_seg(ti, v0, o0)
+                    _scroll_seg_into_view(ti, o0)
+            return "break"
+
+        if knd == "seg":
+            try:
+                ti = int(sel.get("ti", 0))
+                oi = int(sel.get("orig_i", 0))
+                vi = int(sel.get("vis_i", 0))
+            except (TypeError, ValueError):
+                return "break"
+            ti = max(0, min(ntr - 1, ti))
+            lst = track_visible_segs.get(ti) or []
+            idx: Optional[int] = None
+            for j, pair in enumerate(lst):
+                if pair == (vi, oi):
+                    idx = j
+                    break
+            if idx is None and lst:
+                idx = 0
+                vi, oi = lst[0]
+            if ks in ("Left", "Right") and lst and idx is not None:
+                if ks == "Left" and idx > 0:
+                    v2, o2 = lst[idx - 1]
+                    on_select_seg(ti, v2, o2)
+                    _scroll_seg_into_view(ti, o2)
+                elif ks == "Right" and idx + 1 < len(lst):
+                    v2, o2 = lst[idx + 1]
+                    on_select_seg(ti, v2, o2)
+                    _scroll_seg_into_view(ti, o2)
+            elif ks in ("Up", "Down"):
+                if ks == "Up" and ti > 0:
+                    nt = ti - 1
+                elif ks == "Down" and ti + 1 < ntr:
+                    nt = ti + 1
+                else:
+                    return "break"
+                lst_tgt = track_visible_segs.get(nt) or []
+                if not lst_tgt:
+                    on_select_track(nt)
+                    _scroll_track_row_into_view(nt)
+                    return "break"
+                # 与当前轨「从左数第几条可见片段」对齐，目标轨更短时落在最后一条
+                col = int(idx if idx is not None else 0)
+                col = max(0, min(col, len(lst_tgt) - 1))
+                v2, o2 = lst_tgt[col]
+                on_select_seg(nt, v2, o2)
+                _scroll_seg_left_edge_into_view(nt, o2)
+            return "break"
+
+        return "break"
+
+    for _keyseq in ("<Up>", "<Down>", "<Left>", "<Right>"):
+        canvas.bind(_keyseq, on_timeline_arrow_key)
+
     apply_selection_visual()
     if sel.get("kind") == "none":
         _set_status(
-            "提示：点击左侧轨道名选中轨道；点击彩色条选中片段；音视频片段可右键「替换素材…」。"
-            " 轨道多时可滚轮上下浏览或拖右侧竖条；Ctrl+滚轮或标题栏「+/−」横向缩放。",
+            "提示：点击左侧轨道名选中轨道；点击彩色条选中片段；音视频片段可右键「替换素材…」"
+            "（Windows 下也可将单个文件或素材文件夹从资源管理器拖到片段条上，与弹窗保存一致）。"
+            " 时间轴区域点一下后可用方向键：左右切换同轨片段，上下换轨（保持同序）且横滚对齐片段左缘；"
+            "轨道多时可滚轮上下浏览或拖右侧竖条；Ctrl+滚轮或标题栏「+/−」横向缩放。",
             replace_highlight="",
         )
+
+    if sys.platform == "win32":
+        try:
+            import windnd  # type: ignore[import-untyped]
+        except Exception:
+            windnd = None  # type: ignore[assignment]
+        if windnd is not None:
+
+            def _decode_shell_path(p: Any) -> str:
+                if isinstance(p, bytes):
+                    for enc in ("utf-8", sys.getfilesystemencoding() or "utf-8", "gbk"):
+                        try:
+                            return p.decode(enc).strip("\0").strip()
+                        except UnicodeDecodeError:
+                            continue
+                    return p.decode("utf-8", errors="replace").strip("\0").strip()
+                return str(p).strip("\0").strip()
+
+            def _vis_index_for_segment(ti2: int, orig_i2: int) -> int:
+                tr2 = tracks_sorted[ti2]
+                raw2 = list(tr2.get("segments") or [])
+                order2 = sorted(
+                    range(len(raw2)),
+                    key=lambda i: int((raw2[i].get("target_timerange") or {}).get("start", 0)),
+                )
+                try:
+                    return order2.index(orig_i2)
+                except ValueError:
+                    return 0
+
+            def _timeline_hit_segment(cx: float, cy: float) -> Optional[Tuple[int, int]]:
+                if not seg_rect_ids:
+                    return None
+                hits: List[Tuple[int, int, int]] = []
+                for (ti2, oi2), rid in seg_rect_ids.items():
+                    bb = canvas.bbox(rid)
+                    if not bb or len(bb) < 4:
+                        continue
+                    x1, y1, x2, y2 = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+                    if x1 <= cx <= x2 and y1 <= cy <= y2:
+                        z = int(seg_hit_z.get((ti2, oi2), 0))
+                        hits.append((z, ti2, oi2))
+                if not hits:
+                    return None
+                hits.sort(key=lambda t: (t[0], t[1], t[2]))
+                return (hits[-1][1], hits[-1][2])
+
+            def _on_windnd_drop(paths_raw: Any) -> None:
+                ls = paths_raw if isinstance(paths_raw, (list, tuple)) else []
+                paths: List[str] = []
+                for x in ls:
+                    s = _decode_shell_path(x)
+                    if s:
+                        paths.append(os.path.normpath(s))
+                if not paths:
+                    return
+                try:
+                    px = int(canvas.winfo_pointerx())
+                    py = int(canvas.winfo_pointery())
+                    rx = int(canvas.winfo_rootx())
+                    ry = int(canvas.winfo_rooty())
+                except tk.TclError:
+                    return
+                cx = float(canvas.canvasx(px - rx))
+                cy = float(canvas.canvasy(py - ry))
+                hit = _timeline_hit_segment(cx, cy)
+                h = rs.get("_timeline_shell_drop_handler")
+                if not callable(h):
+                    return
+                if hit is None:
+                    h(None, paths)
+                    return
+                ti2, oi2 = hit
+                vi2 = _vis_index_for_segment(ti2, oi2)
+                try:
+                    on_select_seg(ti2, vi2, oi2)
+                except Exception:
+                    pass
+                h(sel.get("replace_ref"), paths)
+
+            try:
+                windnd.hook_dropfiles(canvas, _on_windnd_drop, force_unicode=True)
+            except Exception:
+                pass
 
     canvas.configure(scrollregion=(0, 0, canvas_w, canvas_h))
 
@@ -2290,7 +3190,7 @@ def run_app() -> None:
             auth_status_var.set("未登录（导出 MP4 需登录）")
             login_btn.configure(text="登录")
 
-    draft_root = ctk.StringVar(value=_default_draft_roots()[0] if _default_draft_roots() else "")
+    draft_root = ctk.StringVar(value=initial_draft_root_for_ui())
     selected_name: Optional[str] = None
 
     main = ctk.CTkFrame(root, fg_color="transparent")
@@ -2451,60 +3351,50 @@ def run_app() -> None:
     preset_toolbar_host = ctk.CTkFrame(timeline_status_area, fg_color="transparent")
     preset_toolbar_host.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(6, 0), pady=(0, 2))
 
-    timeline_sel_label = ctk.CTkLabel(
+    timeline_sel_label = ctk.CTkTextbox(
         timeline_status_left,
-        text="提示：点击轨道名选中整条轨道；点击片段时间条选中片段；明文稿中音视频片段可右键「替换素材…」。轨道多时可滚轮上下浏览；Ctrl+滚轮横向缩放。",
+        height=80,
+        width=80,
         font=ctk.CTkFont(size=11),
         text_color=("gray40", "gray60"),
-        anchor="nw",
-        justify="left",
-        wraplength=400,
+        fg_color="transparent",
+        border_width=0,
+        corner_radius=0,
+        activate_scrollbars=False,
+        wrap="word",
+        takefocus=False,
     )
     timeline_sel_label.grid(row=0, column=0, sticky="ew")
 
-    timeline_replace_highlight_label = ctk.CTkLabel(
+    timeline_replace_highlight_label = ctk.CTkTextbox(
         timeline_status_left,
-        text="",
+        height=52,
+        width=80,
         font=ctk.CTkFont(size=11),
         text_color=("#2dd48f", "#5ee9ad"),
-        anchor="nw",
-        justify="left",
-        wraplength=400,
+        fg_color="transparent",
+        border_width=0,
+        corner_radius=0,
+        activate_scrollbars=False,
+        wrap="word",
+        takefocus=False,
     )
     timeline_replace_highlight_label.grid(row=1, column=0, sticky="ew", pady=(2, 0))
 
-    _timeline_status_wrap_w: List[int] = [-1]
-
-    def _sync_timeline_status_wrap(_event: Optional[tk.Event] = None) -> None:
-        """按左侧信息区实际宽度设置 wraplength，避免窗体变窄时提示被裁切。"""
-        try:
-            timeline_status_left.update_idletasks()
-            w = int(timeline_status_left.winfo_width())
-        except (tk.TclError, ValueError, TypeError):
-            return
-        if w < 64:
-            return
-        if w == _timeline_status_wrap_w[0]:
-            return
-        _timeline_status_wrap_w[0] = w
-        wl = max(120, w - 24)
-        try:
-            timeline_sel_label.configure(wraplength=wl)
-            timeline_replace_highlight_label.configure(wraplength=wl)
-        except Exception:
-            pass
-
-    timeline_status_left.bind("<Configure>", lambda e: _sync_timeline_status_wrap(e))
-    root.after_idle(_sync_timeline_status_wrap)
+    _hint0 = (
+        "提示：点击左侧轨道名选中轨道；点击彩色条选中片段；音视频片段可右键「替换素材…」"
+        "（Windows 下也可将单个文件或素材文件夹从资源管理器拖到片段条上，与弹窗保存一致）。"
+        " 时间轴点一下后可用方向键：左右同轨片段，上下换轨（同序）且横滚对齐片段左缘；"
+        "轨道多时可滚轮上下浏览或拖右侧竖条；Ctrl+滚轮或标题栏「+/−」横向缩放。"
+    )
+    _ctk_readonly_text_set(timeline_sel_label, _hint0)
+    _ctk_readonly_text_set(timeline_replace_highlight_label, "")
 
     def refresh_timeline_segment_status_if_selected() -> None:
         """重绘时间轴后，若仍选中片段则按当前 segment_export_pool 等信息刷新下方说明。"""
         ts = timeline_select
         if ts.get("kind") != "seg" or ts.get("ti") is None or ts.get("orig_i") is None:
-            try:
-                timeline_replace_highlight_label.configure(text="")
-            except Exception:
-                pass
+            _timeline_status_set_text(timeline_replace_highlight_label, "", ctk_mod=ctk)
             return
         raw = timeline_content_cache[0]
         if not raw or not isinstance(raw, dict):
@@ -2522,11 +3412,8 @@ def run_app() -> None:
             return
         main, hl = parts
         ts["summary"] = main + (f"\n\n{hl}" if hl else "")
-        try:
-            timeline_sel_label.configure(text=main)
-            timeline_replace_highlight_label.configure(text=hl)
-        except Exception:
-            pass
+        _timeline_status_set_text(timeline_sel_label, main, ctk_mod=ctk)
+        _timeline_status_set_text(timeline_replace_highlight_label, hl, ctk_mod=ctk)
 
     export_strip = ctk.CTkFrame(right, fg_color="transparent")
     export_strip.grid(row=2, column=0, sticky="nsew", padx=12, pady=(4, 12))
@@ -2558,7 +3445,13 @@ def run_app() -> None:
             ("所有文件", "*.*"),
         ]
 
-    def _try_apply_ref(ref: MediaSegmentRef, npath: str) -> bool:
+    def _try_apply_ref(
+        ref: MediaSegmentRef,
+        npath: str,
+        *,
+        start_mode: str = VIDEO_REPLACE_SOURCE_HEAD,
+        start_sec: float = 0.0,
+    ) -> bool:
         from tkinter import messagebox
 
         name = selected_name
@@ -2578,41 +3471,28 @@ def run_app() -> None:
             )
             return False
         try:
-            _ensure_local_pyjianyingdraft_on_path()
-            from pyJianYingDraft import DraftFolder
-
-            lineage_parent = resolve_lineage_parent_for_nested_draft(base, name)
-            child_name = _next_generated_child_name(base, lineage_parent)
-            DraftFolder(base).duplicate_as_template(name, child_name, allow_replace=False)
-            content_child = os.path.join(base, child_name, "draft_content.json")
-            extra = apply_single_material_replace(content_child, ref, npath)
-            register_child_draft(base, lineage_parent, child_name)
-            remapped_pool = remap_draft_keyed_map(replace_state.get("segment_export_pool") or {}, name, child_name)
-            raw_cur = remap_draft_keyed_map(
-                replace_state.get("export_pool_sequential_cursor") or {}, name, child_name
-            )
-            cursor_ints: Dict[str, int] = {}
-            for k, v in raw_cur.items():
-                try:
-                    cursor_ints[k] = int(v)
-                except (TypeError, ValueError):
-                    cursor_ints[k] = 0
-            merge_remapped_pool_and_cursor_into_replace_state(replace_state, remapped_pool, cursor_ints)
-            ck = segment_export_pool_key(child_name, ref)
+            ck = segment_export_pool_key(name, ref)
             seg_map = replace_state.setdefault("segment_export_pool", {})
-            sub = dict(seg_map.get(ck) or {}) if isinstance(seg_map.get(ck), dict) else {}
-            sub["replace_file"] = os.path.abspath(npath)
-            seg_map[ck] = sub
+            sm = normalize_replace_source_start_mode(start_mode)
+            sec_v = float(parse_replace_source_start_sec(start_sec)) if sm == VIDEO_REPLACE_SOURCE_CUSTOM else 0.0
+            seg_map[ck] = {
+                "replace_file": os.path.abspath(npath),
+                "replace_source_start_mode": sm,
+                "replace_source_start_sec": sec_v,
+            }
+            persist_working_export_pool_snapshot(base, name, replace_state)
+            persist_active_named_export_pool_preset(base, name, pool_preset_var.get(), replace_state)
         except Exception as e:
-            messagebox.showerror("替换失败", f"槽 {slot_n}: {e}")
+            messagebox.showerror("保存失败", f"槽 {slot_n}: {e}")
             return False
-        tail = (
-            f"已保存为新子草稿「{child_name}」（归在父模板「{lineage_parent}」下），"
-            f"原草稿「{name}」未修改。\n若剪映已打开相关草稿，请关闭后重新打开以便加载。"
-        )
-        messagebox.showinfo("完成", f"{extra}\n\n{tail}" if extra else tail)
-        refresh_list()
-        show_draft(child_name)
+        try:
+            refresh_timeline_panel_data(None, reset_selection=False)
+        except Exception:
+            pass
+        try:
+            refresh_timeline_segment_status_if_selected()
+        except Exception:
+            pass
         return True
 
     def open_replace_material_dialog(ref: MediaSegmentRef) -> None:
@@ -2620,9 +3500,9 @@ def run_app() -> None:
 
         win = ctk.CTkToplevel(root)
         win.title("替换素材")
-        dlg_w, dlg_h = 600, 360
+        dlg_w, dlg_h = 600, 440
         win.geometry(f"{dlg_w}x{dlg_h}")
-        win.minsize(520, 320)
+        win.minsize(520, 360)
         win.transient(root)
 
         main = ctk.CTkFrame(win, fg_color="transparent")
@@ -2656,9 +3536,19 @@ def run_app() -> None:
         )
         _ord0 = _cfg0.get("order", "random")
         seg_order_var = ctk.StringVar(value=_ord0 if _ord0 in ("random", "sequential") else "random")
-        if _cfg0.get("dir"):
-            dir_var.set(str(_cfg0.get("dir", "")))
+        _rf0 = str(_cfg0.get("replace_file", "") or "").strip()
+        _d0 = str(_cfg0.get("dir", "") or "").strip()
+        if _rf0:
+            path_var.set(_rf0)
+            mode_var.set("file")
+        elif _d0:
+            dir_var.set(_d0)
             mode_var.set("dir")
+        replace_src_mode_var = ctk.StringVar(
+            value=normalize_replace_source_start_mode(_cfg0.get("replace_source_start_mode"))
+        )
+        _rsv0 = parse_replace_source_start_sec(_cfg0.get("replace_source_start_sec"))
+        replace_src_sec_var = ctk.StringVar(value="" if _rsv0 == 0 else str(_rsv0))
 
         mode_row = ctk.CTkFrame(main, fg_color="transparent")
         mode_row.pack(fill="x", padx=0, pady=(0, 6))
@@ -2696,6 +3586,63 @@ def run_app() -> None:
         )
         rb_dir.pack(side="left")
 
+        start_block = ctk.CTkFrame(main, fg_color="transparent")
+        start_block.pack(fill="x", padx=0, pady=(4, 2))
+        start_line = ctk.CTkFrame(start_block, fg_color="transparent")
+        start_line.pack(fill="x")
+        ctk.CTkLabel(start_line, text="起点", width=52, anchor="w", font=ctk.CTkFont(size=11)).pack(
+            side="left", padx=(0, 8)
+        )
+        start_inner = ctk.CTkFrame(start_line, fg_color="transparent")
+        start_inner.pack(side="left", fill="x", expand=True)
+
+        sec_row = ctk.CTkFrame(start_block, fg_color="transparent")
+
+        def _sync_replace_src_sec_row(*_args: Any) -> None:
+            if replace_src_mode_var.get() == VIDEO_REPLACE_SOURCE_CUSTOM:
+                sec_row.pack(fill="x", pady=(6, 0))
+            else:
+                sec_row.pack_forget()
+
+        rb_src_head = ctk.CTkRadioButton(
+            start_inner,
+            text="片头",
+            variable=replace_src_mode_var,
+            value=VIDEO_REPLACE_SOURCE_HEAD,
+            font=ctk.CTkFont(size=11),
+            command=_sync_replace_src_sec_row,
+        )
+        rb_src_head.pack(side="left", padx=(0, 10))
+        rb_src_rand = ctk.CTkRadioButton(
+            start_inner,
+            text="随机",
+            variable=replace_src_mode_var,
+            value=VIDEO_REPLACE_SOURCE_RANDOM,
+            font=ctk.CTkFont(size=11),
+            command=_sync_replace_src_sec_row,
+        )
+        rb_src_rand.pack(side="left", padx=(0, 10))
+        rb_src_custom = ctk.CTkRadioButton(
+            start_inner,
+            text="自定义秒",
+            variable=replace_src_mode_var,
+            value=VIDEO_REPLACE_SOURCE_CUSTOM,
+            font=ctk.CTkFont(size=11),
+            command=_sync_replace_src_sec_row,
+        )
+        rb_src_custom.pack(side="left", padx=(0, 0))
+
+        ctk.CTkLabel(sec_row, text="", width=52).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(sec_row, text="从第几秒起", font=ctk.CTkFont(size=11), anchor="w").pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(
+            sec_row,
+            textvariable=replace_src_sec_var,
+            width=100,
+            height=30,
+            placeholder_text="如 2 或 2.5",
+        ).pack(side="left", padx=(0, 0))
+        replace_src_mode_var.trace_add("write", _sync_replace_src_sec_row)
+
         def _persist_segment_export_pool() -> None:
             dn = (selected_name or "").strip()
             if not dn:
@@ -2706,16 +3653,23 @@ def run_app() -> None:
             od = seg_order_var.get()
             if od not in ("random", "sequential"):
                 od = "random"
-            # 「单个文件」下替换不改动已保存的导出目录；仅在「素材目录」模式下写入或清空。
             if mode_var.get() != "dir":
                 return
             if d:
-                prev = dict(pool.get(k) or {}) if isinstance(pool.get(k), dict) else {}
-                prev["dir"] = d
-                prev["order"] = od
-                pool[k] = prev
+                sm = normalize_replace_source_start_mode(replace_src_mode_var.get())
+                sec_v = parse_replace_source_start_sec(replace_src_sec_var.get()) if sm == VIDEO_REPLACE_SOURCE_CUSTOM else 0.0
+                pool[k] = {
+                    "dir": d,
+                    "order": od,
+                    "replace_source_start_mode": sm,
+                    "replace_source_start_sec": float(sec_v) if sm == VIDEO_REPLACE_SOURCE_CUSTOM else 0.0,
+                }
             else:
                 pool.pop(k, None)
+            base_s = draft_root.get().strip()
+            if base_s:
+                persist_working_export_pool_snapshot(base_s, dn, replace_state)
+                persist_active_named_export_pool_preset(base_s, dn, pool_preset_var.get(), replace_state)
 
         def resolve_replacement_path() -> Optional[str]:
             # 目录模式仅配置导出套素材；立即替换文件请用「单个文件」。
@@ -2730,7 +3684,12 @@ def run_app() -> None:
                 if not p:
                     messagebox.showwarning("文件无效", "请填写或浏览选择一个素材文件。")
                     return
-                if _try_apply_ref(ref, p):
+                sm = normalize_replace_source_start_mode(replace_src_mode_var.get())
+                sec_v = parse_replace_source_start_sec(replace_src_sec_var.get()) if sm == VIDEO_REPLACE_SOURCE_CUSTOM else 0.0
+                if sm == VIDEO_REPLACE_SOURCE_CUSTOM and sec_v < 0:
+                    messagebox.showwarning("秒数无效", "起点秒数不能为负数。")
+                    return
+                if _try_apply_ref(ref, p, start_mode=sm, start_sec=sec_v):
                     try:
                         win.destroy()
                     except Exception:
@@ -2855,6 +3814,7 @@ def run_app() -> None:
         ).pack(side="left")
 
         sync_mode()
+        _sync_replace_src_sec_row()
 
         def _cancel_replace_dialog() -> None:
             win.destroy()
@@ -2888,7 +3848,116 @@ def run_app() -> None:
     bottom_actions.pack(fill="both", expand=True)
 
     pool_preset_suppress: Dict[str, Any] = {"v": False}
-    pool_preset_var = ctk.StringVar(value=POOL_EXPORT_PRESET_KEEP)
+    pool_preset_var = ctk.StringVar(value=POOL_EXPORT_PRESET_DEFAULT)
+
+    def _persist_dir_for_ref(
+        ref: MediaSegmentRef,
+        d: str,
+        order: str,
+        start_mode: str,
+        start_sec: float,
+    ) -> bool:
+        from tkinter import messagebox
+
+        dn = (selected_name or "").strip()
+        base_s = draft_root.get().strip()
+        if not dn:
+            messagebox.showwarning("拖放", "请先在左侧选择草稿。")
+            return False
+        if not base_s:
+            messagebox.showwarning("拖放", "请先设置有效的草稿根目录。")
+            return False
+        d_abs = os.path.abspath(d)
+        if not os.path.isdir(d_abs):
+            messagebox.showwarning("目录无效", "拖入的路径不是有效的文件夹。")
+            return False
+        k = segment_export_pool_key(dn, ref)
+        pool: Dict[str, Dict[str, Any]] = replace_state.setdefault("segment_export_pool", {})
+        od = order if order in ("random", "sequential") else "random"
+        sm = normalize_replace_source_start_mode(start_mode)
+        sec_v = (
+            float(parse_replace_source_start_sec(start_sec))
+            if sm == VIDEO_REPLACE_SOURCE_CUSTOM
+            else 0.0
+        )
+        pool[k] = {
+            "dir": d_abs,
+            "order": od,
+            "replace_source_start_mode": sm,
+            "replace_source_start_sec": sec_v,
+        }
+        try:
+            persist_working_export_pool_snapshot(base_s, dn, replace_state)
+            persist_active_named_export_pool_preset(base_s, dn, pool_preset_var.get(), replace_state)
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
+            return False
+        try:
+            refresh_timeline_panel_data(None, reset_selection=False)
+        except Exception:
+            pass
+        try:
+            refresh_timeline_segment_status_if_selected()
+        except Exception:
+            pass
+        return True
+
+    def _handle_timeline_shell_drop(ref: Optional[MediaSegmentRef], paths: List[str]) -> None:
+        from tkinter import messagebox
+
+        if not paths:
+            return
+        if len(paths) > 1:
+            messagebox.showwarning("拖放", "一次请只拖入一个文件或一个文件夹。")
+            return
+        p = paths[0]
+        if not ref:
+            messagebox.showwarning(
+                "拖放",
+                "请将文件或文件夹拖到时间轴上的音视频片段（彩色条）上；"
+                "不可替换的轨道片段上无法接收拖放。",
+            )
+            return
+        if not replace_state.get("content_ok") or replace_state.get("encrypted"):
+            messagebox.showerror(
+                "无法替换",
+                "draft_content.json 不可用（未加载或已加密），无法配置替换素材。",
+            )
+            return
+        name = (selected_name or "").strip()
+        if not name:
+            messagebox.showwarning("拖放", "请先在左侧选择草稿。")
+            return
+        ck = segment_export_pool_key(name, ref)
+        prev: Dict[str, Any] = {}
+        raw_pool = replace_state.get("segment_export_pool")
+        if isinstance(raw_pool, dict):
+            pv = raw_pool.get(ck)
+            if isinstance(pv, dict):
+                prev = pv
+        if os.path.isfile(p):
+            sm = normalize_replace_source_start_mode(prev.get("replace_source_start_mode"))
+            sec_v = (
+                parse_replace_source_start_sec(prev.get("replace_source_start_sec"))
+                if sm == VIDEO_REPLACE_SOURCE_CUSTOM
+                else 0.0
+            )
+            _try_apply_ref(ref, p, start_mode=sm, start_sec=sec_v)
+        elif os.path.isdir(p):
+            od = prev.get("order", "random")
+            if od not in ("random", "sequential"):
+                od = "random"
+            sm = normalize_replace_source_start_mode(prev.get("replace_source_start_mode"))
+            sec_v = (
+                parse_replace_source_start_sec(prev.get("replace_source_start_sec"))
+                if sm == VIDEO_REPLACE_SOURCE_CUSTOM
+                else 0.0
+            )
+            _persist_dir_for_ref(ref, p, od, sm, sec_v)
+        else:
+            messagebox.showwarning("拖放", "拖入的路径不是有效的文件或文件夹。")
+
+    replace_state["_timeline_shell_drop_handler"] = _handle_timeline_shell_drop
 
     preset_toolbar = ctk.CTkFrame(preset_toolbar_host, fg_color="transparent")
     preset_toolbar.pack(anchor="ne")
@@ -2899,9 +3968,23 @@ def run_app() -> None:
     def _apply_export_pool_preset_choice(choice: str) -> None:
         base_s = draft_root.get().strip()
         dn = (selected_name or "").strip()
-        if choice == POOL_EXPORT_PRESET_KEEP:
-            replace_state["segment_export_pool"] = {}
-            replace_state["export_pool_sequential_cursor"] = {}
+        if is_pool_export_default_menu_preset(choice):
+            if base_s and dn:
+                bkt = (load_export_pool_store(base_s).get("by_draft") or {}).get(dn) or {}
+                wp = bkt.get("working_pool")
+                if isinstance(wp, dict):
+                    seg_wp = wp.get("segment_export_pool")
+                    cur_wp = wp.get("export_pool_sequential_cursor")
+                    replace_state["segment_export_pool"] = segment_export_pool_enforce_exclusive_sources(
+                        dict(seg_wp) if isinstance(seg_wp, dict) else {}
+                    )
+                    replace_state["export_pool_sequential_cursor"] = _normalize_export_pool_cursor_dict(cur_wp)
+                else:
+                    replace_state["segment_export_pool"] = {}
+                    replace_state["export_pool_sequential_cursor"] = {}
+            else:
+                replace_state["segment_export_pool"] = {}
+                replace_state["export_pool_sequential_cursor"] = {}
         else:
             blob = get_export_pool_preset_blob_for_draft(base_s, dn, choice) if base_s and dn else None
             if not isinstance(blob, dict):
@@ -2910,7 +3993,9 @@ def run_app() -> None:
             else:
                 seg = blob.get("segment_export_pool")
                 cur = blob.get("export_pool_sequential_cursor")
-                replace_state["segment_export_pool"] = dict(seg) if isinstance(seg, dict) else {}
+                replace_state["segment_export_pool"] = segment_export_pool_enforce_exclusive_sources(
+                    dict(seg) if isinstance(seg, dict) else {}
+                )
                 replace_state["export_pool_sequential_cursor"] = {}
                 if isinstance(cur, dict):
                     for ck, cv in cur.items():
@@ -2944,7 +4029,7 @@ def run_app() -> None:
     ).pack(side="left", padx=(0, 4))
     pool_preset_menu = ctk.CTkOptionMenu(
         preset_toolbar,
-        values=[POOL_EXPORT_PRESET_KEEP],
+        values=[POOL_EXPORT_PRESET_DEFAULT],
         variable=pool_preset_var,
         width=140,
         height=26,
@@ -2957,16 +4042,16 @@ def run_app() -> None:
         base_s = draft_root.get().strip()
         dn = (selected_name or "").strip()
         names = _export_pool_preset_name_list(base_s, dn)
-        vals = [POOL_EXPORT_PRESET_KEEP] + names
+        vals = [POOL_EXPORT_PRESET_DEFAULT] + names
         pool_preset_suppress["v"] = True
         try:
             pool_preset_menu.configure(values=vals)
             if reset_memory or not base_s or not os.path.isdir(base_s):
-                pool_preset_var.set(POOL_EXPORT_PRESET_KEEP)
+                pool_preset_var.set(POOL_EXPORT_PRESET_DEFAULT)
         finally:
             pool_preset_suppress["v"] = False
         if reset_memory or not base_s or not os.path.isdir(base_s):
-            _apply_export_pool_preset_choice(POOL_EXPORT_PRESET_KEEP)
+            _apply_export_pool_preset_choice(POOL_EXPORT_PRESET_DEFAULT)
 
     def sync_export_pool_preset_for_draft(draft_folder_name: str) -> None:
         """切换草稿后：按该稿记录恢复下拉项与上次选用的预设。"""
@@ -2977,12 +4062,13 @@ def run_app() -> None:
         if not dn:
             return
         names = export_pool_preset_names_for_draft(base_s, dn)
-        vals = [POOL_EXPORT_PRESET_KEEP] + names
+        vals = [POOL_EXPORT_PRESET_DEFAULT] + names
         store = load_export_pool_store(base_s)
         b = (store.get("by_draft") or {}).get(dn) or {}
         last = b.get("last_preset") if isinstance(b, dict) else None
-        if not isinstance(last, str) or last.strip() not in vals:
-            last = POOL_EXPORT_PRESET_KEEP
+        last = normalize_pool_export_last_preset_value(last)
+        if last not in vals:
+            last = POOL_EXPORT_PRESET_DEFAULT
         pool_preset_suppress["v"] = True
         try:
             pool_preset_menu.configure(values=vals)
@@ -3000,7 +4086,7 @@ def run_app() -> None:
             messagebox.showwarning("无法保存", "请先设置有效的草稿根目录。")
             return
         dlg = CTkInputDialog(
-            text="预设名称（保存当前所有槽的目录与顺序模式）：",
+            text="预设名称（保存当前各槽的目录/顺序与单个替换文件）：",
             title="保存导出槽预设",
         )
         _center_ctk_input_dialog_on_parent(dlg, root)
@@ -3014,7 +4100,7 @@ def run_app() -> None:
                     dlg.after(15, lambda: _prefill_preset_name(attempts + 1))
                     return
                 default_name = (pool_preset_var.get() or "").strip()
-                if default_name and default_name != POOL_EXPORT_PRESET_KEEP:
+                if default_name and not is_pool_export_default_menu_preset(default_name):
                     ent.delete(0, "end")
                     ent.insert(0, default_name)
                     try:
@@ -3026,7 +4112,7 @@ def run_app() -> None:
 
         dlg.after(20, lambda: _prefill_preset_name(0))
         name = (dlg.get_input() or "").strip()
-        if not name or name == POOL_EXPORT_PRESET_KEEP:
+        if not name or is_pool_export_default_menu_preset(name):
             return
         if re.search(r'[<>:"/\\|?*]', name):
             messagebox.showwarning("名称无效", "预设名不能包含下列字符：< > : \" / \\ | ? *")
@@ -3039,9 +4125,24 @@ def run_app() -> None:
         if not isinstance(seg, dict) or not seg:
             messagebox.showinfo(
                 "保存预设",
-                "当前没有可保存的「素材目录」槽位配置。\n请在「替换素材…」弹窗中选择「素材目录」并为至少一个片段指定目录后再保存。",
+                "当前没有可保存的槽位配置。\n请在「替换素材…」中为至少一个片段指定「素材目录」或「单个文件」后再保存。",
             )
             return
+        has_slot = False
+        for _k, sv in seg.items():
+            if not isinstance(sv, dict):
+                continue
+            if str(sv.get("dir", "") or "").strip() or str(sv.get("replace_file", "") or "").strip():
+                has_slot = True
+                break
+        if not has_slot:
+            messagebox.showinfo(
+                "保存预设",
+                "当前没有可保存的槽位配置。\n请在「替换素材…」中为至少一个片段指定「素材目录」或「单个文件」后再保存。",
+            )
+            return
+        seg = segment_export_pool_enforce_exclusive_sources(seg)
+        replace_state["segment_export_pool"] = seg
         store = load_export_pool_store(base_s)
         bucket = _export_pool_by_draft_bucket_mut(store, dn)
         presets = bucket.setdefault("presets", {})
@@ -3071,6 +4172,7 @@ def run_app() -> None:
             pool_preset_var.set(name)
         finally:
             pool_preset_suppress["v"] = False
+        persist_working_export_pool_snapshot(base_s, dn, replace_state)
 
     def on_delete_export_pool_preset() -> None:
         from tkinter import messagebox
@@ -3080,8 +4182,8 @@ def run_app() -> None:
         if not base_s or not os.path.isdir(base_s):
             messagebox.showwarning("无法删除", "请先设置有效的草稿根目录。")
             return
-        if cur == POOL_EXPORT_PRESET_KEEP:
-            messagebox.showinfo("删除预设", "请先在列表中选择一个已保存的预设（非「保持原样」）。")
+        if is_pool_export_default_menu_preset(cur):
+            messagebox.showinfo("删除预设", "请先在列表中选择一个已保存的预设（「(默认)」不可删除）。")
             return
         dn = (selected_name or "").strip()
         if not dn:
@@ -3108,7 +4210,7 @@ def run_app() -> None:
                 removed = True
         if removed:
             bkt = _export_pool_by_draft_bucket_mut(store, dn)
-            bkt["last_preset"] = POOL_EXPORT_PRESET_KEEP
+            bkt["last_preset"] = POOL_EXPORT_PRESET_DEFAULT
             save_export_pool_store(base_s, store)
         else:
             messagebox.showinfo("删除预设", "未找到可删除的预设（可能已被删除）。")
@@ -3116,10 +4218,10 @@ def run_app() -> None:
         refresh_export_pool_preset_bar(reset_memory=False)
         pool_preset_suppress["v"] = True
         try:
-            pool_preset_var.set(POOL_EXPORT_PRESET_KEEP)
+            pool_preset_var.set(POOL_EXPORT_PRESET_DEFAULT)
         finally:
             pool_preset_suppress["v"] = False
-        _apply_export_pool_preset_choice(POOL_EXPORT_PRESET_KEEP)
+        _apply_export_pool_preset_choice(POOL_EXPORT_PRESET_DEFAULT)
 
     ctk.CTkButton(
         preset_toolbar,
@@ -3141,6 +4243,18 @@ def run_app() -> None:
         hover_color=("gray60", "gray28"),
         command=on_delete_export_pool_preset,
     ).pack(side="left", padx=(0, 0))
+    ctk.CTkLabel(
+        preset_toolbar_host,
+        text=(
+            "「(默认)」＝本稿工作台槽位（可改、会保存到本地）；"
+            "命名预设下改动会写回该预设。"
+        ),
+        font=ctk.CTkFont(size=10),
+        text_color=("gray45", "gray62"),
+        anchor="e",
+        justify="right",
+        wraplength=360,
+    ).pack(anchor="ne", pady=(3, 0))
 
     export_row = ctk.CTkFrame(bottom_actions, fg_color="transparent")
     export_row.pack(fill="x", pady=(0, 0))
@@ -3151,9 +4265,41 @@ def run_app() -> None:
     export_actions = ctk.CTkFrame(export_row, fg_color="transparent")
     export_actions.pack(side="right", anchor="n")
 
-    backup_before_export = ctk.BooleanVar(value=False)
-    export_repeat_var = ctk.StringVar(value="1")
-    export_name_prefix_var = ctk.StringVar(value="video_")
+    _exp_ui = load_export_mp4_ui_preferences()
+    backup_before_export = ctk.BooleanVar(
+        value=_export_ui_pref_bool(_exp_ui, "backup_before_export", False)
+    )
+    export_generate_subtitles = ctk.BooleanVar(
+        value=_export_ui_pref_bool(_exp_ui, "generate_subtitles", False)
+    )
+    export_mp4_create_child_draft = ctk.BooleanVar(
+        value=_export_ui_pref_bool(_exp_ui, "create_child_draft", True)
+    )
+    export_repeat_var = ctk.StringVar(value=_export_ui_pref_repeat(_exp_ui))
+    export_name_prefix_var = ctk.StringVar(value=_export_ui_pref_name_prefix(_exp_ui))
+
+    def _persist_export_mp4_ui_prefs(*_args: Any) -> None:
+        try:
+            save_export_mp4_ui_preferences(
+                {
+                    "backup_before_export": bool(backup_before_export.get()),
+                    "generate_subtitles": bool(export_generate_subtitles.get()),
+                    "create_child_draft": bool(export_mp4_create_child_draft.get()),
+                    "export_repeat": export_repeat_var.get().strip() or "1",
+                    "name_prefix": export_name_prefix_var.get(),
+                }
+            )
+        except OSError:
+            pass
+
+    for _ev in (
+        backup_before_export,
+        export_generate_subtitles,
+        export_mp4_create_child_draft,
+        export_repeat_var,
+        export_name_prefix_var,
+    ):
+        _ev.trace_add("write", lambda *_: _persist_export_mp4_ui_prefs())
     _export_busy_widgets: List[Any] = []
 
     def on_export_mp4() -> None:
@@ -3245,7 +4391,12 @@ def run_app() -> None:
         deduct_res = auth_client.record_operation(
             "导出为MP4",
             -total_cost,
-            {"draft_name": name, "export_count": n_export, "name_prefix": preview_prefix},
+            {
+                "draft_name": name,
+                "export_count": n_export,
+                "name_prefix": preview_prefix,
+                "create_child_draft": bool(export_mp4_create_child_draft.get()),
+            },
         )
         err_deduct = _auth_api_error_message(deduct_res) if _auth_api_error_message else None
         if err_deduct:
@@ -3259,60 +4410,144 @@ def run_app() -> None:
             except tk.TclError:
                 pass
 
+        gen_subtitles = export_generate_subtitles.get()
+        create_child = bool(export_mp4_create_child_draft.get())
+
         def worker() -> None:
             err: Optional[Exception] = None
             try:
                 from pyJianYingDraft import DraftFolder, ExportFramerate, ExportResolution
 
                 ctrl = wait_jianying_controller_or_launch_process(exe_path=jianying_exe_pick)
-                df = DraftFolder(base)
+                df = DraftFolder(base) if create_child else None
                 need_refresh = False
                 last_child: Optional[str] = None
+                did_inplace_pool_export = False
                 for out_one in out_paths:
-                    lineage_parent = resolve_lineage_parent_for_nested_draft(base, name)
-                    child_name = _next_generated_child_name(base, lineage_parent)
-                    df.duplicate_as_template(name, child_name, allow_replace=False)
-                    content_json_c = os.path.join(base, child_name, "draft_content.json")
-                    seg_pool: Dict[str, Dict[str, Any]] = dict(replace_state.get("segment_export_pool") or {})
-                    remapped_pool = remap_draft_keyed_map(seg_pool, name, child_name)
-                    raw_cur = remap_draft_keyed_map(
-                        replace_state.get("export_pool_sequential_cursor") or {}, name, child_name
-                    )
-                    cursor_ints: Dict[str, int] = {}
-                    for k, v in raw_cur.items():
-                        try:
-                            cursor_ints[k] = int(v)
-                        except (TypeError, ValueError):
-                            cursor_ints[k] = 0
-                    ok_n, _sk, pool_errs, exp_n = apply_per_segment_export_pools_to_draft(
-                        content_json_c,
-                        child_name,
-                        remapped_pool,
-                        cursor_ints,
-                    )
-                    if exp_n > 0:
-                        if ok_n == 0:
+                    inplace_backup: Optional[Dict[str, Any]] = None
+                    inplace_path: Optional[str] = None
+                    if create_child:
+                        assert df is not None
+                        lineage_parent = resolve_lineage_parent_for_nested_draft(base, name)
+                        child_name = _next_generated_child_name(base, lineage_parent)
+                        df.duplicate_as_template(name, child_name, allow_replace=False)
+                        content_json_c = os.path.join(base, child_name, "draft_content.json")
+                        seg_pool: Dict[str, Dict[str, Any]] = dict(
+                            replace_state.get("segment_export_pool") or {}
+                        )
+                        remapped_pool = remap_draft_keyed_map(seg_pool, name, child_name)
+                        raw_cur = remap_draft_keyed_map(
+                            replace_state.get("export_pool_sequential_cursor") or {}, name, child_name
+                        )
+                        cursor_ints: Dict[str, int] = {}
+                        for k, v in raw_cur.items():
+                            try:
+                                cursor_ints[k] = int(v)
+                            except (TypeError, ValueError):
+                                cursor_ints[k] = 0
+                        ok_n, _sk, pool_errs, exp_n = apply_per_segment_export_pools_to_draft(
+                            content_json_c,
+                            child_name,
+                            remapped_pool,
+                            cursor_ints,
+                        )
+                        if exp_n > 0:
+                            if ok_n == 0:
+                                if pool_errs:
+                                    raise RuntimeError("从目录套素材失败：\n" + "\n".join(pool_errs[:12]))
+                                raise RuntimeError(
+                                    "已有片段配置了导出素材目录，但未能替换任何槽。"
+                                    "请确认明文草稿，且各片段对应目录内有与槽类型匹配后缀的素材。"
+                                )
                             if pool_errs:
                                 raise RuntimeError("从目录套素材失败：\n" + "\n".join(pool_errs[:12]))
-                            raise RuntimeError(
-                                "已有片段配置了导出素材目录，但未能替换任何槽。"
-                                "请确认明文草稿，且各片段对应目录内有与槽类型匹配后缀的素材。"
+                        elif pool_errs:
+                            raise RuntimeError("套素材失败：\n" + "\n".join(pool_errs[:12]))
+                        register_child_draft(base, lineage_parent, child_name)
+                        merge_remapped_pool_and_cursor_into_replace_state(
+                            replace_state, remapped_pool, cursor_ints
+                        )
+                        draft_to_export = child_name
+                    else:
+                        draft_to_export = name
+                        if draft_has_any_segment_export_pool(name, replace_state.get("segment_export_pool")):
+                            inplace_path = os.path.join(base, name, "draft_content.json")
+                            snap = _safe_read_json(inplace_path)
+                            if not isinstance(snap, dict):
+                                raise RuntimeError(
+                                    "无法读取当前草稿的 draft_content.json，已中止导出（避免未还原的改写）。"
+                                )
+                            inplace_backup = copy.deepcopy(snap)
+                            seg_pool_b: Dict[str, Dict[str, Any]] = dict(
+                                replace_state.get("segment_export_pool") or {}
                             )
-                        if pool_errs:
-                            raise RuntimeError("从目录套素材失败：\n" + "\n".join(pool_errs[:12]))
-                    register_child_draft(base, lineage_parent, child_name)
-                    merge_remapped_pool_and_cursor_into_replace_state(replace_state, remapped_pool, cursor_ints)
-                    ctrl.export_draft(
-                        child_name,
-                        out_one,
-                        resolution=ExportResolution.RES_1080P,
-                        framerate=ExportFramerate.FR_30,
-                    )
-                    last_child = child_name
-                    need_refresh = True
+                            raw_cur_b = dict(replace_state.get("export_pool_sequential_cursor") or {})
+                            cursor_b: Dict[str, int] = {}
+                            for k, v in raw_cur_b.items():
+                                try:
+                                    cursor_b[k] = int(v)
+                                except (TypeError, ValueError):
+                                    cursor_b[k] = 0
+                            try:
+                                ok_nb, _skb, pool_errs_b, exp_nb = apply_per_segment_export_pools_to_draft(
+                                    inplace_path,
+                                    name,
+                                    seg_pool_b,
+                                    cursor_b,
+                                )
+                                if exp_nb > 0:
+                                    if ok_nb == 0:
+                                        if pool_errs_b:
+                                            raise RuntimeError(
+                                                "从目录套素材失败：\n" + "\n".join(pool_errs_b[:12])
+                                            )
+                                        raise RuntimeError(
+                                            "已有片段配置了导出素材目录，但未能替换任何槽。"
+                                            "请确认明文草稿，且各片段对应目录内有与槽类型匹配后缀的素材。"
+                                        )
+                                    if pool_errs_b:
+                                        raise RuntimeError(
+                                            "从目录套素材失败：\n" + "\n".join(pool_errs_b[:12])
+                                        )
+                                elif pool_errs_b:
+                                    raise RuntimeError("套素材失败：\n" + "\n".join(pool_errs_b[:12]))
+                                merge_remapped_pool_and_cursor_into_replace_state(
+                                    replace_state, seg_pool_b, cursor_b
+                                )
+                            except Exception:
+                                try:
+                                    if inplace_backup is not None and inplace_path:
+                                        _write_draft_content_json(inplace_path, inplace_backup)
+                                except OSError:
+                                    pass
+                                raise
+                    try:
+                        ctrl.export_draft(
+                            draft_to_export,
+                            out_one,
+                            resolution=ExportResolution.RES_1080P,
+                            framerate=ExportFramerate.FR_30,
+                            subtitle_recognition=gen_subtitles,
+                            clear_existing_subtitles=True,
+                        )
+                    finally:
+                        if not create_child and inplace_backup is not None and inplace_path:
+                            try:
+                                _write_draft_content_json(inplace_path, inplace_backup)
+                                did_inplace_pool_export = True
+                            except OSError as oe:
+                                raise RuntimeError(
+                                    "导出后还原 draft_content.json 失败，请关闭占用该草稿的剪映窗口后重试：\n"
+                                    f"{oe}"
+                                ) from oe
+                    if create_child:
+                        last_child = draft_to_export
+                        need_refresh = True
                 if need_refresh and last_child:
                     root.after(0, refresh_list)
                     root.after(0, lambda c=last_child: show_draft(c))
+                elif did_inplace_pool_export:
+                    root.after(0, lambda n=name: show_draft(n))
             except Exception as e:
                 err = e
 
@@ -3480,6 +4715,8 @@ def run_app() -> None:
                             )
                         if pool_errs:
                             raise RuntimeError("从目录套素材失败：\n" + "\n".join(pool_errs[:12]))
+                    elif pool_errs:
+                        raise RuntimeError("套素材失败：\n" + "\n".join(pool_errs[:12]))
                     register_child_draft(base, lineage_parent, child_name)
                     merge_remapped_pool_and_cursor_into_replace_state(replace_state, remapped_pool, cursor_ints)
                     created.append(child_name)
@@ -3691,18 +4928,30 @@ def run_app() -> None:
     )
     export_btn.pack(side="left", padx=(0, 0))
     _export_busy_widgets.extend([generate_drafts_btn, export_btn])
-    backup_chk_align = ctk.CTkFrame(export_mp4_col, fg_color="transparent", width=_export_btn_row_w, height=32)
-    backup_chk_align.pack(anchor="w")
-    try:
-        backup_chk_align.pack_propagate(False)
-    except tk.TclError:
-        pass
-    ctk.CTkCheckBox(
-        backup_chk_align,
+    chk_row = ctk.CTkFrame(export_mp4_col, fg_color="transparent")
+    chk_row.pack(anchor="w", pady=(0, 2))
+    backup_chk = ctk.CTkCheckBox(
+        chk_row,
         text="导出前备份明文",
         variable=backup_before_export,
         font=ctk.CTkFont(size=12),
-    ).pack(side="right")
+    )
+    backup_chk.pack(side="left", padx=(0, 18))
+    gen_sub_chk = ctk.CTkCheckBox(
+        chk_row,
+        text="生成字幕",
+        variable=export_generate_subtitles,
+        font=ctk.CTkFont(size=12),
+    )
+    gen_sub_chk.pack(side="left", padx=(0, 18))
+    mp4_child_chk = ctk.CTkCheckBox(
+        chk_row,
+        text="导出生成子草稿",
+        variable=export_mp4_create_child_draft,
+        font=ctk.CTkFont(size=12),
+    )
+    mp4_child_chk.pack(side="left")
+    _export_busy_widgets.extend([backup_chk, gen_sub_chk, mp4_child_chk])
 
     draft_buttons: List[Any] = []
     collapsed_parents: set[str] = set()
@@ -3720,9 +4969,15 @@ def run_app() -> None:
 
     def set_path(p: str) -> None:
         nonlocal draft_root
+        p = (p or "").strip()
         draft_root.set(p)
         path_entry.delete(0, "end")
         path_entry.insert(0, p)
+        if p:
+            try:
+                save_draft_root_preference(p)
+            except OSError:
+                pass
         refresh_list()
         refresh_export_pool_preset_bar(reset_memory=True)
 
@@ -3943,14 +5198,18 @@ def run_app() -> None:
         encrypted = _file_exists_nonempty(content_path) and _looks_like_jianying_encrypted(content_path)
         replace_state["encrypted"] = encrypted
         replace_state["content_ok"] = bool(summary.content_ok)
-        if summary.content_ok and _file_exists_nonempty(content_path) and not encrypted:
-            try:
-                replace_state["refs"] = list_replaceable_media_segments(content_path)
-            except Exception:
-                replace_state["refs"] = []
         raw_timeline: Optional[Dict[str, Any]] = None
         if summary.content_ok and _file_exists_nonempty(content_path) and not encrypted:
             raw_timeline = _safe_read_json(content_path)
+            if raw_timeline:
+                try:
+                    from pyJianYingDraft.script_file import ScriptFile
+
+                    script = ScriptFile.load_from_parsed_json(raw_timeline, content_path)
+                    replace_state["refs"] = list_replaceable_media_segments_from_script(script)
+                except Exception as e:
+                    replace_state["refs"] = []
+                    detail.insert("end", f"\n\n【替换音视频槽解析失败】{e}")
         refresh_timeline_panel_data(raw_timeline)
         sync_export_pool_preset_for_draft(folder_name)
 
@@ -4103,11 +5362,28 @@ def run_app() -> None:
             detail.insert(
                 "1.0",
                 "请从左侧选择草稿。\n\n"
-                "单文件替换、导出 MP4 时都会新建「父模板名_N」子草稿并挂在推断的父模板下，"
-                "不直接改写你选中的底稿；父子关系记在本地应用数据中。",
+                "「替换素材」与导出槽位会改当前草稿的素材引用；导出 MP4 仅在勾选「导出生成子草稿」时复制为子稿；"
+                "未勾选时临时套用槽位导出后自动还原 draft_content.json。父子关系记在本地应用数据中。",
             )
 
         _redraw_list_scroll(reset_scroll=reset_list_scroll)
+
+    def _commit_path_entry(_event: Any = None) -> None:
+        """路径框手动修改后失焦或按回车时同步到 StringVar 并写入本地偏好。"""
+        p = path_entry.get().strip()
+        if p == (draft_root.get() or "").strip():
+            return
+        draft_root.set(p)
+        if p:
+            try:
+                save_draft_root_preference(p)
+            except OSError:
+                pass
+        refresh_list()
+        refresh_export_pool_preset_bar(reset_memory=True)
+
+    path_entry.bind("<Return>", lambda _e: _commit_path_entry())
+    path_entry.bind("<FocusOut>", lambda _e: _commit_path_entry())
 
     # init path
     if draft_root.get():

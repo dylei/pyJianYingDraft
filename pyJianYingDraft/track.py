@@ -47,8 +47,9 @@ class TrackType(Enum):
     @staticmethod
     def from_name(name: str) -> "TrackType":
         """根据名称获取轨道类型枚举"""
+        s = str(name).strip().lower() if name is not None else ""
         for t in TrackType:
-            if t.name == name:
+            if t.name == s:
                 return t
         raise ValueError("Invalid track type: %s" % name)
 

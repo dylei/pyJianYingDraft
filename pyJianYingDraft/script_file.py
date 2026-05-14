@@ -213,6 +213,47 @@ class ScriptFile:
         self.content["id"] = str(uuid.uuid4()).upper()
         self.content["create_time"] = int(time.time() * 1_000_000)
 
+    @classmethod
+    def _new_for_existing_draft_load(cls) -> "ScriptFile":
+        """供 ``load_template`` / ``load_from_parsed_json`` 使用：不执行 ``__init__``、不读模板 JSON。"""
+        obj = cls.__new__(cls)
+        d = util.provide_ctor_defaults(ScriptFile)
+        obj.save_path = None
+        obj.width = d["width"]
+        obj.height = d["height"]
+        obj.fps = d["fps"]
+        obj.maintrack_adsorb = d["maintrack_adsorb"]
+        obj.duration = 0
+        obj.materials = ScriptMaterial()
+        obj.tracks = {}
+        obj.imported_materials = {}
+        obj.imported_tracks = []
+        obj.content = {}
+        return obj
+
+    @staticmethod
+    def _normalize_draft_content_for_import(content: Dict[str, Any]) -> None:
+        """补全明文草稿在导入时可能缺失的字段，避免 assign_attr / 轨道遍历抛错导致替换槽列表为空。"""
+        if not isinstance(content, dict):
+            return
+        content.setdefault("fps", 30)
+        content.setdefault("duration", 0)
+        if not isinstance(content.get("materials"), dict):
+            content["materials"] = {}
+        if not isinstance(content.get("tracks"), list):
+            content["tracks"] = []
+        cfg = content.get("config")
+        if not isinstance(cfg, dict):
+            content["config"] = {"maintrack_adsorb": True}
+        else:
+            cfg.setdefault("maintrack_adsorb", True)
+        cc = content.get("canvas_config")
+        if not isinstance(cc, dict):
+            content["canvas_config"] = {"width": 1920, "height": 1080}
+        else:
+            cc.setdefault("width", 1920)
+            cc.setdefault("height", 1080)
+
     @staticmethod
     def load_template(json_path: str) -> "ScriptFile":
         """从JSON文件加载草稿模板
@@ -223,13 +264,14 @@ class ScriptFile:
         Raises:
             `FileNotFoundError`: JSON文件不存在
         """
-        obj = ScriptFile(**util.provide_ctor_defaults(ScriptFile))
+        obj = ScriptFile._new_for_existing_draft_load()
         obj.save_path = json_path
         if not os.path.exists(json_path):
             raise FileNotFoundError("JSON文件 '%s' 不存在" % json_path)
         with open(json_path, "r", encoding="utf-8") as f:
             obj.content = json.load(f)
 
+        ScriptFile._normalize_draft_content_for_import(obj.content)
         util.assign_attr_with_json(obj, ["fps", "duration"], obj.content)
         util.assign_attr_with_json(obj, ["maintrack_adsorb"], obj.content["config"])
         util.assign_attr_with_json(obj, ["width", "height"], obj.content["canvas_config"])
@@ -237,6 +279,26 @@ class ScriptFile:
         obj.imported_materials = deepcopy(obj.content["materials"])
         obj.imported_tracks = [import_track(track_data) for track_data in obj.content["tracks"]]
 
+        return obj
+
+    @staticmethod
+    def load_from_parsed_json(content: Dict[str, Any], json_path: str) -> "ScriptFile":
+        """与 ``load_template`` 解析逻辑相同，但直接使用已 ``json.load`` 的字典。
+
+        与 ``load_template`` 不同之处在于 **不复制** 顶层 ``content``，以便与时间轴等 UI
+        共用同一 ``tracks`` 对象引用，从而能用轨道在 ``tracks`` 数组中的下标对齐片段。
+
+        调用方请勿在未打算写回磁盘时修改 ``content`` 的结构。
+        """
+        obj = ScriptFile._new_for_existing_draft_load()
+        obj.save_path = json_path
+        obj.content = content
+        ScriptFile._normalize_draft_content_for_import(obj.content)
+        util.assign_attr_with_json(obj, ["fps", "duration"], obj.content)
+        util.assign_attr_with_json(obj, ["maintrack_adsorb"], obj.content["config"])
+        util.assign_attr_with_json(obj, ["width", "height"], obj.content["canvas_config"])
+        obj.imported_materials = deepcopy(obj.content["materials"])
+        obj.imported_tracks = [import_track(track_data) for track_data in obj.content["tracks"]]
         return obj
 
     def add_material(self, material: Union[VideoMaterial, AudioMaterial]) -> "ScriptFile":

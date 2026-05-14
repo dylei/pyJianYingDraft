@@ -14,6 +14,16 @@ _extra_datas = []
 if os.path.isdir(_tutorial):
     _extra_datas.append((_tutorial, os.path.join("readme_assets", "tutorial")))
 
+# 库内 JSON 模板非 .py，PyInstaller 默认不会打进包；否则 ScriptFile 构造会报 assets 缺失
+try:
+    import pyJianYingDraft as _pjd
+
+    _jy_assets = os.path.join(os.path.dirname(_pjd.__file__), "assets")
+    if os.path.isdir(_jy_assets):
+        _extra_datas.append((_jy_assets, os.path.join("pyJianYingDraft", "assets")))
+except Exception:
+    pass
+
 hiddenimports = list(_hi_ctk)
 hiddenimports.extend(collect_submodules("pyJianYingDraft"))
 for h in (

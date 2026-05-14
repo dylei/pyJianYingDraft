@@ -83,9 +83,22 @@ class ImportedTrack(BaseTrack):
 
     def __init__(self, json_data: Dict[str, Any]):
         self.track_type = TrackType.from_name(json_data["type"])
-        self.name = json_data["name"]
-        self.track_id = json_data["id"]
-        self.render_index = max([int(seg["render_index"]) for seg in json_data["segments"]], default=0)
+        nm = json_data.get("name", "")
+        self.name = nm if isinstance(nm, str) else str(nm)
+        raw_id = json_data.get("id")
+        if raw_id is None or raw_id == "":
+            self.track_id = ""
+        else:
+            self.track_id = str(raw_id).strip()
+        segs = json_data.get("segments") or []
+        ri_vals: List[int] = []
+        for seg in segs:
+            if isinstance(seg, dict):
+                try:
+                    ri_vals.append(int(seg.get("render_index", 0)))
+                except (TypeError, ValueError):
+                    ri_vals.append(0)
+        self.render_index = max(ri_vals, default=0)
 
         self.raw_data = deepcopy(json_data)
 
@@ -213,7 +226,17 @@ class ImportedMediaTrack(EditableTrack):
 
 def import_track(json_data: Dict[str, Any]) -> ImportedTrack:
     """导入轨道"""
-    track_type = TrackType.from_name(json_data["type"])
+    if not isinstance(json_data, dict):
+        json_data = {}
+    try:
+        raw_ty = json_data.get("type", "")
+        s = str(raw_ty).strip().lower() if raw_ty is not None else ""
+        track_type = TrackType.from_name(s)
+    except (ValueError, TypeError):
+        jd = deepcopy(json_data)
+        jd["type"] = "adjust"
+        track_type = TrackType.adjust
+        json_data = jd
     if not track_type.value.allow_modify:
         return ImportedTrack(json_data)
     if track_type == TrackType.text:
