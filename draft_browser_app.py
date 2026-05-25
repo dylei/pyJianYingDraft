@@ -2988,7 +2988,7 @@ def run_app() -> None:
 
     root = ctk.CTk()
     root.title("爆款智剪")
-    win_w, win_h = 1100, 720
+    win_w, win_h = 1100, 800
     root.minsize(880, 560)
     root.geometry(f"{win_w}x{win_h}")
     root.update_idletasks()
@@ -3203,10 +3203,10 @@ def run_app() -> None:
     right = ctk.CTkFrame(main, corner_radius=12)
     right.pack(side="left", fill="both", expand=True)
     right.grid_columnconfigure(0, weight=1)
-    # 草稿信息 : 时间轴 : 导出区 = 2 : 6 : 2
-    right.grid_rowconfigure(0, weight=2, uniform="right_stack", minsize=72)
-    right.grid_rowconfigure(1, weight=6, uniform="right_stack", minsize=160)
-    right.grid_rowconfigure(2, weight=2, uniform="right_stack", minsize=88)
+    # 草稿信息 : 时间轴 : 导出区 = 2 : 9 : 2（时间轴占更多纵向空间）
+    right.grid_rowconfigure(0, weight=2, uniform="right_stack", minsize=64)
+    right.grid_rowconfigure(1, weight=9, uniform="right_stack", minsize=220)
+    right.grid_rowconfigure(2, weight=2, uniform="right_stack", minsize=72)
 
     ctk.CTkLabel(left, text="草稿箱", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=14, pady=(14, 6))
 

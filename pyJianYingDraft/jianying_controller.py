@@ -99,7 +99,7 @@ def _walk_click_by_exact_first_label(
             best_ctrl = ctrl
 
     if best_ctrl is not None:
-        best_ctrl.Click(simulateMove=False)
+        _safe_click_control(best_ctrl)
         return True
     return False
 
@@ -185,6 +185,81 @@ def _control_text_blob(ctrl: uia.Control) -> str:
     return "".join(parts)
 
 
+def _safe_click_control(ctrl: uia.Control) -> None:
+    """优先 UIA Click；部分 QML/Custom 控件需坐标点击。"""
+    try:
+        ctrl.Click(simulateMove=False)
+        return
+    except Exception:
+        pass
+    rect = ctrl.BoundingRectangle
+    if not rect.isempty():
+        uia.Click(int(rect.xcenter()), int(rect.ycenter()))
+
+
+def _walk_click_left_nav_exact_label(
+    app: uia.Control,
+    labels: Tuple[str, ...],
+    *,
+    max_depth: int = 52,
+    max_nodes: int = 20000,
+    rel_right: float = 0.14,
+) -> bool:
+    """在左侧竖栏（窄条）内按精确文案点击导航项；新版剪映部分 Tab 无标准类型。"""
+    want = frozenset(labels)
+    try:
+        win_rect = app.BoundingRectangle
+        win_left = win_rect.left
+        win_w = max(win_rect.width(), 1)
+        win_top = win_rect.top
+        win_h = max(win_rect.height(), 1)
+    except Exception:
+        win_left, win_w, win_top, win_h = 0, 1920, 0, 1080
+
+    type_score = {
+        "TabItemControl": 120,
+        "ListItemControl": 115,
+        "TreeItemControl": 115,
+        "ButtonControl": 100,
+        "HyperlinkControl": 95,
+        "MenuItemControl": 90,
+        "CustomControl": 70,
+        "GroupControl": 55,
+        "PaneControl": 50,
+        "TextControl": 25,
+    }
+    best_score = -10**9
+    best_ctrl: Optional[uia.Control] = None
+    n = 0
+    for ctrl, _depth in uia.WalkControl(app, includeTop=False, maxDepth=max_depth):
+        n += 1
+        if n > max_nodes:
+            break
+        lab = _control_primary_label(ctrl)
+        if lab not in want:
+            continue
+        try:
+            rect = ctrl.BoundingRectangle
+            if rect.isempty() or rect.width() < 2 or rect.height() < 2:
+                continue
+        except Exception:
+            continue
+        rel_x = (rect.xcenter() - win_left) / win_w
+        if rel_x >= rel_right:
+            continue
+        rel_y_mid = (rect.ycenter() - win_top) / win_h
+        upper_band = 25 if rel_y_mid < 0.78 else 0
+        ts = type_score.get(ctrl.ControlTypeName, 40)
+        score = ts + 180 - int(rel_x * 400) + upper_band
+        if score > best_score:
+            best_score = score
+            best_ctrl = ctrl
+    if best_ctrl is not None:
+        _safe_click_control(best_ctrl)
+        return True
+    return False
+
+
 def _geometry_subtitle_click_candidates(app: uia.Control) -> List[Tuple[int, int]]:
     """当无障碍树无「字幕」名时，根据「媒体 / 音频 / 文本」等锚点生成若干屏幕坐标候选。
 
@@ -201,45 +276,53 @@ def _geometry_subtitle_click_candidates(app: uia.Control) -> List[Tuple[int, int
         if win_rect.contains(int(x), int(y)):
             pts.append((int(x), int(y)))
 
-    anchors = ("媒体", "音频", "文本", "贴纸", "特效")
+    anchors = ("媒体", "素材", "音频", "文本", "贴纸", "特效", "转场", "滤镜", "调节")
     rects = _walk_best_rects_for_labels(app, anchors, max_depth=56, max_nodes=22000)
 
     if rects:
+        ordered: List[Tuple[int, uia.Rect, str]] = []
+        for lab in anchors:
+            if lab in rects:
+                _, r = rects[lab]
+                ordered.append((int(r.ycenter()), r, lab))
+        ordered.sort(key=lambda t: t[0])
+        if ordered:
+            x_nav = ordered[0][1].xcenter()
+            for i in range(len(ordered) - 1):
+                y0 = ordered[i][1].ycenter()
+                y1 = ordered[i + 1][1].ycenter()
+                gap = int(abs(y1 - y0))
+                if gap >= 36:
+                    for frac in (0.33, 0.5, 0.66):
+                        _add(x_nav, int(y0 + gap * frac))
+        if "文本" in rects:
+            _, tr = rects["文本"]
+            step = int(max(48, tr.height() * 1.05))
+            x1, yt = tr.xcenter(), tr.ycenter()
+            for k in (1, 2, 3):
+                _add(x1, yt + k * step)
         if "媒体" in rects and "音频" in rects:
             _, mr = rects["媒体"]
             _, ar = rects["音频"]
             step = int(max(42, abs(ar.ycenter() - mr.ycenter())))
             x0 = mr.xcenter()
             ym = mr.ycenter()
-            for k in (3, 4, 2, 5):
+            for k in (3, 4, 2, 5, 6):
                 _add(x0, ym + k * step)
         elif "媒体" in rects:
             _, mr = rects["媒体"]
             step = int(max(52, mr.height() * 1.12))
             x0, ym = mr.xcenter(), mr.ycenter()
-            for k in (3, 4, 2, 5):
+            for k in (3, 4, 2, 5, 6):
                 _add(x0, ym + k * step)
-        if "文本" in rects and "音频" in rects:
-            _, tr = rects["文本"]
-            _, ar = rects["音频"]
-            step2 = int(max(42, abs(tr.ycenter() - ar.ycenter())))
-            x1, yt = tr.xcenter(), tr.ycenter()
-            _add(x1, yt + step2)
-            _add(x1, yt + 2 * step2)
-        elif "文本" in rects:
-            _, tr = rects["文本"]
-            step2 = int(max(52, tr.height() * 1.12))
-            x1, yt = tr.xcenter(), tr.ycenter()
-            _add(x1, yt + step2)
-            _add(x1, yt + 2 * step2)
 
     if not pts:
         try:
             wr = app.BoundingRectangle
             if not wr.isempty():
                 x = wr.left + max(28, int(wr.width() * 0.026))
-                base_y = wr.top + int(wr.height() * 0.36)
-                for dy in (0, 58, 116, 174, 232, 290, 348):
+                base_y = wr.top + int(wr.height() * 0.32)
+                for dy in (0, 52, 104, 156, 208, 260, 312, 364):
                     _add(x, base_y + dy)
         except Exception:
             pass
@@ -250,7 +333,7 @@ def _geometry_subtitle_click_candidates(app: uia.Control) -> List[Tuple[int, int
         if p not in seen:
             seen.add(p)
             uniq.append(p)
-    return uniq[:10]
+    return uniq[:14]
 
 
 def _resolve_actual_export_path(ui_export_path: str, export_started: float) -> str:
@@ -531,6 +614,9 @@ class JianyingController:
             "NavItemSubtitle",
             "NavSubtitleBtn",
             "LeftDockSubtitleBtn",
+            "MainWindowLeftCaptionBtn",
+            "MainWindowCaptionNavBtn",
+            "MaterialPanelCaptionBtn",
         )
         for key in exact_keys_list:
             cmp_e = ControlFinder.desc_exact_any_depth(key, 22)
@@ -556,8 +642,10 @@ class JianyingController:
             "subtitleitem",
             "subtitle_item",
             "mainwindowsubtitle",
+            "leftcaption",
             "captionbtn",
             "caption_btn",
+            "navcaption",
         )
         allowed_types = frozenset(
             {
@@ -640,34 +728,81 @@ class JianyingController:
             raise exceptions.AutomationError("请先打开草稿进入编辑页后再执行字幕识别")
         if self._subtitle_panel_has_recognize_entry():
             return
+
+        def _try_open() -> bool:
+            return self._subtitle_panel_has_recognize_entry()
+
         nav = self._find_subtitle_nav_by_full_description()
         if nav is not None:
             try:
-                nav.Click(simulateMove=False)
+                _safe_click_control(nav)
                 time.sleep(0.65)
             except Exception:
                 pass
             self.get_window()
-            if self._subtitle_panel_has_recognize_entry():
+            if _try_open():
                 return
+
+        for label in ("字幕", "智能字幕"):
+            if _walk_click_left_nav_exact_label(self.app, (label,)):
+                time.sleep(0.65)
+                self.get_window()
+                if _try_open():
+                    return
+
         try:
             self._click_toolbar_item_by_name("字幕")
             time.sleep(0.65)
         except exceptions.AutomationError:
             pass
-        if self._subtitle_panel_has_recognize_entry():
+        if _try_open():
             return
+
+        for label in ("智能字幕",):
+            try:
+                self._click_toolbar_item_by_name(label)
+                time.sleep(0.65)
+            except exceptions.AutomationError:
+                pass
+            self.get_window()
+            if _try_open():
+                return
+
+        # 部分版本「识别字幕」在「文本」面板内
+        if _walk_click_left_nav_exact_label(self.app, ("文本",), rel_right=0.18):
+            time.sleep(0.55)
+            self.get_window()
+            if _try_open():
+                return
+        try:
+            self._click_toolbar_item_by_name("文本")
+            time.sleep(0.55)
+        except exceptions.AutomationError:
+            pass
+        if _try_open():
+            return
+
+        if self._click_first_control_whose_blob_contains(
+            "识别字幕", max_depth=24, left_nav_only=False
+        ):
+            time.sleep(0.5)
+            self.get_window()
+            if _try_open():
+                return
+
         for x, y in _geometry_subtitle_click_candidates(self.app):
             uia.Click(int(x), int(y))
             time.sleep(0.55)
             self.get_window()
-            if self._subtitle_panel_has_recognize_entry():
+            if _try_open():
                 return
+
         raise exceptions.AutomationError(
             "无法打开字幕区：full_description 未匹配到字幕入口、无障碍 Name 无「字幕」，"
             "且根据「媒体/音频/文本」推算的点击也未出现「识别字幕」。"
-            "请用 Inspect 查看「字幕」控件的 full_description 反馈给开发者以加入精确 key；"
-            "或手动打开「字幕」完成识别后，取消导出时的自动生成字幕。"
+            "常见原因：剪映版本过新（自动化主要适配 5.9～6.x）、左侧 Tab 为纯图标无无障碍名称。"
+            "可先在剪映内手动打开「字幕」完成识别，并取消导出时的「生成字幕」；"
+            "或用 Windows 自带的「讲述人/Inspect」查看「字幕」控件的 full_description 反馈给开发者。"
         )
 
     def _click_first_control_whose_blob_contains(
@@ -676,6 +811,8 @@ class JianyingController:
         *,
         max_depth: int = 28,
         max_nodes: int = 16000,
+        left_nav_only: bool = False,
+        rel_right: float = 0.55,
     ) -> bool:
         """在窗口内点击「文本 blob 含 sub」且大致可点、偏左/浅层的控件中得分最高者。"""
         try:
@@ -700,7 +837,10 @@ class JianyingController:
             n += 1
             if n > max_nodes:
                 break
-            if sub not in _control_text_blob(ctrl):
+            blob = _control_text_blob(ctrl)
+            if sub not in blob:
+                continue
+            if left_nav_only and _control_primary_label(ctrl) != sub:
                 continue
             try:
                 rect = ctrl.BoundingRectangle
@@ -709,14 +849,16 @@ class JianyingController:
             except Exception:
                 continue
             rel_x = (rect.xcenter() - win_left) / win_w
-            in_left = 60 if rel_x < 0.55 else 0
+            if left_nav_only and rel_x >= rel_right:
+                continue
+            in_left = 60 if rel_x < rel_right else 0
             tb = type_bonus.get(ctrl.ControlTypeName, 30)
             score = tb + in_left - d * 2
             if score > best_score:
                 best_score = score
                 best = ctrl
         if best is not None:
-            best.Click(simulateMove=False)
+            _safe_click_control(best)
             return True
         return False
 
