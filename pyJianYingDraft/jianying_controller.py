@@ -1,5 +1,6 @@
 """剪映自动化控制，主要与自动导出有关"""
 
+import sys
 import time
 import shutil
 import os
@@ -467,15 +468,101 @@ class ControlFinder:
         return matcher
 
 
+def _normalize_exe_path(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    except OSError:
+        return os.path.normcase(os.path.normpath(path))
+
+
+def _win_process_image_path(pid: int) -> Optional[str]:
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buf))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return None
+        return _normalize_exe_path(buf.value[: int(size.value)])
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _win_jianyingpro_pids() -> List[int]:
+    if sys.platform != "win32":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap in (None, -1, 0xFFFFFFFF):
+        return []
+    out: List[int] = []
+    pe = PROCESSENTRY32W()
+    pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+    try:
+        if not kernel32.Process32FirstW(snap, ctypes.byref(pe)):
+            return out
+        while True:
+            if (pe.szExeFile or "").lower() == "jianyingpro.exe":
+                out.append(int(pe.th32ProcessID))
+            if not kernel32.Process32NextW(snap, ctypes.byref(pe)):
+                break
+    finally:
+        kernel32.CloseHandle(snap)
+    return out
+
+
+def jianying_pids_for_executable(exe_path: str) -> List[int]:
+    """返回可执行文件路径与 ``exe_path`` 完全一致的 JianyingPro 进程 PID（可多实例）。"""
+    target = _normalize_exe_path(exe_path)
+    matched: List[int] = []
+    for pid in _win_jianyingpro_pids():
+        img = _win_process_image_path(pid)
+        if img and img == target:
+            matched.append(pid)
+    return matched
+
+
 class JianyingController:
     """剪映控制器"""
 
     app: uia.WindowControl
     """剪映窗口"""
     app_status: Literal["home", "edit", "pre_export"]
+    _bind_process_id: Optional[int]
 
-    def __init__(self):
-        """初始化剪映控制器, 此时剪映应该处于目录页"""
+    def __init__(self, *, process_id: Optional[int] = None):
+        """初始化剪映控制器, 此时剪映应该处于目录页。
+
+        ``process_id`` 指定时只绑定该进程的剪映主窗口（用于多版本并存时避免连到其它版本）。
+        """
+        self._bind_process_id = int(process_id) if process_id is not None else None
         self.get_window()
 
     def _click_toolbar_item_by_name(self, target: str, *, timeout: float = 12.0, depth: int = 32) -> None:
@@ -1194,6 +1281,12 @@ class JianyingController:
                 pass
 
     def __jianying_window_cmp(self, control: uia.WindowControl, depth: int) -> bool:
+        if self._bind_process_id is not None:
+            try:
+                if int(control.ProcessId) != self._bind_process_id:
+                    return False
+            except (TypeError, ValueError, AttributeError):
+                return False
         # 不同渠道/版本窗口标题可能略有差异，这里放宽匹配
         name = (control.Name or "").strip()
         if not (("剪映" in name) or ("Jianying" in name) or ("CapCut" in name)):
@@ -1207,13 +1300,28 @@ class JianyingController:
         return False
 
 
-def wait_for_jianying_controller(timeout: float = 90.0, poll: float = 0.5) -> JianyingController:
-    """轮询直至剪映主窗口可被 UI 自动化连接（不负责启动进程）。"""
+def wait_for_jianying_controller(
+    timeout: float = 90.0,
+    poll: float = 0.5,
+    *,
+    exe_path: Optional[str] = None,
+) -> JianyingController:
+    """轮询直至剪映主窗口可被 UI 自动化连接（不负责启动进程）。
+
+    若提供 ``exe_path``，仅连接该路径对应的 JianyingPro 进程，忽略其它版本已运行的窗口。
+    """
     deadline = time.time() + timeout
     last_err: Optional[Exception] = None
     while time.time() < deadline:
         try:
-            return JianyingController()
+            if exe_path:
+                for pid in jianying_pids_for_executable(exe_path):
+                    try:
+                        return JianyingController(process_id=pid)
+                    except AutomationError as e:
+                        last_err = e
+            else:
+                return JianyingController()
         except AutomationError as e:
             last_err = e
         except Exception as e:

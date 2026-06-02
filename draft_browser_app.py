@@ -3,7 +3,7 @@
 明文 draft_content.json 下可在时间轴音视频片段上右键「替换素材…」弹窗替换（按原片段时长截断或缩短）；
 Windows 下可将单个素材文件或素材文件夹从资源管理器拖到时间轴片段彩色条上，效果与弹窗中保存「单个文件」或「素材目录」一致（需安装 windnd）；
 每个导出槽位仅保留最后一次配置：「单个文件」与「素材目录」互斥，后保存的生效；可设新素材截取起点（片头 / 随机 / 自定义秒）。
-下拉「(默认)」表示使用本稿槽位工作台（working_pool），与命名预设一样可编辑并持久化到本地；旧版曾显示为「(保持原样)」，程序会自动识别。命名预设下改动会写回该预设。「导出生成子草稿」默认勾选：导出 MP4 时复制为子草稿并在子稿上套用预设，底稿不动；取消勾选时仍会在**每次导出前**对当前草稿临时套用槽位再导出，随后**自动还原** draft_content.json，不增加子文件夹（与「生成草稿」按钮无关，该按钮仍会复制子稿）。
+下拉「(默认)」表示使用本稿槽位工作台（working_pool），与命名预设一样可编辑并持久化到本地；旧版曾显示为「(保持原样)」，程序会自动识别。命名预设下改动会写回该预设。「导出生成子草稿」默认勾选：导出 MP4 时复制为子草稿并在子稿上套用预设，底稿不动；取消勾选时会在**每次导出前**对当前草稿临时套用槽位/花字/贴纸配置再导出，随后**自动还原** draft_content.json，不增加子文件夹（与「生成草稿」按钮无关，该按钮仍会复制子稿）。花字/贴纸请在时间轴点轨道名或片段后使用「替换…」配置。
 父子关系索引与导出 MP4 区选项（备份、字幕、子草稿、条数、文件名前缀等）记忆在 %LOCALAPPDATA%\\pyJianYingDraft_browser\\（export_mp4_ui_preference.json），草稿文件夹仍在剪映根目录下平铺。
 音频槽选视频时自动用 ffmpeg 抽音轨为 MP3。
 运行: pip install customtkinter Send2Trash requests windnd && python draft_browser_app.py
@@ -15,7 +15,9 @@ import hashlib
 import json
 import copy
 import os
+from collections import OrderedDict
 import random
+import uuid
 import re
 import time
 import shutil
@@ -26,7 +28,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     from send2trash import send2trash as _send2trash_impl
@@ -80,12 +82,39 @@ class MediaSegmentRef:
     media_ordinal: int = -1
 
 
+@dataclass
+class StyleSegmentRef:
+    """可配置花字/贴纸替换的字幕或贴纸轨道片段（与时间轴右键、导出槽位配置联动）。"""
+
+    track_type: str  # "text" | "sticker"
+    track_name: str
+    segment_index: int
+    combo_label: str
+    material_id: str
+    track_id: str = ""
+    current_resource_id: str = ""
+
+
+STYLE_KIND_TEXT_EFFECT = "text_effect"
+STYLE_KIND_STICKER = "sticker"
+STYLE_MODE_RANDOM = "random"
+STYLE_MODE_FIXED = "fixed"
+
+
 def segment_export_pool_key(draft_name: str, ref: MediaSegmentRef) -> str:
     """按草稿名 + 轨道 id + 片段下标定位（轨道名为空时也不冲突）。无 track_id 时回退旧格式。"""
     tid = (ref.track_id or "").strip()
     if tid:
         return f"{draft_name}\0{tid}\0{ref.segment_index}"
     return f"{draft_name}\0{ref.track_type}\0{ref.track_name}\0{ref.track_type_index}\0{ref.segment_index}"
+
+
+def segment_style_pool_key(draft_name: str, ref: StyleSegmentRef) -> str:
+    """花字/贴纸槽位键：与音视频槽同规则（草稿 + 轨道 id + 片段下标）。"""
+    tid = (ref.track_id or "").strip()
+    if tid:
+        return f"{draft_name}\0{tid}\0{ref.segment_index}"
+    return f"{draft_name}\0{ref.track_type}\0{ref.track_name}\0{ref.segment_index}"
 
 
 VIDEO_REPLACE_SOURCE_HEAD = "head"
@@ -112,7 +141,7 @@ def parse_replace_source_start_sec(raw: Any) -> float:
 def segment_replace_status_lines(
     draft_name: str, ref: Optional[MediaSegmentRef], pool: Dict[str, Any]
 ) -> List[str]:
-    """根据本地 segment_export_pool 生成「替换目录/替换文件」说明行（用于时间轴下方信息区）。"""
+    """根据本地 segment_export_pool 生成「替换目录/替换文件/花字/贴纸」说明行（用于时间轴下方信息区）。"""
     out: List[str] = []
     if not ref or not (draft_name or "").strip():
         return out
@@ -135,6 +164,79 @@ def segment_replace_status_lines(
         else:
             out.append(f"素材起点：自定义 {parse_replace_source_start_sec(cfg.get('replace_source_start_sec')):g} 秒")
     return out
+
+
+_MATERIAL_EXPORT_POOL_KEYS = frozenset(
+    {
+        "dir",
+        "order",
+        "replace_file",
+        "replace_source_start_mode",
+        "replace_source_start_sec",
+    }
+)
+
+
+def clear_material_keys_from_segment_export_pool_entry(raw: Any) -> Optional[Dict[str, Any]]:
+    """从槽位配置移除音视频素材替换项；若同槽还有花字/贴纸配置则保留。"""
+    if not isinstance(raw, dict):
+        return None
+    style_piece = normalize_style_pool_config(raw)
+    if style_piece:
+        return dict(style_piece)
+    if any(k in raw for k in _MATERIAL_EXPORT_POOL_KEYS):
+        return None
+    return None
+
+
+def normalize_style_pool_config(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("style_kind") or "").strip()
+    if kind not in (STYLE_KIND_TEXT_EFFECT, STYLE_KIND_STICKER):
+        return None
+    mode = str(raw.get("style_mode") or STYLE_MODE_RANDOM).strip()
+    if mode not in (STYLE_MODE_RANDOM, STYLE_MODE_FIXED):
+        mode = STYLE_MODE_RANDOM
+    rid = str(raw.get("style_resource_id") or "").strip()
+    if mode == STYLE_MODE_FIXED and not rid:
+        return None
+    out: Dict[str, Any] = {"style_kind": kind, "style_mode": mode}
+    if mode == STYLE_MODE_FIXED:
+        out["style_resource_id"] = rid
+    return out
+
+
+def segment_style_status_lines(
+    draft_name: str, ref: Optional[StyleSegmentRef], pool: Dict[str, Any]
+) -> List[str]:
+    out: List[str] = []
+    if not ref or not (draft_name or "").strip():
+        return out
+    k = segment_style_pool_key(draft_name.strip(), ref)
+    cfg = normalize_style_pool_config(pool.get(k))
+    if not cfg:
+        return out
+    kind = cfg.get("style_kind")
+    mode = cfg.get("style_mode")
+    rid = str(cfg.get("style_resource_id") or "").strip()
+    if kind == STYLE_KIND_TEXT_EFFECT:
+        if mode == STYLE_MODE_FIXED and rid:
+            out.append(f"花字：指定 id {rid}")
+        else:
+            out.append("花字：导出时从池随机")
+    elif kind == STYLE_KIND_STICKER:
+        if mode == STYLE_MODE_FIXED and rid:
+            out.append(f"贴纸：指定 id {rid}")
+        else:
+            out.append("贴纸：导出时从池随机")
+    return out
+
+
+def segment_has_style_config(
+    draft_name: str, ref: Optional[StyleSegmentRef], pool: Dict[str, Any]
+) -> bool:
+    return bool(segment_style_status_lines(draft_name, ref, pool))
 
 
 def segment_export_pool_enforce_exclusive_sources(pool: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -165,7 +267,7 @@ def segment_has_replace_config(
 
 
 def draft_has_any_segment_export_pool(draft_name: str, pool: Optional[Dict[str, Any]]) -> bool:
-    """该草稿在 segment_export_pool 中是否配置了替换目录或单个替换文件（导出 MP4 时可套用）。"""
+    """该草稿在 segment_export_pool 中是否配置了替换目录/文件或花字/贴纸槽（导出 MP4 时可套用）。"""
     dn = (draft_name or "").strip()
     if not dn or not isinstance(pool, dict):
         return False
@@ -177,11 +279,27 @@ def draft_has_any_segment_export_pool(draft_name: str, pool: Optional[Dict[str, 
             continue
         if str(sv.get("dir", "") or "").strip() or str(sv.get("replace_file", "") or "").strip():
             return True
+        if normalize_style_pool_config(sv):
+            return True
+    return False
+
+
+def _segment_export_pool_has_saveable_config(seg: Optional[Dict[str, Any]]) -> bool:
+    """槽位是否含可持久化配置：素材目录/文件，或花字/贴纸随机/指定 id。"""
+    if not isinstance(seg, dict):
+        return False
+    for sv in seg.values():
+        if not isinstance(sv, dict):
+            continue
+        if str(sv.get("dir", "") or "").strip() or str(sv.get("replace_file", "") or "").strip():
+            return True
+        if normalize_style_pool_config(sv):
+            return True
     return False
 
 
 def _segment_export_pool_for_preset_disk(seg_in: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """写入命名预设时保留「素材目录」与「单个替换文件」路径（供导出/生成子稿套用）。"""
+    """写入命名预设时保留素材目录/单文件与花字/贴纸槽（供导出/生成子稿套用）。"""
     out: Dict[str, Dict[str, Any]] = {}
     for sk, sv in (seg_in or {}).items():
         if not isinstance(sv, dict):
@@ -197,6 +315,9 @@ def _segment_export_pool_for_preset_disk(seg_in: Dict[str, Any]) -> Dict[str, Di
         rf = str(sv.get("replace_file", "") or "").strip()
         if rf:
             piece["replace_file"] = rf
+        style_piece = normalize_style_pool_config(sv)
+        if style_piece:
+            piece.update(style_piece)
         if piece:
             sm = normalize_replace_source_start_mode(sv.get("replace_source_start_mode"))
             piece["replace_source_start_mode"] = sm
@@ -556,6 +677,80 @@ def list_replaceable_media_segments(content_json_path: str) -> List[MediaSegment
     return list_replaceable_media_segments_from_script(script)
 
 
+def _text_effect_id_from_material(mat: Dict[str, Any]) -> str:
+    snap = _extract_text_style_snapshot(mat)
+    if snap and snap.get("effect_id"):
+        return str(snap["effect_id"]).strip()
+    return ""
+
+
+def _sticker_resource_id_from_material(mat: Dict[str, Any]) -> str:
+    return str(mat.get("resource_id") or mat.get("sticker_id") or "").strip()
+
+
+def list_style_segments_from_content(content: Dict[str, Any]) -> List[StyleSegmentRef]:
+    """从 draft_content 解析可配置花字/贴纸的文本与贴纸轨片段。"""
+    out: List[StyleSegmentRef] = []
+    if not isinstance(content, dict):
+        return out
+    materials = content.get("materials") if isinstance(content.get("materials"), dict) else {}
+    texts_by_id = {
+        str(m.get("id")): m
+        for m in (materials.get("texts") or [])
+        if isinstance(m, dict) and m.get("id")
+    }
+    stickers_by_id = {
+        str(m.get("id")): m
+        for m in (materials.get("stickers") or [])
+        if isinstance(m, dict) and m.get("id")
+    }
+    for tr in content.get("tracks") or []:
+        if not isinstance(tr, dict):
+            continue
+        ttype = str(tr.get("type", "")).strip().lower()
+        if ttype not in ("text", "sticker"):
+            continue
+        tid = str(tr.get("id") or "")
+        nm_raw = tr.get("name", "")
+        tname = "" if nm_raw is None else (nm_raw if isinstance(nm_raw, str) else str(nm_raw))
+        tname = tname.strip()
+        segs = tr.get("segments") or []
+        for i, seg in enumerate(segs):
+            if not isinstance(seg, dict):
+                continue
+            mid = str(seg.get("material_id") or "").strip()
+            if not mid:
+                continue
+            trng = seg.get("target_timerange") or {}
+            try:
+                t0 = int(trng.get("start", 0))
+                t1 = t0 + int(trng.get("duration", 0))
+            except (TypeError, ValueError):
+                t0, t1 = 0, 0
+            if ttype == "text":
+                mat = texts_by_id.get(mid) or {}
+                cur_rid = _text_effect_id_from_material(mat)
+                lab = _timeline_segment_label(seg, materials)
+                label = f"[text] {tname} · 片段{i + 1} · {_fmt_tc_us(t0, t1)} · {lab}"
+            else:
+                mat = stickers_by_id.get(mid) or {}
+                cur_rid = _sticker_resource_id_from_material(mat)
+                hint = cur_rid[:16] if cur_rid else mid[:8]
+                label = f"[sticker] {tname} · 片段{i + 1} · {_fmt_tc_us(t0, t1)} · {hint}"
+            out.append(
+                StyleSegmentRef(
+                    track_type=ttype,
+                    track_name=tname,
+                    segment_index=i,
+                    combo_label=label,
+                    material_id=mid,
+                    track_id=tid,
+                    current_resource_id=cur_rid,
+                )
+            )
+    return out
+
+
 def find_ffmpeg() -> Optional[str]:
     """查找 ffmpeg 可执行文件：环境变量 FFMPEG → PATH → 本程序目录下 bin\\ffmpeg.exe。"""
     env = os.environ.get("FFMPEG", "").strip().strip('"')
@@ -631,11 +826,129 @@ _SPATIAL_CLIP_KF_TYPES = frozenset(
 )
 
 
+def _video_display_pixel_size(width: int, height: int, rotation_deg: float = 0.0) -> Tuple[int, int]:
+    """按 rotation 元数据推算显示宽高（后备方案，部分文件元数据不准）。"""
+    w, h = int(width), int(height)
+    try:
+        rot = float(rotation_deg or 0.0) % 360.0
+    except (TypeError, ValueError):
+        rot = 0.0
+    if int(abs(rot)) % 180 == 90:
+        w, h = h, w
+    return max(w, 0), max(h, 0)
+
+
+_video_display_size_cache: Dict[Tuple[str, float], Tuple[int, int]] = {}
+
+
+def _parse_ppm_dimensions(ppm_bytes: bytes) -> Optional[Tuple[int, int]]:
+    """从 ffmpeg ``image2pipe`` 输出的 PPM/PGM 头解析宽高。"""
+    if len(ppm_bytes) < 8:
+        return None
+    if ppm_bytes[0:1] != b"P":
+        return None
+    i = 2
+    tokens: List[str] = []
+    while i < min(len(ppm_bytes), 256) and len(tokens) < 2:
+        while i < len(ppm_bytes) and ppm_bytes[i : i + 1] in (b" ", b"\t", b"\r", b"\n"):
+            i += 1
+        if i >= len(ppm_bytes):
+            break
+        if ppm_bytes[i : i + 1] == b"#":
+            while i < len(ppm_bytes) and ppm_bytes[i : i + 1] not in (b"\n", b"\r"):
+                i += 1
+            continue
+        j = i
+        while j < len(ppm_bytes) and ppm_bytes[j : j + 1] not in (b" ", b"\t", b"\r", b"\n"):
+            j += 1
+        tok = ppm_bytes[i:j].decode("ascii", errors="ignore")
+        if tok:
+            tokens.append(tok)
+        i = j
+    if len(tokens) < 2:
+        return None
+    try:
+        w, h = int(tokens[0]), int(tokens[1])
+    except ValueError:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return w, h
+
+
+def _probe_video_display_size_ffmpeg_frame(path: str) -> Optional[Tuple[int, int]]:
+    """用 ffmpeg 解码一帧（默认 autorotate）得到实际画面宽高，比 rotation 元数据更可靠。"""
+    ff = find_ffmpeg()
+    if not ff:
+        return None
+    path_abs = os.path.abspath(path)
+    if not os.path.isfile(path_abs):
+        return None
+
+    def _run(extra_input_args: List[str]) -> Optional[Tuple[int, int]]:
+        cmd = [
+            ff,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *extra_input_args,
+            "-i",
+            path_abs,
+            "-frames:v",
+            "1",
+            "-an",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=25)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        return _parse_ppm_dimensions(proc.stdout)
+
+    out = _run(["-ss", "0.1"])
+    if out:
+        return out
+    return _run([])
+
+
+def _resolve_video_display_pixel_size(
+    path: str,
+    fallback_w: int,
+    fallback_h: int,
+    rotation_deg: float = 0.0,
+) -> Tuple[int, int]:
+    """优先 ffmpeg 抽帧测显示比例；失败再退回 rotation + 容器宽高。"""
+    path_abs = os.path.abspath(path)
+    try:
+        mtime = os.path.getmtime(path_abs)
+    except OSError:
+        mtime = 0.0
+    cache_key = (path_abs, float(mtime))
+    cached = _video_display_size_cache.get(cache_key)
+    if cached:
+        return cached
+
+    probed = _probe_video_display_size_ffmpeg_frame(path_abs)
+    if probed:
+        _video_display_size_cache[cache_key] = probed
+        return probed
+
+    meta = _video_display_pixel_size(fallback_w, fallback_h, rotation_deg)
+    _video_display_size_cache[cache_key] = meta
+    return meta
+
+
 def _compute_cover_uniform_zoom(canvas_w: int, canvas_h: int, mat_w: int, mat_h: int) -> float:
     """相对剪映默认「整段素材完整放进画布」的缩放，再放大到 **cover 铺满** 所需的等比倍数。
 
     即 ``max(cw/mw, ch/mh) / min(cw/mw, ch/mh)``，与 ``object-fit: cover`` / contain 的缩放比一致；
-    宽高比已与画布一致时为 ``1.0``。不依赖「先按宽铺满」的假设，避免与部分草稿/版本语义不一致。
+    宽高比已与画布一致时为 ``1.0``。``mat_w/mat_h`` 应为显示方向像素（见 ``_video_display_pixel_size``）。
     """
     cw, ch = float(canvas_w), float(canvas_h)
     mw, mh = float(mat_w), float(mat_h)
@@ -680,17 +993,22 @@ def _patch_replaced_video_segment_clip_center_cover(
     *,
     canvas_w: int,
     canvas_h: int,
+    material_path: str,
     mat_w: int,
     mat_h: int,
+    mat_rotation_deg: float = 0.0,
 ) -> None:
     """替换素材后重写片段 ``clip``：等比铺满画布（cover）；旋转归零；去掉与缩放/位置冲突的关键帧。
 
-    缩放取相对「完整放入」的倍数，位移默认 ``0``（由剪映按 cover 裁切居中）；若仍错位可再调位移公式。
+    缩放按 ffmpeg 解码首帧得到的**实际画面**宽高计算（失败时才用 rotation 元数据）。
     """
     raw = getattr(seg, "raw_data", None)
     if not isinstance(raw, dict):
         return
-    zoom = _compute_cover_uniform_zoom(canvas_w, canvas_h, mat_w, mat_h)
+    disp_w, disp_h = _resolve_video_display_pixel_size(
+        material_path, mat_w, mat_h, mat_rotation_deg
+    )
+    zoom = _compute_cover_uniform_zoom(canvas_w, canvas_h, disp_w, disp_h)
     old_clip = raw.get("clip")
     clip: Dict[str, Any] = dict(old_clip) if isinstance(old_clip, dict) else {}
     flip = clip.get("flip")
@@ -732,7 +1050,7 @@ def apply_single_material_replace(
 
     若替换的是**音频轨**且所选文件带视频画面，则自动调用 ffmpeg 生成同目录下的 ``*_jy_audio.mp3`` 再引用。
 
-    **视频轨**：替换后会按画布与素材像素尺寸重写 ``clip``（**cover**：相对「完整放入」的等比放大倍数；兼容 ``transform.scale`` 嵌套结构；位移默认 0；旋转归零并清理冲突关键帧）。
+    **视频轨**：替换后会按画布与素材**实际画面**像素重写 ``clip``（**cover**；优先 ffmpeg 抽帧测比例，元数据 rotation 仅作后备；兼容 ``transform.scale`` 嵌套结构）。
 
     Returns:
         若有自动转码，返回提示文案；否则返回 None。
@@ -811,12 +1129,15 @@ def apply_single_material_replace(
             mw, mh = 0, 0
         if mw > 0 and mh > 0:
             seg_done = track.segments[ref.segment_index]
+            rot_deg = float(getattr(material, "rotation", 0.0) or 0.0)
             _patch_replaced_video_segment_clip_center_cover(
                 seg_done,
                 canvas_w=int(script.width),
                 canvas_h=int(script.height),
+                material_path=str(material.path),
                 mat_w=mw,
                 mat_h=mh,
+                mat_rotation_deg=rot_deg,
             )
     script.save()
     return extra_note
@@ -885,6 +1206,10 @@ def apply_per_segment_export_pools_to_draft(
         else:
             pick = random.choice(files)
         try:
+            print(
+                f"[套素材] {ref.combo_label} <- {os.path.basename(pick)} "
+                f"(order={order}, 候选 {len(files)} 个)"
+            )
             apply_single_material_replace(
                 content_json_path,
                 ref,
@@ -896,6 +1221,2098 @@ def apply_per_segment_export_pools_to_draft(
         except Exception as e:
             errs.append(f"{ref.combo_label}: {e}")
     return ok, skip, errs, configured
+
+
+# 子草稿随机字幕样式：免费字体 resource_id + 常用色 + 可选花字（剪映内置素材 id）
+_SUBTITLE_FONT_RESOURCE_IDS: Tuple[str, ...] = (
+    "7290445778273702455",  # 文轩体
+    "6740499188347310605",  # 综艺体
+    "7265595305163231781",  # HarmonyOS Sans SC Regular
+    "7068207165277737502",  # 优设标题黑
+    "6740513279296147982",  # 宋体
+    "7130644288047682085",  # 研宋体
+    "7203638484756599333",  # 妙黑体
+    "7265609486646121018",  # 站酷酷黑体
+    "6807743192671195655",  # 思源中宋
+    "7265610359807939132",  # 优设好身体
+)
+_SUBTITLE_COLOR_RGB: Tuple[Tuple[float, float, float], ...] = (
+    (1.0, 1.0, 1.0),
+    (1.0, 0.96, 0.35),
+    (1.0, 0.82, 0.15),
+    (0.95, 0.98, 1.0),
+    (0.35, 0.95, 0.98),
+    (1.0, 0.38, 0.38),
+    (0.55, 1.0, 0.58),
+    (0.92, 0.78, 1.0),
+)
+_SUBTITLE_TEXT_EFFECT_IDS: Tuple[str, ...] = (
+    "7296357486490144036",
+)
+
+
+def _text_effect_pool_pref_path() -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "text_effect_pool.json"
+
+
+def _jianying_artist_effect_cache_roots() -> List[str]:
+    local = os.environ.get("LOCALAPPDATA", "")
+    roots: List[str] = []
+    for app_name in ("JianyingPro", "CapCut"):
+        p = os.path.join(local, app_name, "User Data", "Cache", "artistEffect")
+        if os.path.isdir(p):
+            roots.append(p)
+    return roots
+
+
+def _artist_effect_subdir_kind(subdir: str) -> Optional[str]:
+    """判断 artistEffect 单条缓存类型：``sdftext`` / ``text_style`` / ``sticker`` / 未知。"""
+    if not os.path.isdir(subdir):
+        return None
+    cfg_path = os.path.join(subdir, "config.json")
+    link_types: List[str] = []
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            link = (cfg.get("effect") or {}).get("Link") or []
+            if isinstance(link, list):
+                for item in link:
+                    if isinstance(item, dict):
+                        t = str(item.get("type") or "").strip()
+                        if t:
+                            link_types.append(t)
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    prefab_path = os.path.join(subdir, "effect.prefab")
+    if os.path.isfile(prefab_path):
+        try:
+            with open(prefab_path, "rb") as f:
+                if b"SDFText" in f.read(256_000):
+                    return "sdftext"
+        except OSError:
+            pass
+    if "TextStyle" in link_types and os.path.isfile(os.path.join(subdir, "effectStyle.json")):
+        return "text_style"
+    if "InfoSticker" in link_types:
+        return "sticker"
+    return None
+
+
+def _classify_subtitle_flower_effect_id(effect_id: str) -> Optional[str]:
+    """字幕可用花字：旧版 ``SDFText`` prefab，或 5.9+ ``TextStyle`` + ``effectStyle.json``。"""
+    eid = str(effect_id or "").strip()
+    if not eid.isdigit():
+        return None
+    found_sdftext = False
+    found_text_style = False
+    for root in _jianying_artist_effect_cache_roots():
+        base = os.path.join(root, eid)
+        if not os.path.isdir(base):
+            continue
+        try:
+            for sub in os.listdir(base):
+                kind = _artist_effect_subdir_kind(os.path.join(base, sub))
+                if kind == "sdftext":
+                    found_sdftext = True
+                elif kind == "text_style":
+                    found_text_style = True
+        except OSError:
+            pass
+    if found_sdftext:
+        return "sdftext"
+    if found_text_style:
+        return "text_style"
+    return None
+
+
+def _subtitle_flower_effect_id_is_usable(effect_id: str) -> bool:
+    return _classify_subtitle_flower_effect_id(effect_id) is not None
+
+
+def _subtitle_flower_effect_prefab_has_sdftext(effect_id: str) -> bool:
+    """兼容旧调用：是否 SDFText 类花字。"""
+    return _classify_subtitle_flower_effect_id(effect_id) == "sdftext"
+
+
+def _resolve_subtitle_flower_effect_style_path(effect_id: str) -> str:
+    """``effectStyle.path``：指向本机已缓存花字目录（SDFText 或 TextStyle），否则 ``C:``。"""
+    eid = str(effect_id or "").strip()
+    sdftext_path: Optional[str] = None
+    text_style_path: Optional[str] = None
+    for root in _jianying_artist_effect_cache_roots():
+        base = os.path.join(root, eid)
+        if not os.path.isdir(base):
+            continue
+        try:
+            for sub in os.listdir(base):
+                subp = os.path.join(base, sub)
+                kind = _artist_effect_subdir_kind(subp)
+                if kind == "sdftext" and not sdftext_path:
+                    sdftext_path = os.path.join(base, sub).replace("\\", "/")
+                elif kind == "text_style" and not text_style_path:
+                    text_style_path = os.path.join(base, sub).replace("\\", "/")
+        except OSError:
+            pass
+    return sdftext_path or text_style_path or "C:"
+
+
+def filter_valid_subtitle_flower_effect_ids(
+    effect_ids: Iterable[str],
+) -> Tuple[List[str], List[str]]:
+    """区分可作用于字幕的花字 id 与 artistEffect 里误收的贴纸/无效 id。"""
+    valid: List[str] = []
+    invalid: List[str] = []
+    seen: set[str] = set()
+    for raw in effect_ids:
+        eid = str(raw or "").strip()
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        if _subtitle_flower_effect_id_is_usable(eid):
+            valid.append(eid)
+        else:
+            invalid.append(eid)
+    return valid, invalid
+
+
+def load_user_text_effect_id_pool() -> List[str]:
+    """读取用户维护的花字 id 列表（``text_effect_pool.json`` 的 ``effect_ids``）。"""
+    path = _text_effect_pool_pref_path()
+    if not path.is_file():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    raw = data.get("effect_ids") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        eid = str(item or "").strip()
+        if eid and eid not in seen:
+            seen.add(eid)
+            out.append(eid)
+    return out
+
+
+def load_text_effect_display_name_overrides() -> Dict[str, str]:
+    """读取用户在 ``text_effect_pool.json`` 里维护的花字别名（``effect_names``）。"""
+    path = _text_effect_pool_pref_path()
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    raw = data.get("effect_names") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, val in raw.items():
+        eid = str(key or "").strip()
+        name = str(val or "").strip()
+        if eid and name:
+            out[eid] = name
+    return out
+
+
+def _merge_text_effect_display_name_maps(*maps: Dict[str, str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for mp in maps:
+        for raw_id, raw_name in mp.items():
+            eid = str(raw_id or "").strip()
+            name = str(raw_name or "").strip()
+            if not eid or not name:
+                continue
+            prev = out.get(eid, "")
+            if not prev or len(name) > len(prev):
+                out[eid] = name
+    return out
+
+
+def _iter_local_draft_content_json_paths(extra_draft_root: Optional[str] = None) -> Iterable[str]:
+    """遍历本机剪映/CapCut 草稿与回收站中的 ``draft_content.json``。"""
+    seen: set[str] = set()
+    local = os.environ.get("LOCALAPPDATA", "")
+
+    def _scan_root(root: str) -> None:
+        root = str(root or "").strip()
+        if not root or not os.path.isdir(root):
+            return
+        for sub in ("", ".recycle_bin"):
+            base = os.path.join(root, sub) if sub else root
+            if not os.path.isdir(base):
+                continue
+            try:
+                names = os.listdir(base)
+            except OSError:
+                continue
+            for name in names:
+                p = os.path.abspath(os.path.join(base, name, "draft_content.json"))
+                if p in seen or not os.path.isfile(p):
+                    continue
+                seen.add(p)
+                yield p
+
+    for app_name in ("JianyingPro", "CapCut"):
+        yield from _scan_root(os.path.join(local, app_name, "User Data", "Projects", "com.lveditor.draft"))
+    if extra_draft_root:
+        yield from _scan_root(str(extra_draft_root).strip())
+
+
+def harvest_text_effect_display_names_from_drafts(
+    extra_draft_root: Optional[str] = None,
+) -> Dict[str, str]:
+    """从本机草稿 ``materials.effects[type=text_effect].name`` 收集花字显示名。"""
+    out: Dict[str, str] = {}
+    for p in _iter_local_draft_content_json_paths(extra_draft_root):
+        data = _safe_read_json(p)
+        if not isinstance(data, dict):
+            continue
+        materials = data.get("materials")
+        if not isinstance(materials, dict):
+            continue
+        for eff in materials.get("effects") or []:
+            if not isinstance(eff, dict) or eff.get("type") != "text_effect":
+                continue
+            eid = str(eff.get("effect_id") or eff.get("resource_id") or "").strip()
+            ename = str(eff.get("name") or "").strip()
+            if not eid or not ename:
+                continue
+            prev = out.get(eid, "")
+            if not prev or len(ename) > len(prev):
+                out[eid] = ename
+    return out
+
+
+def persist_harvested_text_effect_display_names(harvested: Dict[str, str]) -> int:
+    """把扫描到的花字名称合并写入 ``text_effect_pool.json`` 的 ``effect_names``。"""
+    if not harvested:
+        return 0
+    path = _text_effect_pool_pref_path()
+    payload: Dict[str, Any] = {}
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+            if isinstance(prev, dict):
+                payload = dict(prev)
+        except (OSError, json.JSONDecodeError, TypeError):
+            payload = {}
+    names_raw = payload.get("effect_names")
+    names: Dict[str, str] = {}
+    if isinstance(names_raw, dict):
+        for key, val in names_raw.items():
+            eid = str(key or "").strip()
+            nm = str(val or "").strip()
+            if eid and nm:
+                names[eid] = nm
+    changed = 0
+    for eid, nm in harvested.items():
+        eid = str(eid or "").strip()
+        nm = str(nm or "").strip()
+        if not eid or not nm:
+            continue
+        prev = names.get(eid, "")
+        if prev != nm and (not prev or len(nm) >= len(prev)):
+            names[eid] = nm
+            changed += 1
+    if changed <= 0:
+        return 0
+    payload["effect_names"] = dict(sorted(names.items(), key=lambda kv: kv[0]))
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        return 0
+    return changed
+
+
+def ensure_text_effect_pool_template_file() -> str:
+    """若用户花字池文件不存在则写入模板，返回绝对路径。"""
+    path = _text_effect_pool_pref_path()
+    if path.is_file():
+        return str(path)
+    tmpl = {
+        "_comment": "effect_ids：花字 effect_id。effect_names：可选别名（下拉显示「名称 · id」）；程序会从剪映草稿自动合并名称，也可手动填写。",
+        "effect_ids": list(_SUBTITLE_TEXT_EFFECT_IDS),
+        "effect_names": {},
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(tmpl, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    return str(path)
+
+
+def harvest_local_text_effect_ids() -> List[str]:
+    """从本机剪映/CapCut 草稿、文本预设、artistEffect 缓存自动收集花字 effect_id。
+
+    说明：剪映没有公开「全部花字列表」API；缓存里一般是你在剪映里预览/用过的花字。
+    想在池子里更多样，可在剪映「花字」面板里多浏览几种，再重启本程序或重新生成子稿。
+    """
+    found: List[str] = []
+    seen: set[str] = set()
+    local = os.environ.get("LOCALAPPDATA", "")
+
+    def _add(eid: str) -> None:
+        e = str(eid or "").strip()
+        if e.isdigit() and len(e) >= 10 and e not in seen:
+            seen.add(e)
+            found.append(e)
+
+    for app_name in ("JianyingPro", "CapCut"):
+        draft_root = os.path.join(local, app_name, "User Data", "Projects", "com.lveditor.draft")
+        if not os.path.isdir(draft_root):
+            continue
+        try:
+            for name in os.listdir(draft_root):
+                p = os.path.join(draft_root, name, "draft_content.json")
+                if not os.path.isfile(p):
+                    continue
+                data = _safe_read_json(p)
+                if not isinstance(data, dict):
+                    continue
+                materials = data.get("materials") if isinstance(data.get("materials"), dict) else {}
+                for eff in materials.get("effects") or []:
+                    if isinstance(eff, dict) and eff.get("type") == "text_effect":
+                        _add(str(eff.get("effect_id") or eff.get("resource_id") or ""))
+                for mat in materials.get("texts") or []:
+                    if not isinstance(mat, dict):
+                        continue
+                    snap = _extract_text_style_snapshot(mat)
+                    if snap:
+                        _add(str(snap.get("effect_id") or ""))
+
+        except OSError:
+            pass
+
+        app_base = os.path.join(local, app_name)
+        for preset_sub in ("User Data/Presets/Text", "User Data/Presets/TextV2", "User Data/Presets/TextPresetV2"):
+            preset_root = os.path.join(app_base, *preset_sub.split("/"))
+            if not os.path.isdir(preset_root):
+                continue
+            try:
+                for dirpath, _dirnames, filenames in os.walk(preset_root):
+                    for fn in filenames:
+                        fp = os.path.join(dirpath, fn)
+                        try:
+                            if os.path.getsize(fp) > 3_000_000:
+                                continue
+                            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                                txt = f.read()
+                        except OSError:
+                            continue
+                        if "flower" not in txt.lower() and "text_effect" not in txt:
+                            continue
+                        try:
+                            data = json.loads(txt)
+                        except json.JSONDecodeError:
+                            data = None
+                        if isinstance(data, dict):
+                            for res in data.get("resources") or []:
+                                if not isinstance(res, dict):
+                                    continue
+                                if str(res.get("panel") or "").lower() in ("flower", "text_effect", "huazi"):
+                                    _add(str(res.get("resource_id") or ""))
+                        for m in re.finditer(
+                            r'"panel"\s*:\s*"flower"[^}]{0,500}?"resource_id"\s*:\s*"(\d{10,})"',
+                            txt,
+                        ):
+                            _add(m.group(1))
+            except OSError:
+                pass
+
+        cache_root = os.path.join(app_base, "User Data", "Cache", "artistEffect")
+        if os.path.isdir(cache_root):
+            try:
+                for name in os.listdir(cache_root):
+                    if name.isdigit() and len(name) >= 10:
+                        if _subtitle_flower_effect_id_is_usable(name):
+                            _add(name)
+            except OSError:
+                pass
+
+    return found
+
+
+def sync_harvested_text_effects_to_pool_file() -> Tuple[int, str]:
+    """把本机扫描到的花字 id 合并写入 text_effect_pool.json（只追加、不删用户已有项）。"""
+    path = _text_effect_pool_pref_path()
+    harvested = harvest_local_text_effect_ids()
+    existing = load_user_text_effect_id_pool()
+    seen = set(existing)
+    merged = list(existing)
+    added = 0
+    for eid in harvested:
+        if eid not in seen:
+            seen.add(eid)
+            merged.append(eid)
+            added += 1
+    if not path.is_file() and not merged:
+        merged = list(_SUBTITLE_TEXT_EFFECT_IDS)
+    payload: Dict[str, Any] = {
+        "_comment": (
+            "effect_ids：花字 effect_id（与 resource_id 相同）。"
+            "程序启动时会从本机剪映草稿/文本预设/artistEffect 缓存自动追加新 id。"
+            "也可手动添加。在剪映花字面板多预览几种可扩充缓存。"
+        ),
+        "effect_ids": merged if merged else list(_SUBTITLE_TEXT_EFFECT_IDS),
+    }
+    if harvested:
+        payload["_auto_harvested_count"] = len(harvested)
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        return added, str(path)
+    _invalidate_text_effect_display_name_cache()
+    try:
+        persist_harvested_text_effect_display_names(harvest_text_effect_display_names_from_drafts())
+    except OSError:
+        pass
+    return added, str(path)
+
+
+def build_text_effect_id_pool(parent_content_path: str) -> Tuple[List[str], List[str]]:
+    """从用户花字池、内置、本机 harvest、父稿已用花字合并去重，并过滤非字幕花字 id。"""
+    pool: List[str] = []
+    seen: set[str] = set()
+    for src in (
+        load_user_text_effect_id_pool(),
+        list(_SUBTITLE_TEXT_EFFECT_IDS),
+        harvest_local_text_effect_ids(),
+    ):
+        for eid in src:
+            e = str(eid or "").strip()
+            if e and e not in seen:
+                seen.add(e)
+                pool.append(e)
+    data = _safe_read_json(parent_content_path)
+    if isinstance(data, dict):
+        materials = data.get("materials") if isinstance(data.get("materials"), dict) else {}
+        for eff in materials.get("effects") or []:
+            if not isinstance(eff, dict) or eff.get("type") != "text_effect":
+                continue
+            eid = str(eff.get("effect_id") or eff.get("resource_id") or "").strip()
+            if eid and eid not in seen:
+                seen.add(eid)
+                pool.append(eid)
+        for mat in materials.get("texts") or []:
+            if not isinstance(mat, dict):
+                continue
+            snap = _extract_text_style_snapshot(mat)
+            if not snap:
+                continue
+            eid = str(snap.get("effect_id") or "").strip()
+            if eid and eid not in seen:
+                seen.add(eid)
+                pool.append(eid)
+    valid, invalid = filter_valid_subtitle_flower_effect_ids(pool)
+    if not valid:
+        valid = list(_SUBTITLE_TEXT_EFFECT_IDS)
+    return valid, invalid
+
+
+def build_text_effect_pool_report(
+    parent_content_json: Optional[str] = None,
+    *,
+    resync: bool = False,
+) -> Dict[str, Any]:
+    """汇总花字池：配置文件条目、可用/无效 id（可用=SDFText 或 TextStyle 花字，非贴纸）。"""
+    added = 0
+    if resync:
+        try:
+            added, _ = sync_harvested_text_effects_to_pool_file()
+        except OSError:
+            pass
+    pool_path = ensure_text_effect_pool_template_file()
+    listed = load_user_text_effect_id_pool()
+    parent_p = (
+        parent_content_json
+        if parent_content_json and os.path.isfile(parent_content_json)
+        else ""
+    )
+    if parent_p:
+        valid, invalid = build_text_effect_id_pool(parent_p)
+    else:
+        pool_raw: List[str] = []
+        seen: set[str] = set()
+        for src in (
+            listed,
+            list(_SUBTITLE_TEXT_EFFECT_IDS),
+            harvest_local_text_effect_ids(),
+        ):
+            for eid in src:
+                e = str(eid or "").strip()
+                if e and e not in seen:
+                    seen.add(e)
+                    pool_raw.append(e)
+        valid, invalid = filter_valid_subtitle_flower_effect_ids(pool_raw)
+        if not valid:
+            valid = list(_SUBTITLE_TEXT_EFFECT_IDS)
+    return {
+        "pool_path": pool_path,
+        "added_on_sync": added,
+        "listed_count": len(listed),
+        "valid_ids": valid,
+        "invalid_ids": invalid,
+        "valid_count": len(valid),
+        "invalid_count": len(invalid),
+    }
+
+
+def format_text_effect_pool_report_text(report: Dict[str, Any]) -> str:
+    lines = [
+        "花字池检测报告",
+        "",
+        f"配置文件：{report.get('pool_path', '')}",
+        f"配置中记录：{report.get('listed_count', 0)} 个 id",
+        f"可用（本机已缓存、可用于字幕花字）：{report.get('valid_count', 0)} 个",
+        f"无效（贴纸等，子稿随机时会忽略）：{report.get('invalid_count', 0)} 个",
+    ]
+    added = int(report.get("added_on_sync") or 0)
+    if added > 0:
+        lines.append(f"本次同步新写入配置：{added} 个 id")
+    lines.extend(
+        [
+            "",
+            "【可用 id】",
+        ]
+    )
+    valid_ids = report.get("valid_ids") or []
+    if valid_ids:
+        names = get_text_effect_display_names()
+        named_n = sum(1 for eid in valid_ids if names.get(str(eid)))
+        lines.append(f"有中文名：{named_n} / {len(valid_ids)} 个（其余仅 id 或类型标签）")
+        lines.append("")
+        for eid in valid_ids:
+            kind = _classify_subtitle_flower_effect_id(str(eid)) or "?"
+            tag = "SDFText" if kind == "sdftext" else ("TextStyle" if kind == "text_style" else kind)
+            label = text_effect_picker_label_for_id(str(eid), names)
+            lines.append(f"  · {label}  ({tag})")
+    else:
+        lines.append("  （无）")
+    lines.append("")
+    lines.append("【无效 id（仅记录在配置里，不会用于随机花字）】")
+    invalid_ids = report.get("invalid_ids") or []
+    if invalid_ids:
+        show = invalid_ids[:24]
+        lines.extend(f"  · {eid}" for eid in show)
+        if len(invalid_ids) > len(show):
+            lines.append(f"  … 另有 {len(invalid_ids) - len(show)} 个未列出")
+    else:
+        lines.append("  （无）")
+    lines.extend(
+        [
+            "",
+            "如何扩充可用花字：",
+            "1. 剪映 5.9 → 选中字幕 → 右侧「花字」面板多预览/应用到字幕；",
+            "2. 回到本程序点「检测花字池」→「同步并刷新」，或重启程序；",
+            "3. 可用 ≥2 个时，时间轴选中字幕轨并点「替换…」配置池随机，生成多条子稿才容易各不相同。",
+            "",
+            "关于中文名：只有剪映把花字应用到字幕时写入 draft 的 name 才会自动出现；",
+            "程序同步时会写入配置文件 effect_names。无名称的可在配置里手动填别名，",
+            "例如 \"7296357486490144036\": \"我的花字1\"。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def print_text_effect_pool_startup_summary(parent_content_json: Optional[str] = None) -> None:
+    """启动时在终端打印花字池概况（与导出时的 [花字] 日志一致口径）。"""
+    try:
+        rep = build_text_effect_pool_report(parent_content_json, resync=False)
+    except OSError:
+        return
+    n = int(rep.get("valid_count") or 0)
+    listed = int(rep.get("listed_count") or 0)
+    inv = int(rep.get("invalid_count") or 0)
+    print(f"[花字] 启动：可用 {n} 个（配置 {listed} 个 id，忽略无效 {inv} 个）")
+    print(f"[花字] 配置：{rep.get('pool_path', '')}")
+    if n < 2:
+        print("[花字] 提示：可用花字偏少，多个子稿可能一样；请在剪映花字面板多预览几种后点「检测花字池」同步。")
+
+
+def open_text_effect_pool_inspector(
+    parent: Any,
+    *,
+    get_draft_root: Any,
+    get_selected_draft_name: Any,
+    on_status_update: Optional[Any] = None,
+) -> None:
+    """弹窗展示花字池检测结果，并可触发扫描写入配置。"""
+    import customtkinter as ctk
+    from tkinter import messagebox
+
+    def _parent_content_json() -> str:
+        dr = (get_draft_root() or "").strip()
+        nm = (get_selected_draft_name() or "").strip()
+        if dr and nm:
+            p = os.path.join(dr, nm, "draft_content.json")
+            if os.path.isfile(p):
+                return p
+        return ""
+
+    win = ctk.CTkToplevel(parent)
+    win.title("花字池检测")
+    win.geometry("560x480")
+    win.minsize(480, 360)
+    win.transient(parent)
+
+    main = ctk.CTkFrame(win, fg_color="transparent")
+    main.pack(fill="both", expand=True, padx=14, pady=12)
+    ctk.CTkLabel(
+        main,
+        text="检测本机可用于替换花字的素材 id",
+        font=ctk.CTkFont(size=13, weight="bold"),
+        anchor="w",
+    ).pack(fill="x", pady=(0, 8))
+
+    box = ctk.CTkTextbox(main, font=ctk.CTkFont(family="Consolas", size=12))
+    box.pack(fill="both", expand=True, pady=(0, 10))
+
+    def _reload(*, resync: bool) -> None:
+        try:
+            rep = build_text_effect_pool_report(_parent_content_json(), resync=resync)
+        except OSError as e:
+            messagebox.showerror("花字池", f"检测失败：\n{e}", parent=win)
+            return
+        box.delete("1.0", "end")
+        box.insert("1.0", format_text_effect_pool_report_text(rep))
+        if callable(on_status_update):
+            try:
+                on_status_update()
+            except Exception:
+                pass
+        if resync:
+            n = int(rep.get("valid_count") or 0)
+            named = sum(1 for eid in (rep.get("valid_ids") or []) if get_text_effect_display_names().get(str(eid)))
+            messagebox.showinfo(
+                "花字池",
+                f"已同步扫描。\n可用花字：{n} 个。\n其中已记录中文名：{named} 个。",
+                parent=win,
+            )
+
+    btn_row = ctk.CTkFrame(main, fg_color="transparent")
+    btn_row.pack(fill="x")
+    ctk.CTkButton(
+        btn_row,
+        text="同步并刷新",
+        width=110,
+        command=lambda: _reload(resync=True),
+    ).pack(side="left", padx=(0, 8))
+
+    def _open_pool_file() -> None:
+        try:
+            p = ensure_text_effect_pool_template_file()
+            if sys.platform == "win32":
+                os.startfile(p)  # type: ignore[attr-defined]
+            else:
+                messagebox.showinfo("花字池", p, parent=win)
+        except OSError as e:
+            messagebox.showerror("花字池", str(e), parent=win)
+
+    ctk.CTkButton(
+        btn_row,
+        text="打开配置文件",
+        width=110,
+        fg_color=("gray70", "gray38"),
+        command=_open_pool_file,
+    ).pack(side="left", padx=(0, 8))
+    ctk.CTkButton(btn_row, text="关闭", width=72, fg_color="transparent", border_width=1, command=win.destroy).pack(
+        side="right"
+    )
+
+    _reload(resync=False)
+    win.grab_set()
+    win.focus_force()
+
+
+def _sticker_pool_pref_path() -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "sticker_pool.json"
+
+
+def _sticker_cache_sticker_subdir(resource_id: str) -> Optional[str]:
+    """本机 artistEffect 中 InfoSticker 缓存子目录（绝对路径）。"""
+    eid = str(resource_id or "").strip()
+    if not eid.isdigit():
+        return None
+    for root in _jianying_artist_effect_cache_roots():
+        base = os.path.join(root, eid)
+        if not os.path.isdir(base):
+            continue
+        try:
+            for sub in os.listdir(base):
+                subp = os.path.join(base, sub)
+                if _artist_effect_subdir_kind(subp) == "sticker":
+                    return subp
+        except OSError:
+            pass
+    return None
+
+
+def _sticker_cache_is_text_template(resource_id: str) -> bool:
+    """TextTemplate 复合贴纸（内含文字/多资源），不能按普通贴纸只换 id。"""
+    subp = _sticker_cache_sticker_subdir(resource_id)
+    if not subp:
+        return False
+    content_path = os.path.join(subp, "content.json")
+    if not os.path.isfile(content_path):
+        return False
+    try:
+        with open(content_path, "r", encoding="utf-8") as f:
+            body = json.load(f)
+        return str((body or {}).get("type") or "").strip() == "TextTemplate"
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+
+
+def _sticker_cache_has_heycan_info(resource_id: str) -> bool:
+    """贴纸缓存是否含 heycanInfo.json（完整下载，非空壳目录）。"""
+    subp = _sticker_cache_sticker_subdir(resource_id)
+    if not subp:
+        return False
+    try:
+        for root, _dirs, files in os.walk(subp):
+            if "heycanInfo.json" in files:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _sticker_resource_id_in_trusted_draft_templates(resource_id: str) -> bool:
+    """草稿中曾成功引用且路径匹配的贴纸（有完整素材记录）。"""
+    rid = str(resource_id or "").strip()
+    if not rid:
+        return False
+    templates, trusted = _get_sticker_material_templates()
+    if rid not in trusted:
+        return False
+    mat = templates.get(rid)
+    return isinstance(mat, dict) and _sticker_material_path_matches(rid, mat)
+
+
+def _classify_sticker_resource_id(resource_id: str) -> Optional[str]:
+    """贴纸素材：InfoSticker 完整缓存，或草稿已验证；排除花字/TextTemplate/过短 id。"""
+    if _classify_subtitle_flower_effect_id(resource_id):
+        return None
+    if _sticker_cache_is_text_template(resource_id):
+        return None
+    eid = str(resource_id or "").strip()
+    if not eid.isdigit() or len(eid) < 19:
+        return None
+    if not _sticker_cache_sticker_subdir(eid):
+        return None
+    if _sticker_cache_has_heycan_info(eid):
+        return "sticker"
+    if _sticker_resource_id_in_trusted_draft_templates(eid):
+        return "sticker"
+    return None
+
+
+def _sticker_resource_id_is_usable(resource_id: str) -> bool:
+    return _classify_sticker_resource_id(resource_id) == "sticker"
+
+
+def load_user_sticker_resource_id_pool() -> List[str]:
+    path = _sticker_pool_pref_path()
+    if not path.is_file():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    raw = data.get("resource_ids") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        rid = str(item or "").strip()
+        if rid and rid not in seen:
+            seen.add(rid)
+            out.append(rid)
+    return out
+
+
+def ensure_sticker_pool_template_file() -> str:
+    path = _sticker_pool_pref_path()
+    if path.is_file():
+        return str(path)
+    tmpl = {
+        "_comment": "贴纸 resource_id（与 sticker_id 相同）。程序会从本机草稿与 artistEffect 缓存自动追加。",
+        "resource_ids": [],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(tmpl, f, ensure_ascii=False, indent=2)
+    return str(path)
+
+
+def harvest_local_sticker_resource_ids() -> List[str]:
+    """从本机剪映/CapCut 草稿与 artistEffect 缓存收集贴纸 resource_id。"""
+    found: List[str] = []
+    seen: set[str] = set()
+    local = os.environ.get("LOCALAPPDATA", "")
+
+    def _add(rid: str) -> None:
+        r = str(rid or "").strip()
+        if r.isdigit() and len(r) >= 19 and r not in seen:
+            seen.add(r)
+            found.append(r)
+
+    for app_name in ("JianyingPro", "CapCut"):
+        draft_root = os.path.join(local, app_name, "User Data", "Projects", "com.lveditor.draft")
+        if os.path.isdir(draft_root):
+            try:
+                for name in os.listdir(draft_root):
+                    p = os.path.join(draft_root, name, "draft_content.json")
+                    if not os.path.isfile(p):
+                        continue
+                    data = _safe_read_json(p)
+                    if not isinstance(data, dict):
+                        continue
+                    for stk in (data.get("materials") or {}).get("stickers") or []:
+                        if not isinstance(stk, dict):
+                            continue
+                        _add(str(stk.get("resource_id") or stk.get("sticker_id") or ""))
+            except OSError:
+                pass
+        cache_root = os.path.join(local, app_name, "User Data", "Cache", "artistEffect")
+        if os.path.isdir(cache_root):
+            try:
+                for name in os.listdir(cache_root):
+                    if name.isdigit() and len(name) >= 19 and _sticker_resource_id_is_usable(name):
+                        _add(name)
+            except OSError:
+                pass
+    return found
+
+
+def sync_harvested_stickers_to_pool_file() -> Tuple[int, int, str]:
+    """合并本机扫描到的贴纸 id 写入配置，并移除无效项。返回 (新增数, 移除无效数, 配置路径)。"""
+    path = _sticker_pool_pref_path()
+    harvested = harvest_local_sticker_resource_ids()
+    existing = load_user_sticker_resource_id_pool()
+    seen = set(existing)
+    merged = list(existing)
+    added = 0
+    for rid in harvested:
+        if rid not in seen:
+            seen.add(rid)
+            merged.append(rid)
+            added += 1
+    valid, invalid = filter_valid_sticker_resource_ids(merged)
+    removed_invalid = len(invalid)
+    payload: Dict[str, Any] = {
+        "_comment": (
+            "resource_ids：剪映贴纸 resource_id（与 sticker_id 相同）。"
+            "程序启动时会从本机草稿/artistEffect 缓存自动追加，并移除无效 id。"
+            "在剪映「贴纸」面板多预览几种可扩充缓存。"
+        ),
+        "resource_ids": valid,
+    }
+    if harvested:
+        payload["_auto_harvested_count"] = len(harvested)
+    if removed_invalid:
+        payload["_pruned_invalid_count"] = removed_invalid
+    try:
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        return added, removed_invalid, str(path)
+    _invalidate_sticker_material_template_cache()
+    return added, removed_invalid, str(path)
+
+
+def _resolve_sticker_cache_path(resource_id: str) -> str:
+    """贴纸 ``materials.stickers[].path``：指向本机 artistEffect 缓存目录。"""
+    subp = _sticker_cache_sticker_subdir(resource_id)
+    if subp:
+        return subp.replace("\\", "/")
+    return "C:"
+
+
+def _sticker_material_path_matches(resource_id: str, mat: Dict[str, Any]) -> bool:
+    rid = str(resource_id or "").strip()
+    if not rid:
+        return False
+    path = str(mat.get("path") or "").replace("\\", "/")
+    return rid in path
+
+
+def _sticker_original_size_from_cache(resource_id: str) -> List[Any]:
+    subp = _sticker_cache_sticker_subdir(resource_id)
+    if not subp:
+        return []
+    try:
+        for root, _dirs, files in os.walk(subp):
+            if "heycanInfo.json" not in files:
+                continue
+            with open(os.path.join(root, "heycanInfo.json"), "r", encoding="utf-8") as f:
+                info = json.load(f)
+            if not isinstance(info, dict):
+                continue
+            w = info.get("bigWidth") or info.get("singleWidth")
+            h = info.get("bigHeight") or info.get("singleHeight")
+            if w and h:
+                return [int(w), int(h)]
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return []
+
+
+_STICKER_MATERIAL_TEMPLATE_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_STICKER_MATERIAL_TEMPLATE_TRUSTED: Optional[set[str]] = None
+
+
+def _invalidate_sticker_material_template_cache() -> None:
+    global _STICKER_MATERIAL_TEMPLATE_CACHE, _STICKER_MATERIAL_TEMPLATE_TRUSTED
+    _STICKER_MATERIAL_TEMPLATE_CACHE = None
+    _STICKER_MATERIAL_TEMPLATE_TRUSTED = None
+    _invalidate_text_effect_display_name_cache()
+
+
+def _sticker_material_template_score(mat: Dict[str, Any]) -> int:
+    score = 0
+    for key in ("name", "icon_url", "preview_cover_url", "request_id", "path"):
+        if str(mat.get(key) or "").strip():
+            score += 1
+    return score
+
+
+def harvest_sticker_material_templates() -> Tuple[Dict[str, Dict[str, Any]], set[str]]:
+    """从本机草稿收集贴纸素材模板；返回 (resource_id→素材, 可信 id 集合)。"""
+    templates: Dict[str, Dict[str, Any]] = {}
+    local = os.environ.get("LOCALAPPDATA", "")
+    for app_name in ("JianyingPro", "CapCut"):
+        draft_root = os.path.join(local, app_name, "User Data", "Projects", "com.lveditor.draft")
+        if not os.path.isdir(draft_root):
+            continue
+        try:
+            for name in os.listdir(draft_root):
+                p = os.path.join(draft_root, name, "draft_content.json")
+                if not os.path.isfile(p):
+                    continue
+                data = _safe_read_json(p)
+                if not isinstance(data, dict):
+                    continue
+                for stk in (data.get("materials") or {}).get("stickers") or []:
+                    if not isinstance(stk, dict):
+                        continue
+                    rid = str(stk.get("resource_id") or stk.get("sticker_id") or "").strip()
+                    if not rid.isdigit() or not _sticker_material_path_matches(rid, stk):
+                        continue
+                    prev = templates.get(rid)
+                    if prev is None or _sticker_material_template_score(stk) > _sticker_material_template_score(prev):
+                        templates[rid] = copy.deepcopy(stk)
+        except OSError:
+            pass
+
+    name_to_rids: Dict[str, List[str]] = {}
+    icon_to_rids: Dict[str, List[str]] = {}
+    for rid, mat in templates.items():
+        name = str(mat.get("name") or "").strip()
+        if name:
+            name_to_rids.setdefault(name, []).append(rid)
+        icon = str(mat.get("icon_url") or "").strip()
+        if icon:
+            icon_to_rids.setdefault(icon, []).append(rid)
+
+    suspicious: set[str] = set()
+    for group in list(name_to_rids.values()) + list(icon_to_rids.values()):
+        if len(group) > 1:
+            suspicious.update(group)
+
+    trusted = {rid for rid in templates if rid not in suspicious}
+    return templates, trusted
+
+
+def _get_sticker_material_templates() -> Tuple[Dict[str, Dict[str, Any]], set[str]]:
+    global _STICKER_MATERIAL_TEMPLATE_CACHE, _STICKER_MATERIAL_TEMPLATE_TRUSTED
+    if _STICKER_MATERIAL_TEMPLATE_CACHE is None or _STICKER_MATERIAL_TEMPLATE_TRUSTED is None:
+        _STICKER_MATERIAL_TEMPLATE_CACHE, _STICKER_MATERIAL_TEMPLATE_TRUSTED = harvest_sticker_material_templates()
+    return _STICKER_MATERIAL_TEMPLATE_CACHE, _STICKER_MATERIAL_TEMPLATE_TRUSTED
+
+
+def _build_sticker_material_for_replace(
+    resource_id: str,
+    material_id: str,
+    source_mat: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """生成可写入 draft 的完整贴纸素材（保留片段 material_id）。"""
+    rid = str(resource_id or "").strip()
+    if not rid or _sticker_cache_is_text_template(rid):
+        return None
+    cache_path = _resolve_sticker_cache_path(rid)
+    if cache_path == "C:":
+        return None
+
+    templates, trusted = _get_sticker_material_templates()
+    tpl = templates.get(rid)
+    if tpl is not None and rid in trusted:
+        mat = copy.deepcopy(tpl)
+    else:
+        mat = copy.deepcopy(source_mat)
+        for key in ("name", "icon_url", "preview_cover_url", "request_id"):
+            mat[key] = ""
+
+    mat["id"] = material_id
+    mat["resource_id"] = rid
+    mat["sticker_id"] = rid
+    mat["path"] = cache_path
+    mat["type"] = "sticker"
+    if not mat.get("source_platform"):
+        mat["source_platform"] = 1
+    if not mat.get("platform"):
+        mat["platform"] = "all"
+    if mat.get("check_flag") is None:
+        mat["check_flag"] = 1
+    if not mat.get("category_id"):
+        mat["category_id"] = "heycan_search_sticker"
+    if not mat.get("category_name"):
+        mat["category_name"] = mat.get("category_id") or "heycan_search_sticker"
+    if not mat.get("aigc_type"):
+        mat["aigc_type"] = "none"
+    osz = _sticker_original_size_from_cache(rid)
+    if osz:
+        mat["original_size"] = osz
+    elif mat.get("original_size") is None:
+        mat["original_size"] = []
+    return mat
+
+
+def build_sticker_resource_id_pool(parent_content_path: str) -> Tuple[List[str], List[str]]:
+    """从贴纸池配置、本机 harvest、父稿已用贴纸合并，并过滤无效 id。"""
+    pool_raw: List[str] = []
+    seen: set[str] = set()
+    for src in (load_user_sticker_resource_id_pool(), harvest_local_sticker_resource_ids()):
+        for rid in src:
+            r = str(rid or "").strip()
+            if r and r not in seen:
+                seen.add(r)
+                pool_raw.append(r)
+    data = _safe_read_json(parent_content_path)
+    if isinstance(data, dict):
+        for stk in (data.get("materials") or {}).get("stickers") or []:
+            if not isinstance(stk, dict):
+                continue
+            r = str(stk.get("resource_id") or stk.get("sticker_id") or "").strip()
+            if r and r not in seen:
+                seen.add(r)
+                pool_raw.append(r)
+    return filter_valid_sticker_resource_ids(pool_raw)
+
+
+def filter_valid_sticker_resource_ids(resource_ids: Iterable[str]) -> Tuple[List[str], List[str]]:
+    valid: List[str] = []
+    invalid: List[str] = []
+    seen: set[str] = set()
+    for raw in resource_ids:
+        rid = str(raw or "").strip()
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        if _sticker_resource_id_is_usable(rid):
+            valid.append(rid)
+        else:
+            invalid.append(rid)
+    return valid, invalid
+
+
+def sanitize_segment_export_pool_styles(
+    pool: Dict[str, Dict[str, Any]],
+    parent_content_json: str = "",
+) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """导出前修正无效的「指定花字/贴纸 id」为池随机；不删除槽位配置。"""
+    if not isinstance(pool, dict):
+        return {}, []
+    if not pool:
+        return {}, []
+    out: Dict[str, Dict[str, Any]] = {}
+    notes: List[str] = []
+    for sk, sv in pool.items():
+        if not isinstance(sv, dict):
+            continue
+        piece = dict(sv)
+        cfg = normalize_style_pool_config(piece)
+        if cfg and cfg.get("style_mode") == STYLE_MODE_FIXED:
+            kind = cfg.get("style_kind")
+            rid = str(cfg.get("style_resource_id") or "").strip()
+            invalid = False
+            pool_name = ""
+            if kind == STYLE_KIND_STICKER:
+                pool_name = "贴纸"
+                invalid = not _sticker_resource_id_is_usable(rid)
+            elif kind == STYLE_KIND_TEXT_EFFECT:
+                pool_name = "花字"
+                invalid = not _subtitle_flower_effect_id_is_usable(rid)
+            if invalid and pool_name:
+                slot_hint = str(sk).split("\0")[-1] if "\0" in str(sk) else str(sk)
+                piece["style_kind"] = kind
+                piece["style_mode"] = STYLE_MODE_RANDOM
+                piece.pop("style_resource_id", None)
+                notes.append(
+                    f"{pool_name} 片段#{slot_hint}：指定 id {rid} 无效或未缓存，导出时改为池随机"
+                )
+        if piece:
+            out[str(sk)] = piece
+    return out, notes
+
+
+def prune_invalid_sticker_ids_from_pool_file() -> Tuple[int, int]:
+    """从 sticker_pool.json 移除无效 resource_id。返回 (移除数, 保留数)。"""
+    path = _sticker_pool_pref_path()
+    listed = load_user_sticker_resource_id_pool()
+    if not listed:
+        return 0, 0
+    valid, invalid = filter_valid_sticker_resource_ids(listed)
+    if not invalid:
+        return 0, len(valid)
+    payload: Dict[str, Any] = {
+        "_comment": (
+            "resource_ids：剪映贴纸 resource_id（与 sticker_id 相同）。"
+            "程序启动时会从本机草稿/artistEffect 缓存自动追加，并移除无效 id。"
+            "在剪映「贴纸」面板多预览几种可扩充缓存。"
+        ),
+        "resource_ids": valid,
+        "_pruned_invalid_count": len(invalid),
+    }
+    try:
+        if path.is_file():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    prev = json.load(f)
+                if isinstance(prev, dict):
+                    for k, v in prev.items():
+                        if k.startswith("_") and k not in payload:
+                            payload[k] = v
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        return 0, len(valid)
+    _invalidate_sticker_material_template_cache()
+    return len(invalid), len(valid)
+
+
+def build_sticker_pool_report(
+    parent_content_json: Optional[str] = None,
+    *,
+    resync: bool = False,
+) -> Dict[str, Any]:
+    added = 0
+    removed_invalid = 0
+    if resync:
+        try:
+            added, removed_invalid, _ = sync_harvested_stickers_to_pool_file()
+        except OSError:
+            pass
+    pool_path = ensure_sticker_pool_template_file()
+    listed = load_user_sticker_resource_id_pool()
+    pool_raw: List[str] = []
+    seen: set[str] = set()
+    for src in (listed, harvest_local_sticker_resource_ids()):
+        for rid in src:
+            r = str(rid or "").strip()
+            if r and r not in seen:
+                seen.add(r)
+                pool_raw.append(r)
+    parent_p = (
+        parent_content_json
+        if parent_content_json and os.path.isfile(parent_content_json)
+        else ""
+    )
+    if parent_p:
+        data = _safe_read_json(parent_p)
+        if isinstance(data, dict):
+            for stk in (data.get("materials") or {}).get("stickers") or []:
+                if not isinstance(stk, dict):
+                    continue
+                r = str(stk.get("resource_id") or stk.get("sticker_id") or "").strip()
+                if r and r not in seen:
+                    seen.add(r)
+                    pool_raw.append(r)
+    valid, invalid = filter_valid_sticker_resource_ids(pool_raw)
+    return {
+        "pool_path": pool_path,
+        "added_on_sync": added,
+        "pruned_invalid_count": removed_invalid,
+        "listed_count": len(listed),
+        "valid_ids": valid,
+        "invalid_ids": invalid,
+        "valid_count": len(valid),
+        "invalid_count": len(invalid),
+    }
+
+
+def format_sticker_pool_report_text(report: Dict[str, Any]) -> str:
+    lines = [
+        "贴纸池检测报告",
+        "",
+        f"配置文件：{report.get('pool_path', '')}",
+        f"配置中记录：{report.get('listed_count', 0)} 个 id",
+        f"可用（本机已完整缓存或草稿已验证）：{report.get('valid_count', 0)} 个",
+        f"无效（空壳缓存/非贴纸/id 过短）：{report.get('invalid_count', 0)} 个",
+    ]
+    added = int(report.get("added_on_sync") or 0)
+    if added > 0:
+        lines.append(f"本次同步新写入配置：{added} 个 id")
+    pruned = int(report.get("pruned_invalid_count") or 0)
+    if pruned > 0:
+        lines.append(f"本次已从配置文件清理无效 id：{pruned} 个")
+    lines.extend(["", "【可用贴纸 id】"])
+    valid_ids = report.get("valid_ids") or []
+    if valid_ids:
+        names = get_sticker_display_names()
+        for rid in valid_ids:
+            label = style_resource_picker_label_for_id(str(rid), names.get(str(rid), ""))
+            lines.append(f"  · {label}  (InfoSticker)")
+    else:
+        lines.append("  （无）")
+    lines.append("")
+    lines.append("【无效 id】")
+    invalid_ids = report.get("invalid_ids") or []
+    if invalid_ids:
+        show = invalid_ids[:24]
+        lines.extend(f"  · {rid}" for rid in show)
+        if len(invalid_ids) > len(show):
+            lines.append(f"  … 另有 {len(invalid_ids) - len(show)} 个未列出")
+    else:
+        lines.append("  （无）")
+    lines.extend(
+        [
+            "",
+            "说明：贴纸与字幕花字是不同素材；花字池里的「无效」项很多其实是贴纸 id。",
+            "TextTemplate 复合贴纸（缓存 content.json 含文字模板）不会纳入可用池。",
+            "仅含 InfoSticker 空壳目录、无 heycanInfo.json 且草稿未用过的 id 视为无效。",
+            "如何扩充：剪映 5.9 →「贴纸」面板多预览/添加到时间轴 → 本程序「检测贴纸池」→「同步并刷新」。",
+            "导出区贴纸请在时间轴选中贴纸轨并点「替换…」配置。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+_TEXT_EFFECT_DISPLAY_NAME_CACHE: Optional[Dict[str, str]] = None
+
+
+def harvest_text_effect_display_names(
+    extra_draft_root: Optional[str] = None,
+) -> Dict[str, str]:
+    """花字 effect_id → 显示名（草稿扫描 + 配置文件 ``effect_names``）。"""
+    return get_text_effect_display_names(extra_draft_root=extra_draft_root)
+
+
+def get_text_effect_display_names(
+    extra_draft_root: Optional[str] = None,
+) -> Dict[str, str]:
+    global _TEXT_EFFECT_DISPLAY_NAME_CACHE
+    if _TEXT_EFFECT_DISPLAY_NAME_CACHE is not None and not extra_draft_root:
+        return _TEXT_EFFECT_DISPLAY_NAME_CACHE
+    harvested = harvest_text_effect_display_names_from_drafts(extra_draft_root)
+    overrides = load_text_effect_display_name_overrides()
+    merged = _merge_text_effect_display_name_maps(harvested, overrides)
+    if not extra_draft_root:
+        _TEXT_EFFECT_DISPLAY_NAME_CACHE = merged
+    return merged
+
+
+def text_effect_picker_label_for_id(effect_id: str, name_map: Optional[Dict[str, str]] = None) -> str:
+    """下拉项：优先中文名；无名称时标注花字类型 + id。"""
+    eid = str(effect_id or "").strip()
+    if not eid:
+        return ""
+    name_map = name_map or {}
+    name = str(name_map.get(eid) or "").strip()
+    if name:
+        return style_resource_picker_label_for_id(eid, name)
+    kind = _classify_subtitle_flower_effect_id(eid)
+    tag = "SDFText" if kind == "sdftext" else ("TextStyle" if kind == "text_style" else "花字")
+    return f"{tag} · {eid}"
+
+
+def _invalidate_text_effect_display_name_cache() -> None:
+    global _TEXT_EFFECT_DISPLAY_NAME_CACHE
+    _TEXT_EFFECT_DISPLAY_NAME_CACHE = None
+
+
+def get_sticker_display_names() -> Dict[str, str]:
+    """贴纸 resource_id → 显示名（来自本机草稿贴纸素材）。"""
+    templates, _ = _get_sticker_material_templates()
+    out: Dict[str, str] = {}
+    for rid, mat in templates.items():
+        name = str(mat.get("name") or "").strip()
+        if name:
+            out[str(rid)] = name
+    return out
+
+
+def _truncate_style_resource_label(text: str, *, max_len: int = 36) -> str:
+    t = " ".join(str(text or "").split())
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 1].rstrip() + "…"
+
+
+def style_resource_picker_label_for_id(resource_id: str, display_name: str = "") -> str:
+    rid = str(resource_id or "").strip()
+    if not rid:
+        return ""
+    name = _truncate_style_resource_label(str(display_name or "").strip())
+    if name:
+        return f"{name} · {rid}"
+    return rid
+
+
+def build_style_resource_picker_choices(
+    valid_ids: Iterable[str],
+    name_map: Optional[Dict[str, str]] = None,
+    *,
+    empty_label: str = "（请选择）",
+) -> Tuple[List[str], Dict[str, str]]:
+    """构建下拉显示项与 label→resource_id 映射（label 含名称与 id）。"""
+    name_map = name_map or {}
+    labels: List[str] = [empty_label]
+    label_to_id: Dict[str, str] = {empty_label: ""}
+    seen_labels: set[str] = {empty_label}
+    for raw in valid_ids:
+        rid = str(raw or "").strip()
+        if not rid:
+            continue
+        label = style_resource_picker_label_for_id(rid, name_map.get(rid, ""))
+        if label in seen_labels:
+            n = 2
+            while f"{label}#{n}" in seen_labels:
+                n += 1
+            label = f"{label}#{n}"
+        labels.append(label)
+        label_to_id[label] = rid
+        seen_labels.add(label)
+    return labels, label_to_id
+
+
+def build_text_effect_picker_choices(
+    valid_ids: Iterable[str],
+    name_map: Optional[Dict[str, str]] = None,
+    *,
+    empty_label: str = "（请选择）",
+) -> Tuple[List[str], Dict[str, str]]:
+    """花字下拉：有中文名则「名称 · id」，否则「TextStyle/SDFText · id」。"""
+    name_map = name_map or {}
+    labels: List[str] = [empty_label]
+    label_to_id: Dict[str, str] = {empty_label: ""}
+    seen_labels: set[str] = {empty_label}
+    for raw in valid_ids:
+        rid = str(raw or "").strip()
+        if not rid:
+            continue
+        label = text_effect_picker_label_for_id(rid, name_map)
+        if label in seen_labels:
+            n = 2
+            while f"{label}#{n}" in seen_labels:
+                n += 1
+            label = f"{label}#{n}"
+        labels.append(label)
+        label_to_id[label] = rid
+        seen_labels.add(label)
+    return labels, label_to_id
+
+
+def open_sticker_pool_inspector(
+    parent: Any,
+    *,
+    get_draft_root: Any,
+    get_selected_draft_name: Any,
+    on_status_update: Optional[Any] = None,
+) -> None:
+    import customtkinter as ctk
+    from tkinter import messagebox
+
+    def _parent_content_json() -> str:
+        dr = (get_draft_root() or "").strip()
+        nm = (get_selected_draft_name() or "").strip()
+        if dr and nm:
+            p = os.path.join(dr, nm, "draft_content.json")
+            if os.path.isfile(p):
+                return p
+        return ""
+
+    win = ctk.CTkToplevel(parent)
+    win.title("贴纸池检测")
+    win.geometry("560x480")
+    win.minsize(480, 360)
+    win.transient(parent)
+
+    main = ctk.CTkFrame(win, fg_color="transparent")
+    main.pack(fill="both", expand=True, padx=14, pady=12)
+    ctk.CTkLabel(
+        main,
+        text="检测本机可用贴纸 resource_id（InfoSticker 缓存）",
+        font=ctk.CTkFont(size=13, weight="bold"),
+        anchor="w",
+    ).pack(fill="x", pady=(0, 8))
+
+    box = ctk.CTkTextbox(main, font=ctk.CTkFont(family="Consolas", size=12))
+    box.pack(fill="both", expand=True, pady=(0, 10))
+
+    def _reload(*, resync: bool) -> None:
+        try:
+            rep = build_sticker_pool_report(_parent_content_json(), resync=resync)
+        except OSError as e:
+            messagebox.showerror("贴纸池", f"检测失败：\n{e}", parent=win)
+            return
+        box.delete("1.0", "end")
+        box.insert("1.0", format_sticker_pool_report_text(rep))
+        if callable(on_status_update):
+            try:
+                on_status_update()
+            except Exception:
+                pass
+        if resync:
+            n = int(rep.get("valid_count") or 0)
+            pruned = int(rep.get("pruned_invalid_count") or 0)
+            msg = f"已同步扫描。\n可用贴纸：{n} 个。"
+            if pruned > 0:
+                msg += f"\n已从配置清理无效 id：{pruned} 个。"
+            messagebox.showinfo("贴纸池", msg, parent=win)
+
+    btn_row = ctk.CTkFrame(main, fg_color="transparent")
+    btn_row.pack(fill="x")
+    ctk.CTkButton(btn_row, text="同步并刷新", width=110, command=lambda: _reload(resync=True)).pack(
+        side="left", padx=(0, 8)
+    )
+
+    def _open_pool_file() -> None:
+        try:
+            p = ensure_sticker_pool_template_file()
+            if sys.platform == "win32":
+                os.startfile(p)  # type: ignore[attr-defined]
+            else:
+                messagebox.showinfo("贴纸池", p, parent=win)
+        except OSError as e:
+            messagebox.showerror("贴纸池", str(e), parent=win)
+
+    ctk.CTkButton(
+        btn_row,
+        text="打开配置文件",
+        width=110,
+        fg_color=("gray70", "gray38"),
+        command=_open_pool_file,
+    ).pack(side="left", padx=(0, 8))
+    ctk.CTkButton(btn_row, text="关闭", width=72, fg_color="transparent", border_width=1, command=win.destroy).pack(
+        side="right"
+    )
+
+    _reload(resync=False)
+    win.grab_set()
+    win.focus_force()
+
+
+def _pick_text_effect_id(pool: List[str], used_in_batch: Optional[set[str]] = None) -> str:
+    """从池中抽取花字 id；同一批次内优先不重复。"""
+    if not pool:
+        raise ValueError("花字池为空")
+    if used_in_batch is not None:
+        available = [x for x in pool if x not in used_in_batch]
+        if not available:
+            available = list(pool)
+        pick = random.choice(available)
+        used_in_batch.add(pick)
+        return pick
+    return random.choice(pool)
+
+
+def _text_material_ids_on_text_tracks(content: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for tr in content.get("tracks") or []:
+        if str(tr.get("type", "")) != "text":
+            continue
+        for seg in tr.get("segments") or []:
+            if not isinstance(seg, dict):
+                continue
+            mid = str(seg.get("material_id") or "").strip()
+            if mid and mid not in seen:
+                seen.add(mid)
+                out.append(mid)
+    return out
+
+
+def _subtitle_text_material_ids(content: Dict[str, Any]) -> List[str]:
+    """文本轨道上字幕素材 id；若无 type=subtitle 则退回该轨全部文本。"""
+    track_ids = _text_material_ids_on_text_tracks(content)
+    mats = {
+        str(m.get("id")): m
+        for m in (content.get("materials") or {}).get("texts") or []
+        if isinstance(m, dict) and m.get("id")
+    }
+    subs = [mid for mid in track_ids if str(mats.get(mid, {}).get("type", "")) == "subtitle"]
+    return subs if subs else track_ids
+
+
+def _extract_text_style_snapshot(mat: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = mat.get("content")
+    if not isinstance(raw, str) or not raw.strip().startswith("{"):
+        return None
+    try:
+        content = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    styles = content.get("styles")
+    if not isinstance(styles, list) or not styles:
+        return None
+    st0 = styles[0] if isinstance(styles[0], dict) else {}
+    color: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    try:
+        solid = st0["fill"]["content"]["solid"]["color"]
+        color = (float(solid[0]), float(solid[1]), float(solid[2]))
+    except (KeyError, TypeError, IndexError, ValueError):
+        pass
+    font_id: Optional[str] = None
+    font = st0.get("font")
+    if isinstance(font, dict):
+        font_id = str(font.get("id") or "").strip() or None
+    effect_id: Optional[str] = None
+    es = st0.get("effectStyle")
+    if isinstance(es, dict):
+        effect_id = str(es.get("id") or "").strip() or None
+    try:
+        size = float(st0.get("size") or 5.0)
+    except (TypeError, ValueError):
+        size = 5.0
+    return {
+        "size": size,
+        "color": color,
+        "font_id": font_id,
+        "effect_id": effect_id,
+        "bold": bool(st0.get("bold")),
+        "italic": bool(st0.get("italic")),
+        "underline": bool(st0.get("underline")),
+        "strokes": copy.deepcopy(st0.get("strokes") if isinstance(st0.get("strokes"), list) else []),
+        "alignment": mat.get("alignment"),
+    }
+
+
+def _subtitle_style_preset_key(preset: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        preset.get("font_id"),
+        tuple(preset.get("color") or ()),
+        preset.get("effect_id"),
+        preset.get("size"),
+    )
+
+
+def _random_builtin_subtitle_style() -> Dict[str, Any]:
+    effect_id: Optional[str] = None
+    if _SUBTITLE_TEXT_EFFECT_IDS and random.random() < 0.42:
+        effect_id = random.choice(_SUBTITLE_TEXT_EFFECT_IDS)
+    strokes: List[Any] = []
+    if random.random() < 0.28:
+        strokes = [
+            {
+                "content": {"solid": {"alpha": 1.0, "color": [0.0, 0.0, 0.0]}},
+                "width": 0.08,
+            }
+        ]
+    return {
+        "size": random.choice([4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 8.0]),
+        "color": random.choice(_SUBTITLE_COLOR_RGB),
+        "font_id": random.choice(_SUBTITLE_FONT_RESOURCE_IDS),
+        "effect_id": effect_id,
+        "bold": random.random() < 0.18,
+        "italic": False,
+        "underline": False,
+        "strokes": strokes,
+        "alignment": 1,
+    }
+
+
+def build_subtitle_style_presets(parent_content_path: str, *, min_pool: int = 10) -> List[Dict[str, Any]]:
+    """从父草稿已有字幕/文本样式抽取预设，并补足内置随机组合供子稿抽取。"""
+    presets: List[Dict[str, Any]] = []
+    seen: set[Tuple[Any, ...]] = set()
+    data = _safe_read_json(parent_content_path)
+    if isinstance(data, dict):
+        mats = {
+            str(m.get("id")): m
+            for m in (data.get("materials") or {}).get("texts") or []
+            if isinstance(m, dict) and m.get("id")
+        }
+        for mid in _subtitle_text_material_ids(data):
+            mat = mats.get(mid)
+            if not isinstance(mat, dict):
+                continue
+            snap = _extract_text_style_snapshot(mat)
+            if not snap:
+                continue
+            key = _subtitle_style_preset_key(snap)
+            if key in seen:
+                continue
+            seen.add(key)
+            presets.append(snap)
+    while len(presets) < max(min_pool, 8):
+        cand = _random_builtin_subtitle_style()
+        key = _subtitle_style_preset_key(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        presets.append(cand)
+    return presets
+
+
+def _subtitle_style_preset_label(preset: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    if preset.get("font_id"):
+        parts.append(f"字体={preset['font_id']}")
+    col = preset.get("color")
+    if isinstance(col, (list, tuple)) and len(col) >= 3:
+        parts.append(
+            "颜色=({:.2f},{:.2f},{:.2f})".format(float(col[0]), float(col[1]), float(col[2]))
+        )
+    try:
+        parts.append(f"字号={float(preset.get('size') or 5):g}")
+    except (TypeError, ValueError):
+        pass
+    if preset.get("effect_id"):
+        parts.append(f"花字={preset['effect_id']}")
+    return "，".join(parts) if parts else "随机样式"
+
+
+def _text_decor_effect_global_ids(materials: Dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for eff in materials.get("effects") or []:
+        if not isinstance(eff, dict):
+            continue
+        if eff.get("type") in ("text_effect", "text_shape"):
+            gid = str(eff.get("id") or "").strip()
+            if gid:
+                out.add(gid)
+    return out
+
+
+def _prune_text_effects_except(materials: Dict[str, Any], keep_gid: str) -> None:
+    """去掉多余的 text_effect 条目，避免复制子稿后 effects 列表膨胀。"""
+    effects = materials.get("effects")
+    if not isinstance(effects, list):
+        return
+    keep = str(keep_gid or "").strip()
+    materials["effects"] = [
+        eff
+        for eff in effects
+        if not (
+            isinstance(eff, dict)
+            and eff.get("type") == "text_effect"
+            and str(eff.get("id") or "").strip() != keep
+        )
+    ]
+
+
+def _ensure_text_effect_material(materials: Dict[str, Any], effect_id: str) -> str:
+    """在 materials.effects 中确保存在花字条目，返回其 global id。"""
+    effects = materials.setdefault("effects", [])
+    if not isinstance(effects, list):
+        effects = []
+        materials["effects"] = effects
+    for eff in effects:
+        if not isinstance(eff, dict):
+            continue
+        if eff.get("type") == "text_effect" and str(eff.get("effect_id") or "") == effect_id:
+            gid = str(eff.get("id") or "").strip()
+            if gid:
+                return gid
+    gid = uuid.uuid4().hex
+    effects.append(
+        {
+            "apply_target_type": 0,
+            "effect_id": effect_id,
+            "id": gid,
+            "resource_id": effect_id,
+            "type": "text_effect",
+            "value": 1.0,
+            "source_platform": 1,
+        }
+    )
+    return gid
+
+
+def _text_effect_global_ids(materials: Dict[str, Any]) -> set[str]:
+    """仅花字（text_effect）实例 id，不含气泡 text_shape。"""
+    out: set[str] = set()
+    for eff in materials.get("effects") or []:
+        if not isinstance(eff, dict):
+            continue
+        if eff.get("type") == "text_effect":
+            gid = str(eff.get("id") or "").strip()
+            if gid:
+                out.add(gid)
+    return out
+
+
+def _apply_text_effect_id_to_content(
+    content: Dict[str, Any],
+    effect_id: str,
+    material_ids: List[str],
+) -> int:
+    """仅替换花字：改 content.styles[].effectStyle 与 segment.extra_material_refs，不动字体/颜色/字号。"""
+    materials = content.setdefault("materials", {})
+    if not isinstance(materials, dict):
+        return 0
+    texts = materials.get("texts")
+    if not isinstance(texts, list):
+        return 0
+    mat_by_id = {str(m.get("id")): m for m in texts if isinstance(m, dict) and m.get("id")}
+    effect_gid = _ensure_text_effect_material(materials, effect_id)
+    _prune_text_effects_except(materials, effect_gid)
+    remove_effect_gids = _text_effect_global_ids(materials) - {effect_gid}
+    style_path = _resolve_subtitle_flower_effect_style_path(effect_id)
+
+    seg_by_mat: Dict[str, List[Dict[str, Any]]] = {}
+    for tr in content.get("tracks") or []:
+        if str(tr.get("type", "")) != "text":
+            continue
+        for seg in tr.get("segments") or []:
+            if not isinstance(seg, dict):
+                continue
+            mid = str(seg.get("material_id") or "").strip()
+            if mid in material_ids:
+                seg_by_mat.setdefault(mid, []).append(seg)
+
+    n = 0
+    for mid in material_ids:
+        mat = mat_by_id.get(mid)
+        if not isinstance(mat, dict):
+            continue
+        raw = mat.get("content")
+        if not isinstance(raw, str) or not raw.strip().startswith("{"):
+            continue
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        styles = body.get("styles")
+        if not isinstance(styles, list) or not styles:
+            text = str(body.get("text") or "")
+            styles = [{"range": [0, len(text)]}]
+            body["styles"] = styles
+        for st in styles:
+            if isinstance(st, dict):
+                st["effectStyle"] = {"id": effect_id, "path": style_path}
+        mat["content"] = json.dumps(body, ensure_ascii=False)
+        for seg in seg_by_mat.get(mid, []):
+            refs = [str(r) for r in (seg.get("extra_material_refs") or []) if r]
+            refs = [r for r in refs if r not in remove_effect_gids]
+            if effect_gid not in refs:
+                refs.append(effect_gid)
+            seg["extra_material_refs"] = refs
+        n += 1
+    return n
+
+
+def _apply_sticker_resource_id_to_content(
+    content: Dict[str, Any],
+    resource_id: str,
+    material_ids: List[str],
+) -> int:
+    """子稿内贴纸轨素材整段替换（含 name/icon/path 等），片段 clip 不变。"""
+    materials = content.setdefault("materials", {})
+    if not isinstance(materials, dict):
+        return 0
+    stickers = materials.get("stickers")
+    if not isinstance(stickers, list):
+        return 0
+    mat_by_id = {str(m.get("id")): m for m in stickers if isinstance(m, dict) and m.get("id")}
+    n = 0
+    for mid in material_ids:
+        mat = mat_by_id.get(mid)
+        if not isinstance(mat, dict):
+            continue
+        new_mat = _build_sticker_material_for_replace(resource_id, mid, mat)
+        if not isinstance(new_mat, dict):
+            continue
+        for i, item in enumerate(stickers):
+            if isinstance(item, dict) and str(item.get("id")) == mid:
+                stickers[i] = new_mat
+                n += 1
+                break
+    return n
+
+
+def apply_per_segment_style_pools_to_draft(
+    content_json_path: str,
+    draft_name: str,
+    style_pool: Dict[str, Dict[str, Any]],
+    style_refs: List[StyleSegmentRef],
+    *,
+    text_effect_id_pool: Optional[List[str]] = None,
+    sticker_id_pool: Optional[List[str]] = None,
+    used_fx_batch: Optional[set[str]] = None,
+    used_sticker_batch: Optional[set[str]] = None,
+) -> Tuple[int, List[str]]:
+    """对 segment_export_pool 中已配置的花字/贴纸槽，在导出或生成子稿时套用。"""
+    style_pool, sanitize_notes = sanitize_segment_export_pool_styles(
+        dict(style_pool) if isinstance(style_pool, dict) else {},
+        content_json_path,
+    )
+    for note in sanitize_notes:
+        print(f"[槽位修正] {note}")
+    data = _safe_read_json(content_json_path)
+    if not isinstance(data, dict):
+        return 0, ["无法读取 draft_content.json"]
+    dn = (draft_name or "").strip()
+    if not dn or not isinstance(style_pool, dict):
+        return 0, []
+    text_pool = [str(x).strip() for x in (text_effect_id_pool or []) if str(x).strip()]
+    sticker_pool = [str(x).strip() for x in (sticker_id_pool or []) if str(x).strip()]
+    if not text_pool:
+        text_pool, _ = build_text_effect_id_pool(content_json_path)
+    if not sticker_pool:
+        sticker_pool, _ = build_sticker_resource_id_pool(content_json_path)
+    ref_by_key = {segment_style_pool_key(dn, r): r for r in style_refs}
+    n = 0
+    errors: List[str] = []
+    pfx = dn + "\0"
+    for sk, raw_cfg in style_pool.items():
+        if not isinstance(sk, str) or not sk.startswith(pfx):
+            continue
+        cfg = normalize_style_pool_config(raw_cfg)
+        if not cfg:
+            continue
+        ref = ref_by_key.get(sk)
+        if ref is None:
+            continue
+        kind = cfg.get("style_kind")
+        mode = cfg.get("style_mode")
+        fixed_id = str(cfg.get("style_resource_id") or "").strip()
+        if kind == STYLE_KIND_TEXT_EFFECT:
+            if mode == STYLE_MODE_FIXED:
+                if not fixed_id:
+                    errors.append(f"{ref.combo_label}：未指定花字 id")
+                    continue
+                if not _subtitle_flower_effect_id_is_usable(fixed_id):
+                    errors.append(f"{ref.combo_label}：花字 id {fixed_id} 无效或未缓存")
+                    continue
+                rid = fixed_id
+            else:
+                if not text_pool:
+                    errors.append(f"{ref.combo_label}：花字池为空")
+                    continue
+                rid = _pick_text_effect_id(text_pool, used_fx_batch)
+            applied = _apply_text_effect_id_to_content(data, rid, [ref.material_id])
+        elif kind == STYLE_KIND_STICKER:
+            if mode == STYLE_MODE_FIXED:
+                if not fixed_id:
+                    errors.append(f"{ref.combo_label}：未指定贴纸 id")
+                    continue
+                if not _sticker_resource_id_is_usable(fixed_id):
+                    errors.append(f"{ref.combo_label}：贴纸 id {fixed_id} 无效或未缓存")
+                    continue
+                rid = fixed_id
+            else:
+                if not sticker_pool:
+                    errors.append(f"{ref.combo_label}：贴纸池为空")
+                    continue
+                tried: set[str] = set()
+                applied = 0
+                rid = ""
+                while len(tried) < len(sticker_pool):
+                    pick = _pick_text_effect_id(sticker_pool, used_sticker_batch)
+                    if pick in tried:
+                        break
+                    tried.add(pick)
+                    applied = _apply_sticker_resource_id_to_content(data, pick, [ref.material_id])
+                    if applied > 0:
+                        rid = pick
+                        break
+                if applied <= 0:
+                    errors.append(f"{ref.combo_label}：未能从贴纸池套用")
+                    continue
+            if mode == STYLE_MODE_FIXED:
+                applied = _apply_sticker_resource_id_to_content(data, rid, [ref.material_id])
+        else:
+            continue
+        if applied <= 0:
+            errors.append(f"{ref.combo_label}：未能套用样式")
+            continue
+        n += applied
+    if n > 0:
+        _write_draft_content_json(content_json_path, data)
+        _invalidate_sticker_material_template_cache()
+    return n, errors
+
+
+def apply_segment_style_pools_or_raise(
+    content_json_path: str,
+    draft_name: str,
+    pool: Dict[str, Dict[str, Any]],
+    *,
+    text_effect_id_pool: Optional[List[str]] = None,
+    sticker_id_pool: Optional[List[str]] = None,
+    used_fx_batch: Optional[set[str]] = None,
+    used_sticker_batch: Optional[set[str]] = None,
+) -> int:
+    data = _safe_read_json(content_json_path)
+    if not isinstance(data, dict):
+        return 0
+    refs = list_style_segments_from_content(data)
+    n, errs = apply_per_segment_style_pools_to_draft(
+        content_json_path,
+        draft_name,
+        pool,
+        refs,
+        text_effect_id_pool=text_effect_id_pool,
+        sticker_id_pool=sticker_id_pool,
+        used_fx_batch=used_fx_batch,
+        used_sticker_batch=used_sticker_batch,
+    )
+    if errs:
+        raise RuntimeError("花字/贴纸槽位套用失败：\n" + "\n".join(errs[:12]))
+    return n
+
+
+def _apply_subtitle_style_preset_to_content(
+    content: Dict[str, Any],
+    preset: Dict[str, Any],
+    material_ids: List[str],
+) -> int:
+    materials = content.setdefault("materials", {})
+    if not isinstance(materials, dict):
+        return 0
+    texts = materials.setdefault("texts", [])
+    if not isinstance(texts, list):
+        return 0
+    mat_by_id = {str(m.get("id")): m for m in texts if isinstance(m, dict) and m.get("id")}
+    decor_ids = _text_decor_effect_global_ids(materials)
+    effect_gid: Optional[str] = None
+    effect_id = str(preset.get("effect_id") or "").strip() or None
+    if effect_id:
+        effect_gid = _ensure_text_effect_material(materials, effect_id)
+        decor_ids = _text_decor_effect_global_ids(materials)
+
+    seg_by_mat: Dict[str, List[Dict[str, Any]]] = {}
+    for tr in content.get("tracks") or []:
+        if str(tr.get("type", "")) != "text":
+            continue
+        for seg in tr.get("segments") or []:
+            if not isinstance(seg, dict):
+                continue
+            mid = str(seg.get("material_id") or "").strip()
+            if mid in material_ids:
+                seg_by_mat.setdefault(mid, []).append(seg)
+
+    n = 0
+    color = preset.get("color") or (1.0, 1.0, 1.0)
+    if not isinstance(color, (list, tuple)) or len(color) < 3:
+        color = (1.0, 1.0, 1.0)
+    color_list = [float(color[0]), float(color[1]), float(color[2])]
+
+    for mid in material_ids:
+        mat = mat_by_id.get(mid)
+        if not isinstance(mat, dict):
+            continue
+        raw = mat.get("content")
+        if not isinstance(raw, str) or not raw.strip().startswith("{"):
+            continue
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        text = str(body.get("text") or "")
+        styles = body.get("styles")
+        if not isinstance(styles, list) or not styles:
+            styles = [{"range": [0, len(text)]}]
+            body["styles"] = styles
+        for st in styles:
+            if not isinstance(st, dict):
+                continue
+            if "range" not in st:
+                st["range"] = [0, len(text)]
+            st["size"] = float(preset.get("size") or st.get("size") or 5.0)
+            st["bold"] = bool(preset.get("bold"))
+            st["italic"] = bool(preset.get("italic"))
+            st["underline"] = bool(preset.get("underline"))
+            fill = st.setdefault("fill", {})
+            if not isinstance(fill, dict):
+                fill = {}
+                st["fill"] = fill
+            fill_content = fill.setdefault("content", {})
+            if not isinstance(fill_content, dict):
+                fill_content = {}
+                fill["content"] = fill_content
+            fill_content["render_type"] = "solid"
+            solid = fill_content.setdefault("solid", {})
+            if not isinstance(solid, dict):
+                solid = {}
+                fill_content["solid"] = solid
+            solid["alpha"] = 1.0
+            solid["color"] = color_list
+            fill["alpha"] = 1.0
+            font_id = str(preset.get("font_id") or "").strip()
+            if font_id:
+                st["font"] = {"id": font_id, "path": "D:"}
+            else:
+                st.pop("font", None)
+            if effect_id:
+                st["effectStyle"] = {"id": effect_id, "path": "C:"}
+            else:
+                st.pop("effectStyle", None)
+            if "strokes" in preset:
+                st["strokes"] = copy.deepcopy(preset.get("strokes") or [])
+        mat["content"] = json.dumps(body, ensure_ascii=False)
+        if preset.get("alignment") is not None:
+            mat["alignment"] = preset.get("alignment")
+        for seg in seg_by_mat.get(mid, []):
+            refs = [str(r) for r in (seg.get("extra_material_refs") or []) if r]
+            refs = [r for r in refs if r not in decor_ids]
+            if effect_gid:
+                refs.append(effect_gid)
+            seg["extra_material_refs"] = refs
+        n += 1
+    return n
+
+
+def apply_random_subtitle_style_to_draft(
+    content_json_path: str,
+    style_presets: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[int, str]:
+    """为子草稿随机套用一套字幕样式（同子稿内全部字幕统一）。返回 (改动条数, 描述)。"""
+    data = _safe_read_json(content_json_path)
+    if not isinstance(data, dict):
+        return 0, ""
+    material_ids = _subtitle_text_material_ids(data)
+    if not material_ids:
+        return 0, ""
+    pool = list(style_presets or [])
+    if not pool:
+        pool = [_random_builtin_subtitle_style()]
+    preset = random.choice(pool)
+    n = _apply_subtitle_style_preset_to_content(data, preset, material_ids)
+    if n <= 0:
+        return 0, ""
+    _write_draft_content_json(content_json_path, data)
+    return n, _subtitle_style_preset_label(preset)
 
 
 def backup_plaintext_draft(draft_root: str, draft_name: str) -> str:
@@ -1391,17 +3808,32 @@ def wait_jianying_controller_or_launch_process(
     after_launch_wait_s: float = 90.0,
     exe_path: Optional[str] = None,
 ) -> Any:
-    """先等待已运行的剪映窗口；若未找到（剪映未开）则拉起指定安装后再等到窗口可用。"""
+    """等待或启动剪映；若指定 ``exe_path`` 则只绑定该安装，不抢占其它已运行版本的主窗口。"""
     _ensure_local_pyjianyingdraft_on_path()
     from pyJianYingDraft.exceptions import AutomationError
     from pyJianYingDraft.jianying_controller import wait_for_jianying_controller
 
     try:
-        return wait_for_jianying_controller(timeout=first_wait_s, poll=0.4)
+        return wait_for_jianying_controller(timeout=first_wait_s, poll=0.4, exe_path=exe_path)
     except AutomationError:
         if not start_jianying_pro_process(exe_path):
             raise AutomationError("无法启动剪映进程。")
-        return wait_for_jianying_controller(timeout=after_launch_wait_s, poll=0.5)
+        return wait_for_jianying_controller(timeout=after_launch_wait_s, poll=0.5, exe_path=exe_path)
+
+
+def _ensure_jianying_home_before_draft_json_write(ctrl: Any) -> None:
+    """写入 draft_content.json 前先回到剪映首页。
+
+    若剪映正在编辑同一草稿，直接改磁盘 JSON 后 ``export_draft`` 会 ``switch_to_home`` 关闭工程，
+    剪映退出时可能把**内存里的旧稿**写回磁盘，覆盖刚套上的随机素材（子草稿路径不受影响）。
+    """
+    try:
+        ctrl.get_window()
+        if ctrl.app_status == "edit":
+            ctrl.switch_to_home()
+            time.sleep(1.5)
+    except Exception:
+        pass
 
 
 def list_draft_folders(root: str) -> List[Tuple[str, float]]:
@@ -1449,6 +3881,124 @@ def _draft_list_sort_key(draft_root: str, folder_name: str) -> Tuple[float, int]
         except ValueError:
             suffix = 0
     return (ts, suffix)
+
+
+_DRAFT_LIST_COLORS: Dict[str, Tuple[Tuple[str, str], Tuple[str, str]]] = {
+    "leaf": (("gray80", "gray20"), ("gray70", "gray30")),
+    "parent": (("gray78", "gray22"), ("gray68", "gray32")),
+    "selected": (("#3B8ED0", "#1F538D"), ("#36719F", "#14375E")),
+}
+
+
+def _draft_list_item_wraplength(*, indent: int, reserved_right: int = 0) -> int:
+    """左侧栏约 280px，扣除边距/缩进/折叠按钮后为草稿名换行宽度。"""
+    return max(96, 236 - max(0, indent) - max(0, reserved_right))
+
+
+def _bind_draft_name_tooltip(widget: Any, full_name: str) -> None:
+    """悬停显示完整草稿名（换行后仍过长时可用）。"""
+    tip_ref: List[Optional[Any]] = [None]
+
+    def _hide(_event: Any = None) -> None:
+        tw = tip_ref[0]
+        if tw is not None:
+            try:
+                tw.destroy()
+            except tk.TclError:
+                pass
+            tip_ref[0] = None
+
+    def _show(_event: Any) -> None:
+        if tip_ref[0] is not None or not str(full_name or "").strip():
+            return
+        try:
+            x = int(widget.winfo_rootx())
+            y = int(widget.winfo_rooty()) + int(widget.winfo_height()) + 2
+        except tk.TclError:
+            return
+        tw = tk.Toplevel(widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            tw,
+            text=str(full_name),
+            justify="left",
+            wraplength=420,
+            bg="#ffffe0",
+            fg="#111111",
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+            padx=6,
+            pady=4,
+        ).pack()
+        tip_ref[0] = tw
+
+    widget.bind("<Enter>", _show, add="+")
+    widget.bind("<Leave>", _hide, add="+")
+    widget.bind("<Button-1>", _hide, add="+")
+
+
+def _make_draft_list_click_box(
+    parent: Any,
+    folder_name: str,
+    *,
+    row_kind: str,
+    on_click: Any,
+    wraplength: int,
+    subtitle: str = "",
+) -> Any:
+    """可点击、长名自动换行的草稿列表项。"""
+    import customtkinter as ctk
+
+    fg, hover = _DRAFT_LIST_COLORS.get(row_kind, _DRAFT_LIST_COLORS["leaf"])
+    box = ctk.CTkFrame(parent, fg_color=fg, corner_radius=6, cursor="hand2")
+    lbl = ctk.CTkLabel(
+        box,
+        text=folder_name,
+        anchor="w",
+        justify="left",
+        wraplength=wraplength,
+        font=ctk.CTkFont(size=13),
+    )
+    lbl.pack(fill="x", padx=8, pady=(6, 4 if subtitle else 6))
+    if subtitle:
+        sub = ctk.CTkLabel(
+            box,
+            text=subtitle,
+            anchor="w",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray48", "gray58"),
+        )
+        sub.pack(fill="x", padx=8, pady=(0, 6))
+    else:
+        sub = None
+
+    box._name = folder_name  # type: ignore[attr-defined]
+    box._row_kind = row_kind  # type: ignore[attr-defined]
+    box._selected = False  # type: ignore[attr-defined]
+    box._base_fg = fg  # type: ignore[attr-defined]
+    box._hover_fg = hover  # type: ignore[attr-defined]
+
+    def _click(_event: Any = None) -> None:
+        on_click()
+
+    def _enter(_event: Any = None) -> None:
+        if not getattr(box, "_selected", False):
+            box.configure(fg_color=hover)
+
+    def _leave(_event: Any = None) -> None:
+        if getattr(box, "_selected", False):
+            box.configure(fg_color=_DRAFT_LIST_COLORS["selected"][0])
+        else:
+            box.configure(fg_color=fg)
+
+    for w in (box, lbl) + ((sub,) if sub is not None else ()):
+        w.bind("<Button-1>", _click)
+        w.bind("<Enter>", _enter)
+        w.bind("<Leave>", _leave)
+    _bind_draft_name_tooltip(box, folder_name)
+    return box
 
 
 def _normalized_draft_root_key(draft_root: str) -> str:
@@ -1564,24 +4114,7 @@ def _clean_export_pool_presets_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
             continue
         seg_in = blob.get("segment_export_pool")
         cur_in = blob.get("export_pool_sequential_cursor")
-        seg: Dict[str, Dict[str, Any]] = {}
-        if isinstance(seg_in, dict):
-            for sk, sv in seg_in.items():
-                if not isinstance(sv, dict):
-                    continue
-                piece: Dict[str, Any] = {}
-                d = str(sv.get("dir", "") or "").strip()
-                if d:
-                    od = sv.get("order", "random")
-                    if od not in ("random", "sequential"):
-                        od = "random"
-                    piece["dir"] = d
-                    piece["order"] = od
-                rf = str(sv.get("replace_file", "") or "").strip()
-                if rf:
-                    piece["replace_file"] = rf
-                if piece:
-                    seg[str(sk)] = piece
+        seg = _segment_export_pool_for_preset_disk(seg_in if isinstance(seg_in, dict) else {})
         cur: Dict[str, int] = {}
         if isinstance(cur_in, dict):
             for ck, cv in cur_in.items():
@@ -1589,6 +4122,8 @@ def _clean_export_pool_presets_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
                     cur[str(ck)] = int(cv)
                 except (TypeError, ValueError):
                     cur[str(ck)] = 0
+        if not seg and not cur:
+            continue
         clean[name] = {"segment_export_pool": seg, "export_pool_sequential_cursor": cur}
     return clean
 
@@ -1738,6 +4273,35 @@ def persist_working_export_pool_snapshot(draft_root: str, draft_folder_name: str
     save_export_pool_store(dr, store)
 
 
+def sanitize_replace_state_export_pool_styles(
+    replace_state: Dict[str, Any],
+    draft_root: str,
+    draft_folder_name: str,
+    *,
+    persist: bool = False,
+) -> List[str]:
+    """导出前在内存中修正无效指定 id（默认不写回磁盘，避免误删用户配置）。"""
+    dr = (draft_root or "").strip()
+    dn = (draft_folder_name or "").strip()
+    seg_raw = replace_state.get("segment_export_pool") or {}
+    parent_json = os.path.join(dr, dn, "draft_content.json") if dr and dn else ""
+    cleaned, notes = sanitize_segment_export_pool_styles(
+        dict(seg_raw) if isinstance(seg_raw, dict) else {},
+        parent_json,
+    )
+    if not notes:
+        return []
+    replace_state["segment_export_pool"] = segment_export_pool_enforce_exclusive_sources(cleaned)
+    if persist and dr and dn:
+        try:
+            persist_working_export_pool_snapshot(dr, dn, replace_state)
+        except OSError:
+            pass
+    for note in notes:
+        print(f"[槽位修正] {note}")
+    return notes
+
+
 def _export_pool_by_draft_bucket_mut(store: Dict[str, Any], draft_folder_name: str) -> Dict[str, Any]:
     bd = store.setdefault("by_draft", {})
     if not isinstance(bd, dict):
@@ -1833,14 +4397,7 @@ def persist_active_named_export_pool_preset(
         return
     seg = segment_export_pool_enforce_exclusive_sources(seg)
     replace_state["segment_export_pool"] = seg
-    has_slot = False
-    for _k, sv in seg.items():
-        if not isinstance(sv, dict):
-            continue
-        if str(sv.get("dir", "") or "").strip() or str(sv.get("replace_file", "") or "").strip():
-            has_slot = True
-            break
-    if not has_slot:
+    if not _segment_export_pool_has_saveable_config(seg):
         return
     store = load_export_pool_store(dr)
     bucket = _export_pool_by_draft_bucket_mut(store, dn)
@@ -1856,6 +4413,62 @@ def persist_active_named_export_pool_preset(
     }
     bucket["last_preset"] = preset_choice
     save_export_pool_store(dr, store)
+
+
+def clear_material_export_pool_for_ref(
+    replace_state: Dict[str, Any],
+    draft_root: str,
+    draft_name: str,
+    ref: MediaSegmentRef,
+    preset_choice: str,
+) -> bool:
+    """清除单个音视频片段的素材替换配置（不写 draft_content.json）。"""
+    dn = (draft_name or "").strip()
+    dr = (draft_root or "").strip()
+    if not dn:
+        return False
+    pool_mut: Dict[str, Dict[str, Any]] = replace_state.setdefault("segment_export_pool", {})
+    if not segment_has_replace_config(dn, ref, pool_mut):
+        return False
+    k = segment_export_pool_key(dn, ref)
+    kept = clear_material_keys_from_segment_export_pool_entry(pool_mut.get(k))
+    if kept:
+        pool_mut[k] = kept
+    else:
+        pool_mut.pop(k, None)
+    if dr:
+        persist_working_export_pool_snapshot(dr, dn, replace_state)
+        persist_active_named_export_pool_preset(dr, dn, preset_choice, replace_state)
+    return True
+
+
+def clear_style_export_pool_for_refs(
+    replace_state: Dict[str, Any],
+    draft_root: str,
+    draft_name: str,
+    refs: Iterable[StyleSegmentRef],
+    preset_choice: str,
+) -> bool:
+    """清除一个或多个片段的花字/贴纸导出配置（不写 draft_content.json）。"""
+    dn = (draft_name or "").strip()
+    dr = (draft_root or "").strip()
+    if not dn:
+        return False
+    pool_mut: Dict[str, Dict[str, Any]] = replace_state.setdefault("segment_export_pool", {})
+    changed = False
+    for ref in refs:
+        if not segment_has_style_config(dn, ref, pool_mut):
+            continue
+        k = segment_style_pool_key(dn, ref)
+        if k in pool_mut:
+            pool_mut.pop(k, None)
+            changed = True
+    if not changed:
+        return False
+    if dr:
+        persist_working_export_pool_snapshot(dr, dn, replace_state)
+        persist_active_named_export_pool_preset(dr, dn, preset_choice, replace_state)
+    return True
 
 
 def prune_draft_families(draft_root: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1994,6 +4607,14 @@ def merge_remapped_pool_and_cursor_into_replace_state(
     replace_state["segment_export_pool"] = coerced
 
 
+def _export_parent_for_new_child(selected_draft_name: str) -> str:
+    """导出/生成子稿时，以**当前选中的草稿文件夹名**为父，而非追溯到根模板。
+
+    例：选中 ``A_1`` 并勾选「导出生成子草稿」→ 生成 ``A_1_1``、``A_1_2``（不是与 ``A_1`` 平级的 ``A_2``）。
+    """
+    return (selected_draft_name or "").strip()
+
+
 def _next_generated_child_name(draft_root: str, parent_name: str) -> str:
     existing = {n for n, _ in list_draft_folders(draft_root)}
     for n in range(1, 10000):
@@ -2013,10 +4634,62 @@ def _timeline_end_us(content: Dict[str, Any]) -> int:
     return max(d, 1)
 
 
+_TIMELINE_LABEL_W = 118
+_TIMELINE_PAD = 6
+_TIMELINE_FX_EXTRA_KINDS = frozenset(
+    {"effects", "video_effects", "material_animations", "filters", "transitions"}
+)
+
+
+def _calc_timeline_fit_pps(content: Dict[str, Any], viewport_px: int) -> float:
+    """按可视宽度计算 pps，使整段草稿能一屏看完（下限 14）。"""
+    total_us = _timeline_end_us(content)
+    total_sec = max(total_us / 1_000_000.0, 0.001)
+    usable = max(160, int(viewport_px) - _TIMELINE_LABEL_W - _TIMELINE_PAD * 2)
+    return max(14.0, min(420.0, usable / total_sec))
+
+
+def _build_material_kind_index(materials: Dict[str, Any]) -> Dict[str, str]:
+    idx: Dict[str, str] = {}
+    for mkey, arr in materials.items():
+        if not isinstance(arr, list):
+            continue
+        for m in arr:
+            if isinstance(m, dict) and m.get("id"):
+                idx[str(m["id"])] = str(mkey)
+    return idx
+
+
+def _segment_extra_material_kinds(seg: Dict[str, Any], mat_kind_by_id: Dict[str, str]) -> set:
+    kinds: set = set()
+    for ref in seg.get("extra_material_refs") or []:
+        k = mat_kind_by_id.get(str(ref), "")
+        if k:
+            kinds.add(k)
+    return kinds
+
+
+def _segment_has_timeline_fx(seg: Dict[str, Any], mat_kind_by_id: Dict[str, str]) -> bool:
+    return bool(_segment_extra_material_kinds(seg, mat_kind_by_id) & _TIMELINE_FX_EXTRA_KINDS)
+
+
+def _timeline_ruler_step_us(total_us: int) -> int:
+    total_sec = total_us / 1_000_000.0
+    if total_sec > 180:
+        return 30_000_000
+    if total_sec > 90:
+        return 10_000_000
+    if total_sec > 45:
+        return 5_000_000
+    if total_sec > 20:
+        return 2_000_000
+    return 1_000_000
+
+
 def _timeline_segment_label(seg: Dict[str, Any], materials: Dict[str, Any]) -> str:
     mid = (seg.get("material_id") or "").strip()
     mats = materials if isinstance(materials, dict) else {}
-    for key in ("videos", "audios", "texts"):
+    for key in ("videos", "audios", "texts", "stickers"):
         for m in mats.get(key) or []:
             if not isinstance(m, dict) or m.get("id") != mid:
                 continue
@@ -2030,6 +4703,11 @@ def _timeline_segment_label(seg: Dict[str, Any], materials: Dict[str, Any]) -> s
                     except (json.JSONDecodeError, TypeError):
                         pass
                 return "文本"
+            if key == "stickers":
+                rid = str(m.get("resource_id") or m.get("sticker_id") or "").strip()
+                name = str(m.get("name") or "").strip()
+                hint = name or rid or mid[:10]
+                return (hint[:28] + "…") if len(hint) > 28 else (hint or "贴纸")
             name = m.get("material_name") or m.get("name") or ""
             pth = m.get("path") or ""
             base = os.path.basename(pth.replace("/", os.sep)) if pth else ""
@@ -2131,6 +4809,130 @@ def find_replace_ref_for_timeline_segment(
     return None
 
 
+def _style_segment_ref_from_timeline(
+    content: Dict[str, Any],
+    track: Dict[str, Any],
+    segment_index_raw: int,
+) -> Optional[StyleSegmentRef]:
+    """由时间轴上的轨道 + 片段下标直接构造花字/贴纸槽引用（不依赖预构建列表）。"""
+    ttype = str(track.get("type", "")).strip().lower()
+    if ttype not in ("text", "sticker"):
+        return None
+    segs = track.get("segments") or []
+    if segment_index_raw < 0 or segment_index_raw >= len(segs):
+        return None
+    seg = segs[segment_index_raw]
+    if not isinstance(seg, dict):
+        return None
+    mid = str(seg.get("material_id") or "").strip()
+    if not mid:
+        return None
+    materials = content.get("materials") if isinstance(content.get("materials"), dict) else {}
+    trng = seg.get("target_timerange") or {}
+    try:
+        t0 = int(trng.get("start", 0))
+        t1 = t0 + int(trng.get("duration", 0))
+    except (TypeError, ValueError):
+        t0, t1 = 0, 0
+    tid = str(track.get("id") or "")
+    nm_raw = track.get("name", "")
+    tname = "" if nm_raw is None else (nm_raw if isinstance(nm_raw, str) else str(nm_raw))
+    tname = tname.strip()
+    if ttype == "text":
+        mat: Dict[str, Any] = {}
+        for m in materials.get("texts") or []:
+            if isinstance(m, dict) and str(m.get("id")) == mid:
+                mat = m
+                break
+        cur_rid = _text_effect_id_from_material(mat) if mat else ""
+        lab = _timeline_segment_label(seg, materials)
+        label = f"[text] {tname} · 片段{segment_index_raw + 1} · {_fmt_tc_us(t0, t1)} · {lab}"
+    else:
+        mat = {}
+        for m in materials.get("stickers") or []:
+            if isinstance(m, dict) and str(m.get("id")) == mid:
+                mat = m
+                break
+        cur_rid = _sticker_resource_id_from_material(mat) if mat else ""
+        hint = cur_rid[:16] if cur_rid else mid[:8]
+        label = f"[sticker] {tname} · 片段{segment_index_raw + 1} · {_fmt_tc_us(t0, t1)} · {hint}"
+    return StyleSegmentRef(
+        track_type=ttype,
+        track_name=tname,
+        segment_index=segment_index_raw,
+        combo_label=label,
+        material_id=mid,
+        track_id=tid,
+        current_resource_id=cur_rid,
+    )
+
+
+def list_style_segment_refs_for_track(
+    content: Dict[str, Any],
+    track: Dict[str, Any],
+) -> List[StyleSegmentRef]:
+    """列出某条文本/贴纸轨道上全部可配置花字/贴纸的片段引用。"""
+    ttype = str(track.get("type", "")).strip().lower()
+    if ttype not in ("text", "sticker") or not isinstance(content, dict):
+        return []
+    segs = track.get("segments") or []
+    out: List[StyleSegmentRef] = []
+    for i in range(len(segs)):
+        ref = _style_segment_ref_from_timeline(content, track, i)
+        if ref is not None:
+            out.append(ref)
+    return out
+
+
+def find_style_ref_for_timeline_segment(
+    refs: List[StyleSegmentRef],
+    track: Dict[str, Any],
+    segment_index_raw: int,
+    content: Optional[Dict[str, Any]] = None,
+) -> Optional[StyleSegmentRef]:
+    """时间轴文本/贴纸片段与花字/贴纸槽列表项对应。"""
+    if content and isinstance(content, dict):
+        built = _style_segment_ref_from_timeline(content, track, segment_index_raw)
+        if built is not None:
+            return built
+    tid = str(track.get("id", "") or "").strip()
+    if tid:
+        for r in refs:
+            rt = str(r.track_id or "").strip()
+            if rt and rt == tid and r.segment_index == segment_index_raw:
+                return r
+    nm_raw = track.get("name", "")
+    tname = "" if nm_raw is None else (nm_raw if isinstance(nm_raw, str) else str(nm_raw))
+    tname = tname.strip()
+    ty_raw = track.get("type", "")
+    ttype = str(ty_raw).strip().lower() if ty_raw is not None else ""
+    for r in refs:
+        rn = (r.track_name or "").strip()
+        rt = (r.track_type or "").strip().lower()
+        if rn == tname and rt == ttype and r.segment_index == segment_index_raw:
+            return r
+    raw_segs = list(track.get("segments") or [])
+    if 0 <= segment_index_raw < len(raw_segs):
+        seg = raw_segs[segment_index_raw]
+        if isinstance(seg, dict):
+            mid = str((seg.get("material_id") or "")).strip()
+            if mid:
+                same = [
+                    r
+                    for r in refs
+                    if r.segment_index == segment_index_raw
+                    and str((r.material_id or "")).strip() == mid
+                ]
+                if len(same) == 1:
+                    return same[0]
+                for r in same:
+                    if (r.track_type or "").strip().lower() == ttype:
+                        return r
+                if same:
+                    return same[0]
+    return None
+
+
 def _local_media_path_for_segment(seg: Dict[str, Any], materials: Dict[str, Any]) -> str:
     """片段引用的视频/音频素材在 materials 中的本地 path（若无则空字符串）。"""
     mid = (seg.get("material_id") or "").strip()
@@ -2142,6 +4944,618 @@ def _local_media_path_for_segment(seg: Dict[str, Any], materials: Dict[str, Any]
                 p = (m.get("path") or "").strip()
                 return p.replace("/", os.sep) if p else ""
     return ""
+
+
+def _fmt_us_as_timecode(us: int) -> str:
+    if us < 0:
+        us = 0
+    total_s = us / 1_000_000.0
+    m, sec = divmod(total_s, 60.0)
+    h, m = divmod(m, 60.0)
+    if h >= 1:
+        return f"{int(h)}:{int(m):02d}:{sec:05.2f}"
+    return f"{int(m)}:{sec:05.2f}"
+
+
+@dataclass(frozen=True)
+class VideoPlayheadHit:
+    path: str
+    source_us: int
+    seg_label: str
+
+
+@dataclass(frozen=True)
+class PreviewVideoLayer:
+    path: str
+    source_us: int
+    render_index: int
+    label: str
+
+
+@dataclass(frozen=True)
+class PreviewTextLayer:
+    text: str
+    font_size: int
+    color: str
+    render_index: int
+
+
+@dataclass(frozen=True)
+class PreviewPlan:
+    playhead_us: int
+    videos: Tuple[PreviewVideoLayer, ...]
+    texts: Tuple[PreviewTextLayer, ...]
+    sticker_count: int
+    info: str
+
+
+def _segment_source_us_at_playhead(seg: Dict[str, Any], playhead_us: int) -> Optional[int]:
+    trng = seg.get("target_timerange") or {}
+    try:
+        st = int(trng.get("start", 0))
+        du = int(trng.get("duration", 0))
+    except (TypeError, ValueError):
+        return None
+    if du <= 0 or not (st <= playhead_us < st + du):
+        return None
+    src_tr = seg.get("source_timerange") or {}
+    try:
+        src_start = int(src_tr.get("start", 0))
+        src_dur = int(src_tr.get("duration", du))
+    except (TypeError, ValueError):
+        src_start, src_dur = 0, du
+    off = playhead_us - st
+    if du > 0 and src_dur > 0:
+        src_us = src_start + int(off * src_dur / du)
+    else:
+        src_us = src_start + off
+    return max(0, src_us)
+
+
+def _color_from_jianying_fill(fill: Any) -> str:
+    if not isinstance(fill, dict):
+        return "#FFFFFF"
+    content = fill.get("content")
+    if isinstance(content, dict):
+        solid = content.get("solid")
+        if isinstance(solid, dict):
+            rgb = solid.get("color")
+            if isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
+                try:
+                    r, g, b = (max(0, min(255, int(float(c) * 255))) for c in rgb[:3])
+                    return f"#{r:02x}{g:02x}{b:02x}"
+                except (TypeError, ValueError):
+                    pass
+    raw = fill.get("color")
+    if isinstance(raw, str) and raw.startswith("#"):
+        return raw
+    return "#FFFFFF"
+
+
+def _text_layer_from_segment(seg: Dict[str, Any], mat: Dict[str, Any]) -> Optional[PreviewTextLayer]:
+    raw = mat.get("content")
+    if not isinstance(raw, str) or not raw.strip().startswith("{"):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    text = str(payload.get("text") or "").replace("\n", " ").strip()
+    if not text:
+        return None
+    styles = payload.get("styles") or []
+    style0 = styles[0] if styles and isinstance(styles[0], dict) else {}
+    try:
+        font_size = max(8, int(style0.get("size") or 14))
+    except (TypeError, ValueError):
+        font_size = 14
+    color = _color_from_jianying_fill(style0.get("fill"))
+    try:
+        render_index = int(seg.get("render_index", 0))
+    except (TypeError, ValueError):
+        render_index = 0
+    return PreviewTextLayer(text=text, font_size=font_size, color=color, render_index=render_index)
+
+
+def build_preview_plan(content: Dict[str, Any], playhead_us: int) -> PreviewPlan:
+    """收集当前时间点的视频层（底→顶）、字幕与贴纸数量，供合成预览。"""
+    tracks_raw = list(content.get("tracks") or [])
+    materials = content.get("materials") if isinstance(content.get("materials"), dict) else {}
+    ph = max(0, int(playhead_us))
+    videos: List[PreviewVideoLayer] = []
+    texts: List[PreviewTextLayer] = []
+    sticker_count = 0
+    texts_by_id = {
+        str(m.get("id")): m for m in (materials.get("texts") or []) if isinstance(m, dict) and m.get("id")
+    }
+
+    for tr in tracks_raw:
+        ttype = str(tr.get("type", "")).strip().lower()
+        for seg in tr.get("segments") or []:
+            if not isinstance(seg, dict):
+                continue
+            if _segment_source_us_at_playhead(seg, ph) is None:
+                continue
+            if ttype == "video":
+                path = _local_media_path_for_segment(seg, materials)
+                if not path or not os.path.isfile(path):
+                    continue
+                src_us = _segment_source_us_at_playhead(seg, ph) or 0
+                try:
+                    ri = int(seg.get("render_index", 0))
+                except (TypeError, ValueError):
+                    ri = 0
+                videos.append(
+                    PreviewVideoLayer(
+                        path=path,
+                        source_us=src_us,
+                        render_index=ri,
+                        label=_timeline_segment_label(seg, materials),
+                    )
+                )
+            elif ttype == "text":
+                mid = str(seg.get("material_id") or "").strip()
+                mat = texts_by_id.get(mid) or {}
+                layer = _text_layer_from_segment(seg, mat)
+                if layer is not None:
+                    texts.append(layer)
+            elif ttype == "sticker":
+                sticker_count += 1
+
+    videos.sort(key=lambda v: v.render_index)
+    texts.sort(key=lambda t: t.render_index)
+
+    info_parts: List[str] = []
+    if videos:
+        info_parts.append(" · ".join(v.label[:20] for v in videos))
+    if texts:
+        info_parts.append("字幕: " + " / ".join(t.text[:18] + ("…" if len(t.text) > 18 else "") for t in texts[:2]))
+        if len(texts) > 2:
+            info_parts.append(f"等 {len(texts)} 条")
+    if sticker_count:
+        info_parts.append(f"贴纸×{sticker_count}")
+    info = " · ".join(info_parts) if info_parts else "（无画面内容）"
+    return PreviewPlan(
+        playhead_us=ph,
+        videos=tuple(videos),
+        texts=tuple(texts),
+        sticker_count=sticker_count,
+        info=info,
+    )
+
+
+def find_video_at_playhead(content: Dict[str, Any], playhead_us: int) -> Optional[VideoPlayheadHit]:
+    """按 render_index 从高到低找当前时间最前景的视频片段。"""
+    plan = build_preview_plan(content, playhead_us)
+    if not plan.videos:
+        return None
+    top = plan.videos[-1]
+    return VideoPlayheadHit(path=top.path, source_us=top.source_us, seg_label=top.label)
+
+
+class _PreviewFrameCache:
+    """LRU 帧缓存；时间按 100ms 分桶以提高拖动命中率。"""
+
+    __slots__ = ("_max", "_data")
+
+    def __init__(self, max_items: int = 64) -> None:
+        self._max = max(8, max_items)
+        self._data: OrderedDict[Tuple[str, int], bytes] = OrderedDict()
+
+    def get(self, path: str, source_us: int) -> Optional[bytes]:
+        key = (path, int(source_us // 100_000))
+        v = self._data.get(key)
+        if v is not None:
+            self._data.move_to_end(key)
+        return v
+
+    def put(self, path: str, source_us: int, img: bytes) -> None:
+        key = (path, int(source_us // 100_000))
+        self._data[key] = img
+        self._data.move_to_end(key)
+        while len(self._data) > self._max:
+            self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+
+def _ffmpeg_seek_input_args(path_abs: str, sec: float) -> List[str]:
+    """前几秒用精确 seek，避免 fast seek 黑帧。"""
+    if sec < 0.8:
+        return ["-i", path_abs, "-ss", f"{max(0.0, sec):.3f}"]
+    return ["-ss", f"{sec:.3f}", "-i", path_abs]
+
+
+SCRUB_THUMB_FPS = 4.0
+SCRUB_THUMB_STEP_US = int(1_000_000 / SCRUB_THUMB_FPS)
+PREVIEW_MAX_WIDTH = 280
+SCRUB_THUMB_WIDTH = PREVIEW_MAX_WIDTH
+PREVIEW_WARM_INITIAL_SEC = 60.0
+PREVIEW_WARM_WINDOW_SEC = 50.0
+PREVIEW_WARM_IDLE_MS = 1200
+
+
+def _extract_one_ppm_frame(buf: bytes) -> Tuple[Optional[bytes], bytes]:
+    """从字节流切出一帧完整 PPM/PGM（P5/P6），返回 (frame, remainder)。"""
+    if len(buf) < 8 or buf[0:1] != b"P":
+        return None, buf
+    i = 2
+    tokens: List[str] = []
+    while i < min(len(buf), 4096) and len(tokens) < 3:
+        while i < len(buf) and buf[i : i + 1] in (b" ", b"\t", b"\r", b"\n"):
+            i += 1
+        if i >= len(buf):
+            break
+        if buf[i : i + 1] == b"#":
+            while i < len(buf) and buf[i : i + 1] not in (b"\n", b"\r"):
+                i += 1
+            continue
+        j = i
+        while j < len(buf) and buf[j : j + 1] not in (b" ", b"\t", b"\r", b"\n"):
+            j += 1
+        tok = buf[i:j].decode("ascii", errors="ignore")
+        if tok:
+            tokens.append(tok)
+        i = j
+    if len(tokens) < 2:
+        return None, buf
+    try:
+        w, h = int(tokens[0]), int(tokens[1])
+        maxval = int(tokens[2]) if len(tokens) >= 3 else 255
+    except ValueError:
+        return None, buf[1:]
+    if w <= 0 or h <= 0:
+        return None, buf[1:]
+    while i < len(buf) and buf[i : i + 1] in (b" ", b"\t", b"\r", b"\n"):
+        i += 1
+    if i < len(buf) and buf[i : i + 1] == b"#":
+        while i < len(buf) and buf[i : i + 1] not in (b"\n", b"\r"):
+            i += 1
+        while i < len(buf) and buf[i : i + 1] in (b" ", b"\t", b"\r", b"\n"):
+            i += 1
+    is_gray = buf[1:2] == b"5"
+    depth = 1 if is_gray else 3
+    bytes_per_sample = 2 if maxval > 255 else 1
+    body = w * h * depth * bytes_per_sample
+    total = i + body
+    if len(buf) < total:
+        return None, buf
+    return buf[:total], buf[total:]
+
+
+class _ThumbnailStripCache:
+    """每素材按固定步长预生成的缩略图条，拖动时 O(1) 取最近帧。"""
+
+    __slots__ = ("_step_us", "_data", "_warming", "_gen", "_procs")
+
+    def __init__(self, step_us: int = SCRUB_THUMB_STEP_US) -> None:
+        self._step_us = max(50_000, int(step_us))
+        self._data: Dict[str, Dict[int, bytes]] = {}
+        self._warming: set = set()
+        self._gen = 0
+        self._procs: Dict[str, Any] = {}
+
+    def clear(self) -> None:
+        self.interrupt_warming()
+        self._gen += 1
+        self._data.clear()
+        self._warming.clear()
+
+    def generation(self) -> int:
+        return self._gen
+
+    def register_proc(self, path: str, proc: Any) -> None:
+        self._procs[os.path.abspath(path)] = proc
+
+    def unregister_proc(self, path: str) -> None:
+        self._procs.pop(os.path.abspath(path), None)
+
+    def interrupt_warming(self) -> None:
+        """终止正在跑的预热 ffmpeg（如开始拖动时），不阻止后续按需预热。"""
+        for proc in list(self._procs.values()):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self._procs.clear()
+
+    def put(self, path: str, source_us: int, ppm: bytes) -> None:
+        p = os.path.abspath(path)
+        bucket = int(source_us // self._step_us) * self._step_us
+        self._data.setdefault(p, {})[bucket] = ppm
+
+    def has_bucket(self, path: str, source_us: int) -> bool:
+        p = os.path.abspath(path)
+        frames = self._data.get(p)
+        if not frames:
+            return False
+        bucket = int(source_us // self._step_us) * self._step_us
+        return bucket in frames
+
+    def nearest(self, path: str, source_us: int) -> Optional[bytes]:
+        p = os.path.abspath(path)
+        frames = self._data.get(p)
+        if not frames:
+            return None
+        bucket = int(source_us // self._step_us) * self._step_us
+        if bucket in frames:
+            return frames[bucket]
+        keys = sorted(frames.keys())
+        if not keys:
+            return None
+        best = min(keys, key=lambda k: abs(k - bucket))
+        return frames.get(best)
+
+    def has_path(self, path: str) -> bool:
+        return bool(self._data.get(os.path.abspath(path)))
+
+    def mark_warming(self, path: str) -> bool:
+        p = os.path.abspath(path)
+        if p in self._warming:
+            return False
+        self._warming.add(p)
+        return True
+
+    def mark_done(self, path: str) -> None:
+        p = os.path.abspath(path)
+        self._warming.discard(p)
+        self._procs.pop(p, None)
+
+
+def _warm_video_thumbnail_strip(
+    path: str,
+    cache: _ThumbnailStripCache,
+    *,
+    cache_gen: int,
+    fps: float = SCRUB_THUMB_FPS,
+    max_width: int = SCRUB_THUMB_WIDTH,
+    start_sec: float = 0.0,
+    duration_sec: Optional[float] = None,
+) -> None:
+    ff = find_ffmpeg()
+    path_abs = os.path.abspath(path)
+    if not ff or not os.path.isfile(path_abs):
+        cache.mark_done(path)
+        return
+    start_sec = max(0.0, float(start_sec))
+    cmd: List[str] = [
+        ff,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start_sec:.3f}",
+        "-i",
+        path_abs,
+    ]
+    if duration_sec is not None and duration_sec > 0:
+        cmd.extend(["-t", f"{float(duration_sec):.3f}"])
+    cmd.extend(
+        [
+            "-an",
+            "-vf",
+            f"fps={fps:.3f},scale={max_width}:-2:flags=fast_bilinear,format=rgb24",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "pipe:1",
+        ]
+    )
+    step_us = int(1_000_000 / fps)
+    base_us = int(start_sec * 1_000_000)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        cache.mark_done(path)
+        return
+    if proc.stdout is None:
+        cache.mark_done(path)
+        return
+    cache.register_proc(path, proc)
+    buf = b""
+    idx = 0
+    try:
+        while cache.generation() == cache_gen:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while cache.generation() == cache_gen:
+                frame, buf = _extract_one_ppm_frame(buf)
+                if frame is None:
+                    break
+                cache.put(path, base_us + idx * step_us, frame)
+                idx += 1
+    finally:
+        cache.unregister_proc(path)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        cache.mark_done(path)
+
+
+def _start_warm_path(
+    path: str,
+    cache: _ThumbnailStripCache,
+    *,
+    start_sec: float = 0.0,
+    duration_sec: Optional[float] = None,
+) -> None:
+    if not cache.mark_warming(path):
+        return
+    cache_gen = cache.generation()
+
+    def _worker(p: str = path, g: int = cache_gen, st: float = start_sec, dur: Optional[float] = duration_sec) -> None:
+        _warm_video_thumbnail_strip(p, cache, cache_gen=g, start_sec=st, duration_sec=dur)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def start_preview_thumbnail_warm(content: Optional[Dict[str, Any]], cache: _ThumbnailStripCache) -> None:
+    """加载草稿后仅预热各视频开头一小段，避免全片扫描占用资源。"""
+    if not isinstance(content, dict):
+        return
+    for path in _collect_preview_video_paths(content):
+        _start_warm_path(path, cache, start_sec=0.0, duration_sec=PREVIEW_WARM_INITIAL_SEC)
+
+
+def warm_preview_for_plan(plan: PreviewPlan, cache: _ThumbnailStripCache) -> None:
+    """仅预热最前景视频层（与预览显示一致）。"""
+    if not plan.videos:
+        return
+    top = plan.videos[-1]
+    if cache.has_bucket(top.path, top.source_us):
+        return
+    half = PREVIEW_WARM_WINDOW_SEC / 2.0
+    center_sec = max(0.0, top.source_us / 1_000_000.0)
+    start_sec = max(0.0, center_sec - half)
+    _start_warm_path(top.path, cache, start_sec=start_sec, duration_sec=PREVIEW_WARM_WINDOW_SEC)
+
+
+def warm_preview_near_playhead(
+    content: Dict[str, Any],
+    cache: _ThumbnailStripCache,
+    playhead_us: int,
+) -> None:
+    """空闲时在播放头附近补预热。"""
+    warm_preview_for_plan(build_preview_plan(content, playhead_us), cache)
+
+
+def _collect_preview_video_paths(content: Dict[str, Any]) -> List[str]:
+    materials = content.get("materials") if isinstance(content.get("materials"), dict) else {}
+    seen: set = set()
+    out: List[str] = []
+    for tr in content.get("tracks") or []:
+        if str(tr.get("type", "")).strip().lower() != "video":
+            continue
+        for seg in tr.get("segments") or []:
+            if not isinstance(seg, dict):
+                continue
+            p = _local_media_path_for_segment(seg, materials)
+            if not p or not os.path.isfile(p):
+                continue
+            pa = os.path.abspath(p)
+            if pa in seen:
+                continue
+            seen.add(pa)
+            out.append(p)
+    return out
+
+
+def fetch_instant_scrub_frame(plan: PreviewPlan, thumb_cache: _ThumbnailStripCache) -> Optional[bytes]:
+    """拖动时从缩略图条取最近帧（仅最前景视频层，不回落到底层）。"""
+    if not plan.videos:
+        return None
+    top = plan.videos[-1]
+    return thumb_cache.nearest(top.path, top.source_us)
+
+
+def fetch_scrub_frame_fast(
+    plan: PreviewPlan,
+    *,
+    max_width: int = SCRUB_THUMB_WIDTH,
+    frame_cache: Optional[_PreviewFrameCache] = None,
+) -> Optional[bytes]:
+    """拖动时的快速单帧：仅最前景视频，低分辨率 PPM + fast seek。"""
+    if not plan.videos:
+        return None
+    layer = plan.videos[-1]
+    ff = find_ffmpeg()
+    if not ff or not os.path.isfile(layer.path):
+        return None
+    if frame_cache is not None:
+        hit = frame_cache.get(layer.path, layer.source_us)
+        if hit:
+            return hit
+    path_abs = os.path.abspath(layer.path)
+    sec = max(0.0, layer.source_us / 1_000_000.0)
+    cmd = [
+        ff,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{sec:.3f}",
+        "-i",
+        path_abs,
+        "-frames:v",
+        "1",
+        "-an",
+        "-vf",
+        f"scale={max_width}:-2:flags=fast_bilinear,format=rgb24",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "ppm",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=12)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0 or not proc.stdout or proc.stdout[0:1] != b"P":
+        return None
+    if frame_cache is not None:
+        frame_cache.put(layer.path, layer.source_us, proc.stdout)
+    return proc.stdout
+
+
+def _fit_photoimage_to_area(photo: tk.PhotoImage, avail_w: int, avail_h: int) -> tk.PhotoImage:
+    """仅缩小过大图片；不做放大（zoom 会阻塞主线程导致卡死）。"""
+    iw, ih = photo.width(), photo.height()
+    if iw <= 0 or ih <= 0 or avail_w <= 0 or avail_h <= 0:
+        return photo
+    scale = min(avail_w / iw, avail_h / ih)
+    if scale <= 0.8:
+        s = max(1, int(1.0 / scale + 0.5))
+        return photo.subsample(s, s)
+    return photo
+
+
+def _draw_preview_subtitle_overlays(
+    canvas: tk.Canvas,
+    texts: Tuple[PreviewTextLayer, ...],
+    img_w: int,
+    img_h: int,
+    *,
+    offset_x: int = 0,
+    offset_y: int = 0,
+) -> None:
+    canvas.delete("preview_sub")
+    if not texts or img_w <= 0 or img_h <= 0:
+        return
+    y = offset_y + img_h - 6
+    for layer in reversed(texts[:4]):
+        line = (layer.text or "").strip()
+        if not line:
+            continue
+        fs = max(10, min(18, layer.font_size))
+        y -= fs + 12
+        canvas.create_rectangle(
+            offset_x + 4,
+            y - 2,
+            offset_x + img_w - 4,
+            y + fs + 6,
+            fill="#000000",
+            outline="#444444",
+            tags=("preview_sub",),
+        )
+        canvas.create_text(
+            offset_x + img_w // 2,
+            y + fs // 2 + 2,
+            text=line,
+            fill=layer.color or "#FFFFFF",
+            font=("Microsoft YaHei UI", fs),
+            width=max(40, img_w - 16),
+            tags=("preview_sub",),
+        )
 
 
 def timeline_segment_selection_status_parts(
@@ -2174,11 +5588,14 @@ def timeline_segment_selection_status_parts(
     lab = _timeline_segment_label(seg, materials)
     refs_list = replace_state.get("refs") or []
     ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i, content)
+    style_refs_list = replace_state.get("style_refs") or []
+    style_ref = find_style_ref_for_timeline_segment(style_refs_list, tr, orig_i, content)
     draft_nm = (replace_state.get("timeline_draft_name") or "").strip()
     pool_ui: Dict[str, Any] = replace_state.get("segment_export_pool") or {}
     if not isinstance(pool_ui, dict):
         pool_ui = {}
     rep_lines = segment_replace_status_lines(draft_nm, ref, pool_ui)
+    rep_lines.extend(segment_style_status_lines(draft_nm, style_ref, pool_ui))
     src_path = ""
     if ref and (ref.current_path or "").strip():
         src_path = ref.current_path.strip()
@@ -2188,6 +5605,11 @@ def timeline_segment_selection_status_parts(
         f"已选片段：{tr.get('name')} [{tr.get('type')}] · 时间序第 {vis_i + 1} 段 · "
         f"{st/1e6:.2f}s—{(st+du)/1e6:.2f}s · {lab}",
     ]
+    if style_ref and (style_ref.current_resource_id or "").strip():
+        if style_ref.track_type == "text":
+            main_lines.append(f"当前花字 id：{style_ref.current_resource_id.strip()}")
+        else:
+            main_lines.append(f"当前贴纸 id：{style_ref.current_resource_id.strip()}")
     if src_path:
         src_dir = os.path.dirname(src_path)
         src_file = os.path.basename(src_path)
@@ -2243,6 +5665,11 @@ def populate_timeline_panel(
 
     sel = selection if selection is not None else {"kind": "none", "ti": None, "si": None, "summary": ""}
     rs = replace_state if replace_state is not None else {}
+    if isinstance(content, dict):
+        try:
+            rs["style_refs"] = list_style_segments_from_content(content)
+        except Exception:
+            pass
 
     def _set_status(text: str, *, replace_highlight: str = "") -> None:
         sel["summary"] = text + (f"\n\n{replace_highlight}" if replace_highlight else "")
@@ -2265,15 +5692,16 @@ def populate_timeline_panel(
     # 高 render_index 在上（前景），低在下（主轨常见）
     tracks_sorted = sorted(tracks_raw, key=_track_render_index, reverse=True)
     materials = content.get("materials") if isinstance(content.get("materials"), dict) else {}
+    mat_kind_by_id = _build_material_kind_index(materials)
 
     total_us = _timeline_end_us(content)
     total_sec = total_us / 1_000_000.0
     time_px = max(int(total_sec * pixels_per_second), 280)
-    label_w = 118
+    label_w = _TIMELINE_LABEL_W
     ruler_h = 28
     row_h = 34
     row_gap = 5
-    pad = 6
+    pad = _TIMELINE_PAD
     canvas_w = label_w + time_px + pad * 2
     canvas_h = ruler_h + len(tracks_sorted) * (row_h + row_gap) + pad
 
@@ -2487,6 +5915,20 @@ def populate_timeline_panel(
         sel.pop("orig_i", None)
         sel.pop("vis_i", None)
         sel.pop("replace_ref", None)
+        sel.pop("style_ref", None)
+        ttype = str(tr.get("type", "")).strip().lower()
+        if ttype in ("text", "sticker") and isinstance(content, dict):
+            track_refs = list_style_segment_refs_for_track(content, tr)
+            if track_refs:
+                sel["track_style_refs"] = track_refs
+            else:
+                sel.pop("track_style_refs", None)
+        else:
+            sel.pop("track_style_refs", None)
+        nm_raw = tr.get("name", "")
+        tname = "" if nm_raw is None else (nm_raw if isinstance(nm_raw, str) else str(nm_raw))
+        tname = tname.strip()
+        sel["track_summary"] = f"{tname or ttype} [{ttype}] · 共 {nseg} 个片段"
         _set_status(f"已选轨道：{tr.get('name')} [{tr.get('type')}] · 共 {nseg} 个片段", replace_highlight="")
         apply_selection_visual()
         _notify_timeline_selection_ui()
@@ -2497,19 +5939,30 @@ def populate_timeline_panel(
         sel["ti"] = ti
         sel["vis_i"] = vis_i
         sel["orig_i"] = orig_i
+        sel.pop("track_style_refs", None)
+        sel.pop("track_summary", None)
         refs_list = rs.get("refs") or []
         ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i, content)
         if ref is not None:
             sel["replace_ref"] = ref
         else:
             sel.pop("replace_ref", None)
-        content_for_status: Dict[str, Any] = content if isinstance(content, dict) else {}
-        parts = timeline_segment_selection_status_parts(
-            content_for_status, ti=ti, vis_i=vis_i, orig_i=orig_i, replace_state=rs
-        )
-        if parts is not None:
-            _set_status(parts[0], replace_highlight=parts[1])
+        style_refs_list = rs.get("style_refs") or []
+        style_ref = find_style_ref_for_timeline_segment(style_refs_list, tr, orig_i, content)
+        if style_ref is not None:
+            sel["style_ref"] = style_ref
+        else:
+            sel.pop("style_ref", None)
         apply_selection_visual()
+        content_for_status: Dict[str, Any] = content if isinstance(content, dict) else {}
+        try:
+            parts = timeline_segment_selection_status_parts(
+                content_for_status, ti=ti, vis_i=vis_i, orig_i=orig_i, replace_state=rs
+            )
+            if parts is not None:
+                _set_status(parts[0], replace_highlight=parts[1])
+        except Exception:
+            pass
         _notify_timeline_selection_ui()
 
     def on_seg_context_menu(event: Any, ti: int, vis_i: int, orig_i: int) -> None:
@@ -2518,6 +5971,8 @@ def populate_timeline_panel(
         tr = tracks_sorted[ti]
         refs_list = rs.get("refs") or []
         ref = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i, content)
+        style_refs_list = rs.get("style_refs") or []
+        style_ref = find_style_ref_for_timeline_segment(style_refs_list, tr, orig_i, content)
         m = Menu(canvas, tearoff=0, bg="#2b2b2b", fg="#e0e0e0", activebackground="#3d3d3d")
 
         def _open_replace_win() -> None:
@@ -2528,10 +5983,39 @@ def populate_timeline_panel(
             if callable(od):
                 od(ref)
 
+        def _open_style_win() -> None:
+            if not style_ref:
+                return
+            on_select_seg(ti, vis_i, orig_i)
+            od = rs.get("_open_style_dialog")
+            if callable(od):
+                od(style_ref)
+
+        draft_nm = (rs.get("timeline_draft_name") or "").strip()
+        pool_ui = rs.get("segment_export_pool") or {}
+        has_material_cfg = bool(ref and segment_has_replace_config(draft_nm, ref, pool_ui))
+        has_style_cfg = bool(style_ref and segment_has_style_config(draft_nm, style_ref, pool_ui))
+
+        def _clear_seg_config() -> None:
+            on_select_seg(ti, vis_i, orig_i)
+            if has_material_cfg and ref:
+                cb = rs.get("_clear_material_config")
+                if callable(cb):
+                    cb(ref)
+            elif has_style_cfg and style_ref:
+                cb = rs.get("_clear_style_config")
+                if callable(cb):
+                    cb(style_ref)
+
         if ref:
             m.add_command(label="替换素材…", command=_open_replace_win)
+        elif style_ref:
+            label = "替换花字…" if style_ref.track_type == "text" else "替换贴纸…"
+            m.add_command(label=label, command=_open_style_win)
         else:
-            m.add_command(label="（此片段无对应音视频替换槽）", state="disabled")
+            m.add_command(label="（此片段不可配置替换）", state="disabled")
+        if has_material_cfg or has_style_cfg:
+            m.add_command(label="清除配置", command=_clear_seg_config)
         try:
             m.tk_popup(int(event.x_root), int(event.y_root))
         finally:
@@ -2543,12 +6027,12 @@ def populate_timeline_panel(
     # 标尺
     canvas.create_rectangle(0, 0, canvas_w, ruler_h, fill=ruler_bg, outline="")
     canvas.create_line(label_w, 0, label_w, canvas_h, fill="#555", width=1)
-    step_us = 1_000_000
+    step_us = _timeline_ruler_step_us(total_us)
     t = 0
     while t <= total_us:
         x = _x_for_us(t)
         sec = t // 1_000_000
-        is_major = sec % 5 == 0
+        is_major = (t % 5_000_000 == 0) or sec == 0
         canvas.create_line(x, ruler_h - (18 if is_major else 10), x, ruler_h, fill="#777", width=1)
         if is_major or sec == 0:
             canvas.create_text(
@@ -2617,12 +6101,26 @@ def populate_timeline_panel(
                 continue
             x1 = _x_for_us(st)
             x2 = _x_for_us(st + du)
-            if x2 - x1 < 2:
-                x2 = x1 + 2
+            bar_w = x2 - x1
+            min_bar = max(4.0, min(10.0, bar_w))
+            if bar_w < min_bar:
+                x2 = x1 + min_bar
+                bar_w = min_bar
             tag_s = f"sid{ti}_{orig_i}"
             seg_fill, seg_text = fill_c, text_c
+            has_fx = _segment_has_timeline_fx(seg, mat_kind_by_id)
+            if has_fx and ttype in ("text", "sticker"):
+                seg_fill, seg_text = ("#7a4a18", "#ffe8b0")
+            elif has_fx and ttype == "video":
+                seg_fill, seg_text = ("#4a3a7a", "#dcc8ff")
             r_here = find_replace_ref_for_timeline_segment(refs_list, tr, orig_i, content)
-            if draft_nm and segment_has_replace_config(draft_nm, r_here, pool_ui):
+            style_here = find_style_ref_for_timeline_segment(
+                rs.get("style_refs") or [], tr, orig_i, content
+            )
+            if draft_nm and (
+                segment_has_replace_config(draft_nm, r_here, pool_ui)
+                or segment_has_style_config(draft_nm, style_here, pool_ui)
+            ):
                 seg_fill, seg_text = ("#257a42", "#d4ffe3")
             rid = canvas.create_rectangle(
                 x1,
@@ -2639,14 +6137,37 @@ def populate_timeline_panel(
             seg_paint_counter[0] += 1
             track_visible_segs[ti].append((vis_i, orig_i))
             lab = _timeline_segment_label(seg, materials)
-            title = f"#{vis_i + 1} {lab}"
-            if x2 - x1 > 52:
+            idx_label = f"#{vis_i + 1}"
+            if has_fx:
+                idx_label = f"{idx_label} FX"
+            title = f"{idx_label} {lab}"
+            if bar_w > 28:
+                canvas.create_text(
+                    x1 + 4,
+                    y + row_h // 2,
+                    text=title[:28] + ("…" if len(title) > 28 else ""),
+                    fill=seg_text,
+                    anchor="w",
+                    font=("Segoe UI", 8),
+                    tags=("sseg", tag_s),
+                )
+            elif bar_w > 8:
                 canvas.create_text(
                     (x1 + x2) / 2,
                     y + row_h // 2,
-                    text=title[:24] + ("…" if len(title) > 24 else ""),
+                    text=idx_label,
                     fill=seg_text,
-                    font=("Segoe UI", 8),
+                    font=("Segoe UI", 7),
+                    tags=("sseg", tag_s),
+                )
+            if has_fx:
+                canvas.create_rectangle(
+                    x1,
+                    y + row_h - 7,
+                    x2,
+                    y + row_h - 2,
+                    fill="#ff9933",
+                    outline="",
                     tags=("sseg", tag_s),
                 )
             canvas.tag_bind(
@@ -2659,6 +6180,103 @@ def populate_timeline_panel(
             )
             canvas.tag_bind(tag_s, "<Enter>", lambda _e: canvas.configure(cursor="hand2"))
             canvas.tag_bind(tag_s, "<Leave>", lambda _e: canvas.configure(cursor=""))
+
+    playhead_us = max(0, min(int(sel.get("playhead_us") or rs.get("playhead_us") or 0), total_us))
+    sel["playhead_us"] = playhead_us
+    rs["playhead_us"] = playhead_us
+    playhead_ids: List[int] = []
+    _scrubbing = [False]
+    rs["_playhead_scrubbing"] = _scrubbing
+
+    def _us_from_canvas_x(cx: float) -> int:
+        x_time = cx - label_w - pad
+        if time_px <= 0:
+            return 0
+        frac = max(0.0, min(1.0, x_time / float(time_px)))
+        return int(frac * total_us)
+
+    def _draw_playhead() -> None:
+        for iid in playhead_ids:
+            try:
+                canvas.delete(iid)
+            except tk.TclError:
+                pass
+        playhead_ids.clear()
+        x = _x_for_us(playhead_us)
+        lh = canvas.create_line(x, 0, x, canvas_h, fill="#ff4444", width=2, tags=("playhead",))
+        tri = canvas.create_polygon(
+            x - 6, 0, x + 6, 0, x, 10, fill="#ff4444", outline="#aa2222", tags=("playhead",)
+        )
+        playhead_ids.extend([lh, tri])
+        try:
+            canvas.tag_raise("playhead")
+        except tk.TclError:
+            pass
+
+    def _set_playhead(us: int, *, notify: bool = True) -> None:
+        nonlocal playhead_us
+        playhead_us = max(0, min(int(us), total_us))
+        sel["playhead_us"] = playhead_us
+        rs["playhead_us"] = playhead_us
+        _draw_playhead()
+        if notify:
+            cb = rs.get("_on_playhead_change")
+            if callable(cb):
+                try:
+                    cb(playhead_us)
+                except Exception:
+                    pass
+
+    def _event_hits_segment(event: tk.Event) -> bool:
+        try:
+            cx = float(canvas.canvasx(event.x))
+            cy = float(canvas.canvasy(event.y))
+            hits = canvas.find_overlapping(cx - 2, cy - 2, cx + 2, cy + 2)
+            for iid in hits:
+                if "sseg" in canvas.gettags(iid):
+                    return True
+        except tk.TclError:
+            pass
+        return False
+
+    def _on_playhead_press(event: tk.Event) -> Optional[str]:
+        try:
+            cx = float(canvas.canvasx(event.x))
+        except (TypeError, ValueError, tk.TclError):
+            return None
+        if cx < label_w:
+            return None
+        if _event_hits_segment(event):
+            return None
+        _scrubbing[0] = True
+        _set_playhead(_us_from_canvas_x(cx))
+        return None
+
+    def _on_playhead_motion(event: tk.Event) -> Optional[str]:
+        if not _scrubbing[0]:
+            return None
+        try:
+            cx = float(canvas.canvasx(event.x))
+        except (TypeError, ValueError, tk.TclError):
+            return None
+        if cx < label_w:
+            cx = float(label_w)
+        _set_playhead(_us_from_canvas_x(cx))
+        return "break"
+
+    def _on_playhead_release(_event: tk.Event) -> None:
+        _scrubbing[0] = False
+        kick = rs.get("_on_playhead_preview_flush")
+        if callable(kick):
+            try:
+                kick(int(playhead_us))
+            except Exception:
+                pass
+
+    _draw_playhead()
+    canvas.bind("<Button-1>", _on_playhead_press, add="+")
+    canvas.bind("<B1-Motion>", _on_playhead_motion, add="+")
+    canvas.bind("<ButtonRelease-1>", _on_playhead_release, add="+")
 
     def _timeline_canvas_vscrolls() -> bool:
         try:
@@ -2880,12 +6498,23 @@ def populate_timeline_panel(
         canvas.bind(_keyseq, on_timeline_arrow_key)
 
     apply_selection_visual()
-    if sel.get("kind") == "none":
+    if sel.get("kind") == "seg" and sel.get("ti") is not None and sel.get("orig_i") is not None:
+        try:
+            ti_rs = int(sel["ti"])
+            oi_rs = int(sel["orig_i"])
+            vi_rs = int(sel.get("vis_i", 0))
+            if 0 <= ti_rs < len(tracks_sorted):
+                on_select_seg(ti_rs, vi_rs, oi_rs)
+        except (TypeError, ValueError):
+            pass
+    elif sel.get("kind") == "none":
         _set_status(
-            "提示：点击左侧轨道名选中轨道；点击彩色条选中片段；音视频片段可右键「替换素材…」"
+            "提示：点击左侧轨道名选中轨道；点击彩色条选中片段；"
+            "音视频可右键「替换素材…」；字幕/贴纸可点轨道名选中整轨后点「替换…」，或点片段右键配置花字/贴纸"
             "（Windows 下也可将单个文件或素材文件夹从资源管理器拖到片段条上，与弹窗保存一致）。"
             " 时间轴区域点一下后可用方向键：左右切换同轨片段，上下换轨（保持同序）且横滚对齐片段左缘；"
-            "轨道多时可滚轮上下浏览或拖右侧竖条；Ctrl+滚轮或标题栏「+/−」横向缩放。",
+            "轨道多时可滚轮上下浏览或拖右侧竖条；Ctrl+滚轮或标题栏「+/−」横向缩放；"
+            "点击或拖动顶部标尺、轨道空白处或红色播放头，可定位并预览对应画面。",
             replace_highlight="",
         )
 
@@ -2988,8 +6617,8 @@ def run_app() -> None:
 
     root = ctk.CTk()
     root.title("爆款智剪")
-    win_w, win_h = 1100, 800
-    root.minsize(880, 560)
+    win_w, win_h = 1380, 800
+    root.minsize(980, 560)
     root.geometry(f"{win_w}x{win_h}")
     root.update_idletasks()
     _center_window_on_screen(root, win_w, win_h)
@@ -3200,6 +6829,10 @@ def run_app() -> None:
     left.pack(side="left", fill="y", padx=(0, 10))
     left.pack_propagate(False)
 
+    preview_col = ctk.CTkFrame(main, width=300, corner_radius=12)
+    preview_col.pack(side="right", fill="y", padx=(10, 0))
+    preview_col.pack_propagate(False)
+
     right = ctk.CTkFrame(main, corner_radius=12)
     right.pack(side="left", fill="both", expand=True)
     right.grid_columnconfigure(0, weight=1)
@@ -3230,9 +6863,11 @@ def run_app() -> None:
     timeline_content_cache: List[Optional[Dict[str, Any]]] = [None]
     timeline_zoom: Dict[str, float] = {"pps": DEFAULT_TIMELINE_PPS}
     timeline_zoom_label_var = ctk.StringVar(value="缩放 100%")
+    timeline_duration_var = ctk.StringVar(value="")
 
     replace_state: Dict[str, Any] = {
         "refs": [],
+        "style_refs": [],
         "encrypted": False,
         "content_ok": False,
         "timeline_draft_name": "",
@@ -3248,10 +6883,17 @@ def run_app() -> None:
 
     ctk.CTkLabel(
         timeline_header,
-        text="时间轴预览（可点击左侧轨道名或片段时间条进行选择）",
+        text="时间轴预览（点击轨道空白/标尺可移动播放头；点击片段可选中）",
         font=ctk.CTkFont(size=14, weight="bold"),
         anchor="w",
     ).grid(row=0, column=0, sticky="w")
+    ctk.CTkLabel(
+        timeline_header,
+        textvariable=timeline_duration_var,
+        font=ctk.CTkFont(size=11),
+        text_color=("gray45", "gray60"),
+        anchor="w",
+    ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
     zoom_bar = ctk.CTkFrame(timeline_header, fg_color="transparent")
     zoom_bar.grid(row=0, column=1, sticky="e", padx=(8, 0))
@@ -3259,18 +6901,52 @@ def run_app() -> None:
         side="left", padx=(0, 6)
     )
 
+    def _timeline_viewport_width() -> int:
+        try:
+            timeline_inner.update_idletasks()
+            vw = int(timeline_inner.winfo_width())
+        except (tk.TclError, ValueError, TypeError):
+            vw = 0
+        return vw if vw >= 120 else 780
+
+    def timeline_zoom_fit_width() -> None:
+        raw = timeline_content_cache[0]
+        if not isinstance(raw, dict):
+            return
+        timeline_zoom["pps"] = _calc_timeline_fit_pps(raw, _timeline_viewport_width())
+        refresh_timeline_panel_data(None, reset_selection=False)
+
     def refresh_timeline_panel_data(raw: Optional[Dict[str, Any]] = None, *, reset_selection: bool = True) -> None:
         if raw is not None:
             timeline_content_cache[0] = raw
-            timeline_zoom["pps"] = DEFAULT_TIMELINE_PPS
+            timeline_zoom["pps"] = _calc_timeline_fit_pps(raw, _timeline_viewport_width())
+            timeline_select["playhead_us"] = 0
+            replace_state["playhead_us"] = 0
         elif reset_selection:
             timeline_content_cache[0] = None
         if reset_selection:
             timeline_select.clear()
             timeline_select.update({"kind": "none", "ti": None, "si": None, "summary": ""})
+            timeline_select["playhead_us"] = 0
+            replace_state["playhead_us"] = 0
+            preview_state["gen"] = int(preview_state.get("gen", 0)) + 1
+            preview_state["frame_cache"].clear()
+            preview_state["thumb_cache"].clear()
+        if raw is not None:
+            start_preview_thumbnail_warm(raw, preview_state["thumb_cache"])
 
         pct = int(round(100.0 * timeline_zoom["pps"] / DEFAULT_TIMELINE_PPS))
         timeline_zoom_label_var.set(f"缩放 {pct}%")
+        raw_cur = timeline_content_cache[0]
+        if isinstance(raw_cur, dict):
+            total_us = _timeline_end_us(raw_cur)
+            n_tracks = len(raw_cur.get("tracks") or [])
+            n_segs = sum(len(tr.get("segments") or []) for tr in (raw_cur.get("tracks") or []))
+            timeline_duration_var.set(
+                f"总长 {_fmt_us_as_timecode(total_us)} · {n_tracks} 轨 · {n_segs} 片段（加载时自动适应宽度，可横向滚动或点「适应宽度」）"
+            )
+        else:
+            timeline_duration_var.set("")
 
         def _wheel_zoom_step(direction: int) -> None:
             if timeline_content_cache[0] is None:
@@ -3304,6 +6980,12 @@ def run_app() -> None:
                 refresh_timeline_segment_status_if_selected()
             except Exception:
                 pass
+        cb_ph = replace_state.get("_on_playhead_change")
+        if callable(cb_ph):
+            try:
+                cb_ph(int(timeline_select.get("playhead_us") or replace_state.get("playhead_us") or 0))
+            except Exception:
+                pass
 
     def timeline_zoom_mult(factor: float) -> None:
         if timeline_content_cache[0] is None:
@@ -3333,11 +7015,270 @@ def run_app() -> None:
     ctk.CTkButton(zoom_bar, text="重置", width=52, fg_color=("gray70", "gray38"), command=timeline_zoom_reset).pack(
         side="left", padx=(6, 0)
     )
+    ctk.CTkButton(
+        zoom_bar, text="适应宽度", width=72, fg_color=("gray70", "gray38"), command=timeline_zoom_fit_width
+    ).pack(side="left", padx=(6, 0))
 
     timeline_inner = ctk.CTkFrame(timeline_block, fg_color=("gray92", "gray20"), corner_radius=8)
     timeline_inner.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
 
     timeline_select: Dict[str, Any] = {"kind": "none", "ti": None, "si": None, "summary": ""}
+
+    ctk.CTkLabel(
+        preview_col,
+        text="画面预览",
+        font=ctk.CTkFont(size=16, weight="bold"),
+        anchor="w",
+    ).pack(anchor="w", padx=12, pady=(14, 4))
+    preview_img_host = ctk.CTkFrame(preview_col, fg_color=("gray88", "gray18"), corner_radius=8)
+    preview_img_host.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+    preview_canvas = tk.Canvas(preview_img_host, bg="#1a1a1a", highlightthickness=0)
+    preview_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+    preview_time_var = ctk.StringVar(value="当前 0.00 秒")
+    ctk.CTkLabel(
+        preview_col,
+        textvariable=preview_time_var,
+        font=ctk.CTkFont(family="Consolas", size=14, weight="bold"),
+        text_color=("gray20", "gray85"),
+        anchor="center",
+    ).pack(fill="x", padx=12, pady=(0, 2))
+    preview_info_var = ctk.StringVar(value="")
+    ctk.CTkLabel(
+        preview_col,
+        textvariable=preview_info_var,
+        font=ctk.CTkFont(size=11),
+        text_color=("gray45", "gray60"),
+        anchor="w",
+        wraplength=268,
+        justify="left",
+    ).pack(anchor="w", padx=12, pady=(0, 12))
+    preview_state: Dict[str, Any] = {
+        "photo": None,
+        "frame_cache": _PreviewFrameCache(max_items=96),
+        "thumb_cache": _ThumbnailStripCache(),
+        "gen": 0,
+        "pending_us": None,
+        "scrub_busy": False,
+        "last_worker_ms": 0,
+        "warm_interrupted_for_scrub": False,
+        "warm_idle_after_id": None,
+        "ui_apply_scheduled": False,
+        "ui_apply_pending": None,
+    }
+
+    def _schedule_preview_apply(img_bytes: bytes, plan: PreviewPlan, gen: int) -> None:
+        preview_state["ui_apply_pending"] = (img_bytes, plan, gen)
+        if preview_state.get("ui_apply_scheduled"):
+            return
+        preview_state["ui_apply_scheduled"] = True
+
+        def _flush_ui_apply() -> None:
+            preview_state["ui_apply_scheduled"] = False
+            pending = preview_state.get("ui_apply_pending")
+            if not pending:
+                return
+            preview_state["ui_apply_pending"] = None
+            img_b, plan_b, gen_b = pending
+            if gen_b != int(preview_state.get("gen", 0)):
+                return
+            try:
+                _apply_preview_image(img_b, plan_b, gen_b)
+            except Exception:
+                pass
+
+        root.after(0, _flush_ui_apply)
+
+    def _preview_show_message(msg: str) -> None:
+        preview_state["photo"] = None
+        preview_canvas.delete("all")
+        try:
+            w = max(160, int(preview_canvas.winfo_width()))
+            h = max(120, int(preview_canvas.winfo_height()))
+        except tk.TclError:
+            w, h = 280, 200
+        preview_canvas.create_text(
+            w // 2,
+            h // 2,
+            text=msg,
+            fill="#888888",
+            font=("Microsoft YaHei UI", 10),
+            justify="center",
+            width=max(120, w - 24),
+        )
+
+    def _apply_preview_image(img_bytes: bytes, plan: PreviewPlan, gen: int, *, silent: bool = False) -> bool:
+        if gen != int(preview_state.get("gen", 0)):
+            return False
+        try:
+            photo = tk.PhotoImage(data=img_bytes)
+        except tk.TclError:
+            if not silent:
+                _preview_show_message("（预览解码失败）")
+            return False
+        preview_state["photo"] = photo
+        preview_canvas.delete("all")
+        try:
+            avail_w = max(PREVIEW_MAX_WIDTH, int(preview_canvas.winfo_width()) - 12)
+            avail_h = max(360, int(preview_canvas.winfo_height()) - 12)
+        except tk.TclError:
+            avail_w, avail_h = PREVIEW_MAX_WIDTH, 480
+        photo = _fit_photoimage_to_area(photo, avail_w, avail_h)
+        preview_state["photo"] = photo
+        iw, ih = photo.width(), photo.height()
+        ox = max(0, (avail_w - iw) // 2)
+        oy = max(0, (avail_h - ih) // 2)
+        preview_canvas.configure(scrollregion=(0, 0, max(avail_w, iw), max(avail_h, ih)))
+        preview_canvas.create_image(ox, oy, anchor="nw", image=photo, tags=("preview_img",))
+        _draw_preview_subtitle_overlays(preview_canvas, plan.texts, iw, ih, offset_x=ox, offset_y=oy)
+        return True
+
+    def _queue_preview_apply(img_bytes: bytes, plan: PreviewPlan, gen: int) -> None:
+        _schedule_preview_apply(img_bytes, plan, gen)
+
+    def _preview_is_scrubbing() -> bool:
+        flag = replace_state.get("_playhead_scrubbing")
+        if isinstance(flag, list) and flag:
+            return bool(flag[0])
+        return False
+
+    def _preview_sync_labels(us: int, plan: Optional[PreviewPlan] = None) -> None:
+        content = timeline_content_cache[0]
+        if not isinstance(content, dict):
+            preview_time_var.set("当前 0.00 秒")
+            preview_info_var.set("")
+            return
+        total_us = _timeline_end_us(content)
+        preview_time_var.set(f"当前 {us / 1_000_000.0:.2f} 秒 / 总长 {total_us / 1_000_000.0:.2f} 秒")
+        if plan is None:
+            plan = build_preview_plan(content, us)
+        preview_info_var.set(plan.info[:120] + ("…" if len(plan.info) > 120 else ""))
+
+    def _cancel_warm_idle_timer() -> None:
+        aid = preview_state.get("warm_idle_after_id")
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            preview_state["warm_idle_after_id"] = None
+
+    def _interrupt_warm_for_scrub() -> None:
+        if preview_state.get("warm_interrupted_for_scrub"):
+            return
+        preview_state["warm_interrupted_for_scrub"] = True
+        _cancel_warm_idle_timer()
+        preview_state["thumb_cache"].interrupt_warming()
+
+    def _schedule_warm_near_playhead(playhead_us: int) -> None:
+        _cancel_warm_idle_timer()
+
+        def _idle_warm() -> None:
+            preview_state["warm_idle_after_id"] = None
+            if _preview_is_scrubbing():
+                return
+            content = timeline_content_cache[0]
+            if not isinstance(content, dict):
+                return
+            warm_preview_near_playhead(content, preview_state["thumb_cache"], int(playhead_us))
+
+        preview_state["warm_idle_after_id"] = root.after(PREVIEW_WARM_IDLE_MS, _idle_warm)
+
+    def _on_scrub_end(playhead_us: int) -> None:
+        preview_state["warm_interrupted_for_scrub"] = False
+        _schedule_warm_near_playhead(playhead_us)
+
+    def _try_instant_scrub_preview(plan: PreviewPlan) -> bool:
+        instant = fetch_instant_scrub_frame(plan, preview_state["thumb_cache"])
+        if not instant:
+            return False
+        gen = int(preview_state.get("gen", 0)) + 1
+        preview_state["gen"] = gen
+        _queue_preview_apply(instant, plan, gen)
+        return True
+
+    def _run_fast_preview_fetch(plan: PreviewPlan, us: int) -> None:
+        if preview_state.get("scrub_busy"):
+            return
+        preview_state["scrub_busy"] = True
+        preview_state["last_worker_ms"] = time.time() * 1000.0
+        gen = int(preview_state.get("gen", 0)) + 1
+        preview_state["gen"] = gen
+        frame_cache = preview_state["frame_cache"]
+
+        def worker() -> None:
+            img = fetch_scrub_frame_fast(plan, frame_cache=frame_cache)
+
+            def ui() -> None:
+                preview_state["scrub_busy"] = False
+                if gen != int(preview_state.get("gen", 0)):
+                    return
+                if img:
+                    _queue_preview_apply(img, plan, gen)
+                latest = preview_state.get("pending_us")
+                if (
+                    latest is not None
+                    and int(latest) != us
+                    and isinstance(timeline_content_cache[0], dict)
+                ):
+                    p2 = build_preview_plan(timeline_content_cache[0], int(latest))
+                    if not _try_instant_scrub_preview(p2):
+                        _run_fast_preview_fetch(p2, int(latest))
+
+            root.after(0, ui)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _request_preview_update(plan: PreviewPlan, us: int) -> None:
+        if _try_instant_scrub_preview(plan):
+            return
+        warm_preview_for_plan(plan, preview_state["thumb_cache"])
+        if not preview_state.get("scrub_busy"):
+            _run_fast_preview_fetch(plan, us)
+
+    def _preview_sync_time_only(us: int) -> None:
+        content = timeline_content_cache[0]
+        if not isinstance(content, dict):
+            preview_time_var.set("当前 0.00 秒")
+            return
+        total_us = _timeline_end_us(content)
+        preview_time_var.set(f"当前 {us / 1_000_000.0:.2f} 秒 / 总长 {total_us / 1_000_000.0:.2f} 秒")
+
+    def on_playhead_changed(playhead_us: int) -> None:
+        preview_state["pending_us"] = int(playhead_us)
+
+        us = int(playhead_us)
+        content = timeline_content_cache[0]
+        if not isinstance(content, dict):
+            preview_time_var.set("当前 0.00 秒")
+            preview_info_var.set("")
+            return
+
+        plan = build_preview_plan(content, us)
+        if _preview_is_scrubbing():
+            _preview_sync_time_only(us)
+            _interrupt_warm_for_scrub()
+        else:
+            _preview_sync_labels(us, plan)
+        if not plan.videos:
+            _preview_show_message("（当前时间无视频）")
+            return
+
+        _request_preview_update(plan, us)
+
+    replace_state["_on_playhead_change"] = on_playhead_changed
+
+    def _flush_preview_after_scrub(playhead_us: int) -> None:
+        """松手：只补全文字信息，不重复取帧（拖动链式路径已显示画面）。"""
+        preview_state["pending_us"] = int(playhead_us)
+        us = int(playhead_us)
+        content = timeline_content_cache[0]
+        if isinstance(content, dict):
+            plan = build_preview_plan(content, us)
+            _preview_sync_labels(us, plan)
+        _on_scrub_end(us)
+
+    replace_state["_on_playhead_preview_flush"] = _flush_preview_after_scrub
+
     timeline_status_area = ctk.CTkFrame(timeline_block, fg_color="transparent")
     timeline_status_area.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 0))
     timeline_status_area.grid_columnconfigure(0, weight=1)
@@ -3382,7 +7323,8 @@ def run_app() -> None:
     timeline_replace_highlight_label.grid(row=1, column=0, sticky="ew", pady=(2, 0))
 
     _hint0 = (
-        "提示：点击左侧轨道名选中轨道；点击彩色条选中片段；音视频片段可右键「替换素材…」"
+        "提示：点击左侧轨道名选中轨道；点击彩色条选中片段；"
+        "音视频可右键「替换素材…」；字幕/贴纸可点轨道名选中整轨后点「替换…」，或点片段右键配置花字/贴纸"
         "（Windows 下也可将单个文件或素材文件夹从资源管理器拖到片段条上，与弹窗保存一致）。"
         " 时间轴点一下后可用方向键：左右同轨片段，上下换轨（同序）且横滚对齐片段左缘；"
         "轨道多时可滚轮上下浏览或拖右侧竖条；Ctrl+滚轮或标题栏「+/−」横向缩放。"
@@ -3819,6 +7761,26 @@ def run_app() -> None:
         def _cancel_replace_dialog() -> None:
             win.destroy()
 
+        def _clear_material_dialog() -> None:
+            base_s = draft_root.get().strip()
+            dn = (selected_name or "").strip()
+            if not clear_material_export_pool_for_ref(
+                replace_state, base_s, dn, ref, pool_preset_var.get()
+            ):
+                return
+            try:
+                refresh_timeline_panel_data(None, reset_selection=False)
+            except Exception:
+                pass
+            try:
+                refresh_timeline_segment_status_if_selected()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
         win.protocol("WM_DELETE_WINDOW", _cancel_replace_dialog)
 
         footer_row = ctk.CTkFrame(win, fg_color="transparent")
@@ -3833,6 +7795,13 @@ def run_app() -> None:
         ).pack(side="right")
         ctk.CTkButton(
             footer_row,
+            text="清除配置",
+            width=88,
+            fg_color=("gray70", "gray35"),
+            command=_clear_material_dialog,
+        ).pack(side="right", padx=(0, 10))
+        ctk.CTkButton(
+            footer_row,
             text="关闭",
             width=88,
             fg_color=("gray70", "gray35"),
@@ -3842,7 +7811,328 @@ def run_app() -> None:
         _center_toplevel_on_root(win, root, dlg_w, dlg_h)
         win.after(80, win.lift)
 
+    def open_replace_style_dialog(
+        ref: StyleSegmentRef,
+        *,
+        batch_refs: Optional[List[StyleSegmentRef]] = None,
+        track_summary: str = "",
+    ) -> None:
+        from tkinter import messagebox
+
+        targets = list(batch_refs) if batch_refs else [ref]
+        if not targets:
+            return
+        ref = targets[0]
+        batch_mode = len(targets) > 1
+
+        kind = STYLE_KIND_TEXT_EFFECT if ref.track_type == "text" else STYLE_KIND_STICKER
+        title = "替换花字" if kind == STYLE_KIND_TEXT_EFFECT else "替换贴纸"
+        if batch_mode:
+            title = "替换轨道花字" if kind == STYLE_KIND_TEXT_EFFECT else "替换轨道贴纸"
+        pool_name = "花字" if kind == STYLE_KIND_TEXT_EFFECT else "贴纸"
+
+        win = ctk.CTkToplevel(root)
+        win.title(title)
+        dlg_w, dlg_h = 560, (400 if batch_mode else 360)
+        win.geometry(f"{dlg_w}x{dlg_h}")
+        win.minsize(480, 300)
+        win.transient(root)
+
+        main = ctk.CTkFrame(win, fg_color="transparent")
+        main.pack(side="top", fill="both", expand=True, padx=16)
+
+        if batch_mode:
+            head = (track_summary or f"[{ref.track_type}] {ref.track_name}").strip()
+            ctk.CTkLabel(
+                main,
+                text=head,
+                font=ctk.CTkFont(size=14, weight="bold"),
+                anchor="w",
+            ).pack(fill="x", padx=0, pady=(16, 4))
+            ctk.CTkLabel(
+                main,
+                text=f"将为本轨道 {len(targets)} 个片段统一配置{pool_name}（导出/生成子稿时分别套用）。",
+                font=ctk.CTkFont(size=12),
+                text_color=("gray35", "gray55"),
+                anchor="w",
+                wraplength=500,
+            ).pack(fill="x", padx=0, pady=(0, 8))
+        else:
+            ctk.CTkLabel(
+                main,
+                text=ref.combo_label,
+                font=ctk.CTkFont(size=14, weight="bold"),
+                anchor="w",
+            ).pack(fill="x", padx=0, pady=(16, 4))
+            cur_id = (ref.current_resource_id or "").strip()
+            ctk.CTkLabel(
+                main,
+                text=f"当前{pool_name} id: {cur_id or '（无）'}",
+                font=ctk.CTkFont(size=12),
+                text_color=("gray35", "gray55"),
+                anchor="w",
+            ).pack(fill="x", padx=0, pady=(0, 8))
+
+        base = draft_root.get().strip()
+        parent_json = (
+            os.path.join(base, (selected_name or "").strip(), "draft_content.json")
+            if base and (selected_name or "").strip()
+            else ""
+        )
+        if kind == STYLE_KIND_TEXT_EFFECT:
+            valid_ids, _ = build_text_effect_id_pool(parent_json or "")
+            name_map = get_text_effect_display_names(base or None)
+        else:
+            valid_ids, _ = build_sticker_resource_id_pool(parent_json or "")
+            name_map = get_sticker_display_names()
+        ctk.CTkLabel(
+            main,
+            text=f"本机可用{pool_name}池：{len(valid_ids)} 个（导出/生成子稿时套用）",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray60"),
+            anchor="w",
+        ).pack(fill="x", padx=0, pady=(0, 10))
+
+        _dn = (selected_name or "").strip()
+        _pool_all: Dict[str, Dict[str, Any]] = replace_state.get("segment_export_pool") or {}
+
+        def _cfg_for_ref(r: StyleSegmentRef) -> Optional[Dict[str, Any]]:
+            if not _dn:
+                return None
+            k = segment_style_pool_key(_dn, r)
+            return normalize_style_pool_config(_pool_all.get(k))
+
+        _cfg0: Optional[Dict[str, Any]] = None
+        if batch_mode:
+            cfgs = [c for c in (_cfg_for_ref(r) for r in targets) if c]
+            if cfgs and all(c == cfgs[0] for c in cfgs):
+                _cfg0 = cfgs[0]
+        else:
+            _cfg0 = _cfg_for_ref(ref)
+
+        mode_var = ctk.StringVar(
+            value=_cfg0.get("style_mode", STYLE_MODE_RANDOM) if _cfg0 else STYLE_MODE_RANDOM
+        )
+        id_var = ctk.StringVar(value=str((_cfg0 or {}).get("style_resource_id") or ""))
+
+        mode_row = ctk.CTkFrame(main, fg_color="transparent")
+        mode_row.pack(fill="x", padx=0, pady=(0, 8))
+        ctk.CTkLabel(mode_row, text="方式", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").pack(
+            side="left", padx=(0, 12)
+        )
+
+        id_row = ctk.CTkFrame(main, fg_color="transparent")
+        if kind == STYLE_KIND_TEXT_EFFECT:
+            pick_labels, pick_label_to_id = build_text_effect_picker_choices(valid_ids, name_map)
+        else:
+            pick_labels, pick_label_to_id = build_style_resource_picker_choices(valid_ids, name_map)
+        pick_var = ctk.StringVar(value=pick_labels[0])
+
+        def _sync_style_id_row(*_args: Any) -> None:
+            if mode_var.get() == STYLE_MODE_FIXED:
+                id_row.pack(fill="x", padx=0, pady=(4, 4))
+            else:
+                id_row.pack_forget()
+
+        ctk.CTkRadioButton(
+            mode_row,
+            text=f"从{pool_name}池随机",
+            variable=mode_var,
+            value=STYLE_MODE_RANDOM,
+            font=ctk.CTkFont(size=12),
+            command=_sync_style_id_row,
+        ).pack(side="left", padx=(0, 14))
+        ctk.CTkRadioButton(
+            mode_row,
+            text=f"指定{pool_name}",
+            variable=mode_var,
+            value=STYLE_MODE_FIXED,
+            font=ctk.CTkFont(size=12),
+            command=_sync_style_id_row,
+        ).pack(side="left")
+
+        ctk.CTkLabel(id_row, text="选择", width=52, anchor="w", font=ctk.CTkFont(size=11)).pack(
+            side="left", padx=(0, 8)
+        )
+
+        def _apply_style_pick_label(label: str) -> None:
+            rid = pick_label_to_id.get(label, "")
+            if rid:
+                id_var.set(rid)
+                mode_var.set(STYLE_MODE_FIXED)
+                _sync_style_id_row()
+
+        style_pick_menu = ctk.CTkOptionMenu(
+            id_row,
+            variable=pick_var,
+            values=pick_labels if len(pick_labels) > 1 else pick_labels + [f"（无可用{pool_name}）"],
+            width=360,
+            height=32,
+            font=ctk.CTkFont(size=12),
+            command=_apply_style_pick_label,
+        )
+        style_pick_menu.pack(side="left", fill="x", expand=True)
+
+        cur_rid = id_var.get().strip()
+        if cur_rid:
+            for lab, rid in pick_label_to_id.items():
+                if rid == cur_rid:
+                    pick_var.set(lab)
+                    break
+            else:
+                if kind == STYLE_KIND_TEXT_EFFECT:
+                    pick_var.set(text_effect_picker_label_for_id(cur_rid, name_map))
+                else:
+                    pick_var.set(style_resource_picker_label_for_id(cur_rid, name_map.get(cur_rid, "")))
+
+        _sync_style_id_row()
+
+        def _persist_style_pool(cfg: Optional[Dict[str, Any]], refs: Optional[List[StyleSegmentRef]] = None) -> None:
+            dn = (selected_name or "").strip()
+            if not dn:
+                return
+            apply_refs = refs if refs is not None else targets
+            pool: Dict[str, Dict[str, Any]] = replace_state.setdefault("segment_export_pool", {})
+            for r in apply_refs:
+                k = segment_style_pool_key(dn, r)
+                if cfg:
+                    pool[k] = dict(cfg)
+                else:
+                    pool.pop(k, None)
+            base_s = draft_root.get().strip()
+            if base_s:
+                persist_working_export_pool_snapshot(base_s, dn, replace_state)
+                persist_active_named_export_pool_preset(base_s, dn, pool_preset_var.get(), replace_state)
+
+        def _confirm_style_dialog() -> None:
+            mode = mode_var.get()
+            if mode == STYLE_MODE_RANDOM:
+                cfg = {"style_kind": kind, "style_mode": STYLE_MODE_RANDOM}
+            else:
+                rid = id_var.get().strip()
+                if not rid:
+                    messagebox.showwarning("未选择", f"请从列表中选择要指定的{pool_name}。")
+                    return
+                if kind == STYLE_KIND_TEXT_EFFECT:
+                    if not _subtitle_flower_effect_id_is_usable(rid):
+                        messagebox.showwarning(
+                            "花字无效",
+                            f"id {rid} 不是可用的字幕花字，或未在本机缓存。\n"
+                            "可在剪映花字面板预览后点「检测花字池」。",
+                        )
+                        return
+                elif not _sticker_resource_id_is_usable(rid):
+                    messagebox.showwarning(
+                        "贴纸无效",
+                        f"id {rid} 不是可用的贴纸，或未在本机缓存。\n"
+                        "可在剪映贴纸面板预览后点「检测贴纸池」。",
+                    )
+                    return
+                cfg = {"style_kind": kind, "style_mode": STYLE_MODE_FIXED, "style_resource_id": rid}
+            _persist_style_pool(cfg)
+            try:
+                refresh_timeline_panel_data(None, reset_selection=False)
+            except Exception:
+                pass
+            try:
+                refresh_timeline_segment_status_if_selected()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def _clear_style_dialog() -> None:
+            base_s = draft_root.get().strip()
+            dn = (selected_name or "").strip()
+            if not clear_style_export_pool_for_refs(
+                replace_state, base_s, dn, targets, pool_preset_var.get()
+            ):
+                return
+            try:
+                refresh_timeline_panel_data(None, reset_selection=False)
+            except Exception:
+                pass
+            try:
+                refresh_timeline_segment_status_if_selected()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def _cancel_style_dialog() -> None:
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _cancel_style_dialog)
+
+        footer_row = ctk.CTkFrame(win, fg_color="transparent")
+        footer_row.pack(side="bottom", fill="x", padx=16, pady=(8, 14))
+        ctk.CTkButton(
+            footer_row,
+            text="确定",
+            width=88,
+            fg_color=("#2FA572", "#1D7A4F"),
+            hover_color=("#268A5F", "#176642"),
+            command=_confirm_style_dialog,
+        ).pack(side="right")
+        ctk.CTkButton(
+            footer_row,
+            text="清除配置",
+            width=88,
+            fg_color=("gray70", "gray35"),
+            command=_clear_style_dialog,
+        ).pack(side="right", padx=(0, 10))
+        ctk.CTkButton(
+            footer_row,
+            text="关闭",
+            width=88,
+            fg_color=("gray70", "gray35"),
+            command=_cancel_style_dialog,
+        ).pack(side="right", padx=(0, 10))
+
+        _center_toplevel_on_root(win, root, dlg_w, dlg_h)
+        win.after(80, win.lift)
+
     replace_state["_open_replace_dialog"] = open_replace_material_dialog
+    replace_state["_open_style_dialog"] = open_replace_style_dialog
+
+    def _clear_material_config_cb(ref: MediaSegmentRef) -> None:
+        base_s = draft_root.get().strip()
+        dn = (selected_name or "").strip()
+        if not clear_material_export_pool_for_ref(
+            replace_state, base_s, dn, ref, pool_preset_var.get()
+        ):
+            return
+        try:
+            refresh_timeline_panel_data(None, reset_selection=False)
+        except Exception:
+            pass
+        try:
+            refresh_timeline_segment_status_if_selected()
+        except Exception:
+            pass
+
+    def _clear_style_config_cb(ref: StyleSegmentRef) -> None:
+        base_s = draft_root.get().strip()
+        dn = (selected_name or "").strip()
+        if not clear_style_export_pool_for_refs(
+            replace_state, base_s, dn, [ref], pool_preset_var.get()
+        ):
+            return
+        try:
+            refresh_timeline_panel_data(None, reset_selection=False)
+        except Exception:
+            pass
+        try:
+            refresh_timeline_segment_status_if_selected()
+        except Exception:
+            pass
+
+    replace_state["_clear_material_config"] = _clear_material_config_cb
+    replace_state["_clear_style_config"] = _clear_style_config_cb
 
     bottom_actions = ctk.CTkFrame(export_strip, fg_color="transparent")
     bottom_actions.pack(fill="both", expand=True)
@@ -4086,7 +8376,7 @@ def run_app() -> None:
             messagebox.showwarning("无法保存", "请先设置有效的草稿根目录。")
             return
         dlg = CTkInputDialog(
-            text="预设名称（保存当前各槽的目录/顺序与单个替换文件）：",
+            text="预设名称（保存当前各槽：素材目录/文件、花字/贴纸随机或指定 id）：",
             title="保存导出槽预设",
         )
         _center_ctk_input_dialog_on_parent(dlg, root)
@@ -4125,20 +8415,15 @@ def run_app() -> None:
         if not isinstance(seg, dict) or not seg:
             messagebox.showinfo(
                 "保存预设",
-                "当前没有可保存的槽位配置。\n请在「替换素材…」中为至少一个片段指定「素材目录」或「单个文件」后再保存。",
+                "当前没有可保存的槽位配置。\n"
+                "请为至少一个片段配置「替换素材…」或「替换花字/贴纸…」后再保存。",
             )
             return
-        has_slot = False
-        for _k, sv in seg.items():
-            if not isinstance(sv, dict):
-                continue
-            if str(sv.get("dir", "") or "").strip() or str(sv.get("replace_file", "") or "").strip():
-                has_slot = True
-                break
-        if not has_slot:
+        if not _segment_export_pool_has_saveable_config(seg):
             messagebox.showinfo(
                 "保存预设",
-                "当前没有可保存的槽位配置。\n请在「替换素材…」中为至少一个片段指定「素材目录」或「单个文件」后再保存。",
+                "当前没有可保存的槽位配置。\n"
+                "请为至少一个片段配置「替换素材…」或「替换花字/贴纸…」后再保存。",
             )
             return
         seg = segment_export_pool_enforce_exclusive_sources(seg)
@@ -4386,8 +8671,6 @@ def run_app() -> None:
             return
         unit = int(auth_client.get_gold_cost("导出为MP4", default_cost=1))
         total_cost = unit * n_export
-        if not messagebox.askyesno("豆子确认", f"将扣除 {total_cost} 豆子。"):
-            return
         deduct_res = auth_client.record_operation(
             "导出为MP4",
             -total_cost,
@@ -4404,21 +8687,24 @@ def run_app() -> None:
             return
         refresh_auth_bar()
 
+        gen_subtitles = export_generate_subtitles.get()
+        create_child = bool(export_mp4_create_child_draft.get())
+
         for _bw in _export_busy_widgets:
             try:
                 _bw.configure(state="disabled")
             except tk.TclError:
                 pass
 
-        gen_subtitles = export_generate_subtitles.get()
-        create_child = bool(export_mp4_create_child_draft.get())
-
         def worker() -> None:
             err: Optional[Exception] = None
+            used_fx_batch: set[str] = set()
+            used_sticker_batch: set[str] = set()
             try:
                 from pyJianYingDraft import DraftFolder, ExportFramerate, ExportResolution
 
                 ctrl = wait_jianying_controller_or_launch_process(exe_path=jianying_exe_pick)
+                sanitize_replace_state_export_pool_styles(replace_state, base, name, persist=False)
                 df = DraftFolder(base) if create_child else None
                 need_refresh = False
                 last_child: Optional[str] = None
@@ -4428,10 +8714,11 @@ def run_app() -> None:
                     inplace_path: Optional[str] = None
                     if create_child:
                         assert df is not None
-                        lineage_parent = resolve_lineage_parent_for_nested_draft(base, name)
+                        lineage_parent = _export_parent_for_new_child(name)
                         child_name = _next_generated_child_name(base, lineage_parent)
                         df.duplicate_as_template(name, child_name, allow_replace=False)
                         content_json_c = os.path.join(base, child_name, "draft_content.json")
+                        _ensure_jianying_home_before_draft_json_write(ctrl)
                         seg_pool: Dict[str, Dict[str, Any]] = dict(
                             replace_state.get("segment_export_pool") or {}
                         )
@@ -4463,6 +8750,15 @@ def run_app() -> None:
                                 raise RuntimeError("从目录套素材失败：\n" + "\n".join(pool_errs[:12]))
                         elif pool_errs:
                             raise RuntimeError("套素材失败：\n" + "\n".join(pool_errs[:12]))
+                        style_slot_n = apply_segment_style_pools_or_raise(
+                            content_json_c,
+                            child_name,
+                            remapped_pool,
+                            used_fx_batch=used_fx_batch,
+                            used_sticker_batch=used_sticker_batch,
+                        )
+                        if style_slot_n > 0:
+                            print(f"[槽位花字/贴纸] {child_name}: {style_slot_n} 个片段")
                         register_child_draft(base, lineage_parent, child_name)
                         merge_remapped_pool_and_cursor_into_replace_state(
                             replace_state, remapped_pool, cursor_ints
@@ -4470,7 +8766,11 @@ def run_app() -> None:
                         draft_to_export = child_name
                     else:
                         draft_to_export = name
-                        if draft_has_any_segment_export_pool(name, replace_state.get("segment_export_pool")):
+                        has_export_pool = draft_has_any_segment_export_pool(
+                            name, replace_state.get("segment_export_pool")
+                        )
+                        need_inplace = has_export_pool
+                        if need_inplace:
                             inplace_path = os.path.join(base, name, "draft_content.json")
                             snap = _safe_read_json(inplace_path)
                             if not isinstance(snap, dict):
@@ -4478,42 +8778,55 @@ def run_app() -> None:
                                     "无法读取当前草稿的 draft_content.json，已中止导出（避免未还原的改写）。"
                                 )
                             inplace_backup = copy.deepcopy(snap)
-                            seg_pool_b: Dict[str, Dict[str, Any]] = dict(
-                                replace_state.get("segment_export_pool") or {}
-                            )
-                            raw_cur_b = dict(replace_state.get("export_pool_sequential_cursor") or {})
-                            cursor_b: Dict[str, int] = {}
-                            for k, v in raw_cur_b.items():
-                                try:
-                                    cursor_b[k] = int(v)
-                                except (TypeError, ValueError):
-                                    cursor_b[k] = 0
+                            _ensure_jianying_home_before_draft_json_write(ctrl)
                             try:
-                                ok_nb, _skb, pool_errs_b, exp_nb = apply_per_segment_export_pools_to_draft(
-                                    inplace_path,
-                                    name,
-                                    seg_pool_b,
-                                    cursor_b,
-                                )
-                                if exp_nb > 0:
-                                    if ok_nb == 0:
+                                if has_export_pool:
+                                    seg_pool_b: Dict[str, Dict[str, Any]] = dict(
+                                        replace_state.get("segment_export_pool") or {}
+                                    )
+                                    raw_cur_b = dict(replace_state.get("export_pool_sequential_cursor") or {})
+                                    cursor_b: Dict[str, int] = {}
+                                    for k, v in raw_cur_b.items():
+                                        try:
+                                            cursor_b[k] = int(v)
+                                        except (TypeError, ValueError):
+                                            cursor_b[k] = 0
+                                    ok_nb, _skb, pool_errs_b, exp_nb = apply_per_segment_export_pools_to_draft(
+                                        inplace_path,
+                                        name,
+                                        seg_pool_b,
+                                        cursor_b,
+                                    )
+                                    if exp_nb > 0:
+                                        if ok_nb == 0:
+                                            if pool_errs_b:
+                                                raise RuntimeError(
+                                                    "从目录套素材失败：\n" + "\n".join(pool_errs_b[:12])
+                                                )
+                                            raise RuntimeError(
+                                                "已有片段配置了导出素材目录，但未能替换任何槽。"
+                                                "请确认明文草稿，且各片段对应目录内有与槽类型匹配后缀的素材。"
+                                            )
                                         if pool_errs_b:
                                             raise RuntimeError(
                                                 "从目录套素材失败：\n" + "\n".join(pool_errs_b[:12])
                                             )
-                                        raise RuntimeError(
-                                            "已有片段配置了导出素材目录，但未能替换任何槽。"
-                                            "请确认明文草稿，且各片段对应目录内有与槽类型匹配后缀的素材。"
-                                        )
-                                    if pool_errs_b:
-                                        raise RuntimeError(
-                                            "从目录套素材失败：\n" + "\n".join(pool_errs_b[:12])
-                                        )
-                                elif pool_errs_b:
-                                    raise RuntimeError("套素材失败：\n" + "\n".join(pool_errs_b[:12]))
-                                merge_remapped_pool_and_cursor_into_replace_state(
-                                    replace_state, seg_pool_b, cursor_b
+                                    elif pool_errs_b:
+                                        raise RuntimeError("套素材失败：\n" + "\n".join(pool_errs_b[:12]))
+                                    merge_remapped_pool_and_cursor_into_replace_state(
+                                        replace_state, seg_pool_b, cursor_b
+                                    )
+                                style_slot_n = apply_segment_style_pools_or_raise(
+                                    inplace_path,
+                                    name,
+                                    seg_pool_b if has_export_pool else dict(
+                                        replace_state.get("segment_export_pool") or {}
+                                    ),
+                                    used_fx_batch=used_fx_batch,
+                                    used_sticker_batch=used_sticker_batch,
                                 )
+                                if style_slot_n > 0:
+                                    print(f"[槽位花字/贴纸] {name}: {style_slot_n} 个片段")
                             except Exception:
                                 try:
                                     if inplace_backup is not None and inplace_path:
@@ -4679,12 +8992,15 @@ def run_app() -> None:
         def worker_gen() -> None:
             err: Optional[Exception] = None
             created: List[str] = []
+            used_fx_batch: set[str] = set()
+            used_sticker_batch: set[str] = set()
             try:
                 from pyJianYingDraft import DraftFolder
 
+                sanitize_replace_state_export_pool_styles(replace_state, base, name, persist=False)
                 df = DraftFolder(base)
                 for _i in range(n_gen):
-                    lineage_parent = resolve_lineage_parent_for_nested_draft(base, name)
+                    lineage_parent = _export_parent_for_new_child(name)
                     child_name = _next_generated_child_name(base, lineage_parent)
                     df.duplicate_as_template(name, child_name, allow_replace=False)
                     content_json_c = os.path.join(base, child_name, "draft_content.json")
@@ -4717,6 +9033,15 @@ def run_app() -> None:
                             raise RuntimeError("从目录套素材失败：\n" + "\n".join(pool_errs[:12]))
                     elif pool_errs:
                         raise RuntimeError("套素材失败：\n" + "\n".join(pool_errs[:12]))
+                    style_slot_n = apply_segment_style_pools_or_raise(
+                        content_json_c,
+                        child_name,
+                        remapped_pool,
+                        used_fx_batch=used_fx_batch,
+                        used_sticker_batch=used_sticker_batch,
+                    )
+                    if style_slot_n > 0:
+                        print(f"[槽位花字/贴纸] {child_name}: {style_slot_n} 个片段")
                     register_child_draft(base, lineage_parent, child_name)
                     merge_remapped_pool_and_cursor_into_replace_state(replace_state, remapped_pool, cursor_ints)
                     created.append(child_name)
@@ -4750,19 +9075,69 @@ def run_app() -> None:
     def on_replace_material_bar() -> None:
         from tkinter import messagebox
 
+        if timeline_select.get("kind") == "track":
+            track_refs = timeline_select.get("track_style_refs")
+            if isinstance(track_refs, list) and track_refs:
+                od = replace_state.get("_open_style_dialog")
+                if callable(od):
+                    od(
+                        track_refs[0],
+                        batch_refs=track_refs,
+                        track_summary=str(timeline_select.get("track_summary") or ""),
+                    )
+                return
+
         ref = timeline_select.get("replace_ref")
-        if not ref:
-            messagebox.showinfo("替换素材", "请先在时间轴上点击选中一个可替换的音视频片段。")
+        style_ref = timeline_select.get("style_ref")
+        if style_ref is None and timeline_select.get("kind") == "seg":
+            raw = timeline_content_cache[0]
+            if isinstance(raw, dict):
+                try:
+                    ti = int(timeline_select["ti"])
+                    oi = int(timeline_select["orig_i"])
+                    tracks_sorted = sorted(list(raw.get("tracks") or []), key=_track_render_index, reverse=True)
+                    if 0 <= ti < len(tracks_sorted):
+                        style_ref = _style_segment_ref_from_timeline(raw, tracks_sorted[ti], oi)
+                except (TypeError, KeyError, ValueError):
+                    pass
+        if ref:
+            od = replace_state.get("_open_replace_dialog")
+            if callable(od):
+                od(ref)
             return
-        od = replace_state.get("_open_replace_dialog")
-        if not callable(od):
+        if style_ref:
+            od = replace_state.get("_open_style_dialog")
+            if callable(od):
+                od(style_ref)
             return
-        od(ref)
+        messagebox.showinfo(
+            "替换",
+            "请先在时间轴上点击选中一个可替换的音视频片段，或选中字幕/贴纸轨道名称后配置花字/贴纸。",
+        )
 
     def sync_replace_material_bar_btn() -> None:
+        track_refs = (
+            timeline_select.get("track_style_refs")
+            if timeline_select.get("kind") == "track"
+            else None
+        )
         ref = timeline_select.get("replace_ref")
+        style_ref = timeline_select.get("style_ref")
+        if style_ref is None and timeline_select.get("kind") == "seg":
+            raw = timeline_content_cache[0]
+            if isinstance(raw, dict):
+                try:
+                    ti = int(timeline_select["ti"])
+                    oi = int(timeline_select["orig_i"])
+                    tracks_sorted = sorted(list(raw.get("tracks") or []), key=_track_render_index, reverse=True)
+                    if 0 <= ti < len(tracks_sorted):
+                        style_ref = _style_segment_ref_from_timeline(raw, tracks_sorted[ti], oi)
+                        if style_ref is not None:
+                            timeline_select["style_ref"] = style_ref
+                except (TypeError, KeyError, ValueError):
+                    pass
         ok = bool(
-            ref is not None
+            (ref is not None or style_ref is not None or track_refs)
             and replace_state.get("content_ok")
             and not replace_state.get("encrypted")
             and (selected_name or "").strip()
@@ -4823,8 +9198,21 @@ def run_app() -> None:
                         locate_timeout=3.0,
                     )
                 else:
-                    if not launch_jianying_pro(jy_exe):
-                        raise OSError("无法启动剪映。")
+                    from pyJianYingDraft.jianying_controller import (
+                        jianying_pids_for_executable,
+                        wait_for_jianying_controller,
+                    )
+
+                    if not jianying_pids_for_executable(jy_exe):
+                        if not start_jianying_pro_process(jy_exe):
+                            raise OSError("无法启动剪映。")
+                    else:
+                        try:
+                            wait_for_jianying_controller(timeout=8.0, poll=0.4, exe_path=jy_exe)
+                        except AutomationError:
+                            if not start_jianying_pro_process(jy_exe):
+                                raise OSError("无法启动剪映。")
+                            wait_for_jianying_controller(timeout=60.0, poll=0.5, exe_path=jy_exe)
             except DraftNotFound:
                 err = (
                     f"剪映首页未找到草稿「{draft_open}」。\n"
@@ -4869,7 +9257,7 @@ def run_app() -> None:
 
     replace_material_bar_btn = ctk.CTkButton(
         export_actions,
-        text="替换素材…",
+        text="替换…",
         height=34,
         width=112,
         state="disabled",
@@ -4950,7 +9338,7 @@ def run_app() -> None:
         variable=export_mp4_create_child_draft,
         font=ctk.CTkFont(size=12),
     )
-    mp4_child_chk.pack(side="left")
+    mp4_child_chk.pack(side="left", padx=(0, 18))
     _export_busy_widgets.extend([backup_chk, gen_sub_chk, mp4_child_chk])
 
     draft_buttons: List[Any] = []
@@ -5166,12 +9554,13 @@ def run_app() -> None:
     def highlight_selection() -> None:
         for b in draft_buttons:
             kn = getattr(b, "_row_kind", "leaf")
+            base_fg = getattr(b, "_base_fg", _DRAFT_LIST_COLORS.get(kn, _DRAFT_LIST_COLORS["leaf"])[0])
             if b._name == selected_name:  # type: ignore[attr-defined]
-                b.configure(fg_color=("#3B8ED0", "#1F538D"))
-            elif kn == "parent":
-                b.configure(fg_color=("gray78", "gray22"), hover_color=("gray68", "gray32"))
+                b._selected = True  # type: ignore[attr-defined]
+                b.configure(fg_color=_DRAFT_LIST_COLORS["selected"][0])
             else:
-                b.configure(fg_color=("gray80", "gray20"), hover_color=("gray70", "gray30"))
+                b._selected = False  # type: ignore[attr-defined]
+                b.configure(fg_color=base_fg)
 
     def show_draft(folder_name: str) -> None:
         nonlocal selected_name
@@ -5182,6 +9571,7 @@ def run_app() -> None:
             detail.delete("1.0", "end")
             detail.insert("1.0", "请先设置有效的草稿根目录。")
             replace_state["refs"] = []
+            replace_state["style_refs"] = []
             replace_state["encrypted"] = False
             replace_state["content_ok"] = False
             replace_state["timeline_draft_name"] = ""
@@ -5194,6 +9584,7 @@ def run_app() -> None:
         detail.insert("1.0", "\n".join(summary.lines))
 
         replace_state["refs"] = []
+        replace_state["style_refs"] = []
         content_path = os.path.join(dpath, "draft_content.json")
         encrypted = _file_exists_nonempty(content_path) and _looks_like_jianying_encrypted(content_path)
         replace_state["encrypted"] = encrypted
@@ -5202,6 +9593,7 @@ def run_app() -> None:
         if summary.content_ok and _file_exists_nonempty(content_path) and not encrypted:
             raw_timeline = _safe_read_json(content_path)
             if raw_timeline:
+                replace_state["style_refs"] = list_style_segments_from_content(raw_timeline)
                 try:
                     from pyJianYingDraft.script_file import ScriptFile
 
@@ -5240,6 +9632,7 @@ def run_app() -> None:
         draft_buttons = []
         selected_name = None
         replace_state["refs"] = []
+        replace_state["style_refs"] = []
         replace_state["encrypted"] = False
         replace_state["content_ok"] = False
         replace_state["timeline_draft_name"] = ""
@@ -5277,28 +9670,26 @@ def run_app() -> None:
 
         def add_leaf_button(container: Any, folder_name: str, *, indent: int) -> None:
             pad_l = 12 + max(0, indent)
-            b = ctk.CTkButton(
+            wrap = _draft_list_item_wraplength(indent=indent)
+            b = _make_draft_list_click_box(
                 container,
-                text=folder_name,
-                anchor="w",
-                height=32,
-                fg_color=("gray80", "gray20"),
-                hover_color=("gray70", "gray30"),
-                command=lambda n=folder_name: show_draft(n),
+                folder_name,
+                row_kind="leaf",
+                on_click=lambda n=folder_name: show_draft(n),
+                wraplength=wrap,
             )
             b.pack(fill="x", pady=2, padx=(pad_l, 4))
-            b._name = folder_name  # type: ignore[attr-defined]
-            b._row_kind = "leaf"  # type: ignore[attr-defined]
             draft_buttons.append(b)
 
-        for name in top_level:
-            children = list(by_parent.get(name) or [])
+        def render_draft_subtree(folder_name: str, *, indent: int) -> None:
+            """递归展示父子草稿（支持 A → A_1 → A_1_1 等多级）。"""
+            children = list(by_parent.get(folder_name) or [])
             if children:
-                expanded = name not in collapsed_parents
+                expanded = folder_name not in collapsed_parents
                 row = ctk.CTkFrame(list_frame, fg_color="transparent")
-                row.pack(fill="x", pady=2, padx=4)
+                row.pack(fill="x", pady=2, padx=(4 + max(0, indent), 4))
 
-                def _mk_toggle(pn: str = name) -> Any:
+                def _mk_toggle(pn: str = folder_name) -> Any:
                     def _inner() -> None:
                         if pn in collapsed_parents:
                             collapsed_parents.discard(pn)
@@ -5319,41 +9710,28 @@ def run_app() -> None:
                 ).pack(side="left", padx=(0, 4))
                 mid = ctk.CTkFrame(row, fg_color="transparent")
                 mid.pack(side="left", fill="x", expand=True)
-                mid.grid_columnconfigure(0, weight=1)
-                pb = ctk.CTkButton(
-                    mid,
-                    text=name,
-                    anchor="w",
-                    height=32,
-                    fg_color=("gray78", "gray22"),
-                    hover_color=("gray68", "gray32"),
-                    command=lambda n=name: show_draft(n),
-                )
-                pb.grid(row=0, column=0, sticky="ew")
                 n_sub = len(children)
-                cnt_lbl = ctk.CTkLabel(
+                wrap = _draft_list_item_wraplength(indent=indent, reserved_right=36)
+                pb = _make_draft_list_click_box(
                     mid,
-                    text=f"· {n_sub} 个子稿",
-                    font=ctk.CTkFont(size=11),
-                    text_color=("gray48", "gray58"),
-                    anchor="e",
+                    folder_name,
+                    row_kind="parent",
+                    on_click=lambda n=folder_name: show_draft(n),
+                    wraplength=wrap,
+                    subtitle=f"· {n_sub} 个子稿",
                 )
-                cnt_lbl.grid(row=0, column=1, sticky="e", padx=(6, 2))
-                cnt_lbl.bind("<Button-1>", lambda _e, n=name: show_draft(n))
-                cnt_lbl.bind("<Enter>", lambda _e: cnt_lbl.configure(cursor="hand2"))
-                cnt_lbl.bind("<Leave>", lambda _e: cnt_lbl.configure(cursor=""))
-                pb._name = name  # type: ignore[attr-defined]
-                pb._row_kind = "parent"  # type: ignore[attr-defined]
+                pb.pack(fill="x")
                 draft_buttons.append(pb)
 
                 if expanded:
                     ch_sorted = sorted(children, key=lambda c: _draft_list_sort_key(base, c), reverse=True)
-                    ch_frame = ctk.CTkFrame(list_frame, fg_color="transparent")
-                    ch_frame.pack(fill="x", padx=(4, 4))
                     for ch in ch_sorted:
-                        add_leaf_button(ch_frame, ch, indent=8)
+                        render_draft_subtree(ch, indent=indent + 8)
             else:
-                add_leaf_button(list_frame, name, indent=0)
+                add_leaf_button(list_frame, folder_name, indent=indent)
+
+        for name in top_level:
+            render_draft_subtree(name, indent=0)
 
         if prev_selected and os.path.isdir(os.path.join(base, prev_selected)):
             show_draft(prev_selected)
@@ -5390,6 +9768,32 @@ def run_app() -> None:
         path_entry.insert(0, draft_root.get())
     refresh_list()
     refresh_export_pool_preset_bar(reset_memory=True)
+    try:
+        sync_harvested_text_effects_to_pool_file()
+    except OSError:
+        try:
+            ensure_text_effect_pool_template_file()
+        except OSError:
+            pass
+    try:
+        _st_added, _st_pruned, _st_path = sync_harvested_stickers_to_pool_file()
+        if _st_pruned > 0:
+            print(f"[贴纸] 启动：已从配置文件清理 {_st_pruned} 个无效 id")
+    except OSError:
+        try:
+            ensure_sticker_pool_template_file()
+        except OSError:
+            pass
+    try:
+        print_text_effect_pool_startup_summary()
+        rep_st = build_sticker_pool_report(resync=False)
+        print(
+            f"[贴纸] 启动：可用 {rep_st.get('valid_count', 0)} 个"
+            f"（配置 {rep_st.get('listed_count', 0)} 个 id）"
+        )
+        print(f"[贴纸] 配置：{rep_st.get('pool_path', '')}")
+    except OSError:
+        pass
 
     from tkinter import messagebox as _mb_startup
 

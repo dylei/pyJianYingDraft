@@ -60,6 +60,8 @@ class VideoMaterial:
     """素材高度"""
     width: int
     """素材宽度"""
+    rotation: float
+    """视频容器旋转元数据（度），常见手机竖拍为 90 或 270"""
     crop_settings: CropSettings
     """素材裁剪设置"""
     material_type: Literal["video", "photo"]
@@ -87,6 +89,7 @@ class VideoMaterial:
         self.path = path
         self.crop_settings = crop_settings
         self.local_material_id = ""
+        self.rotation = 0.0
 
         if not pymediainfo.MediaInfo.can_parse():
             raise ValueError(f"不支持的视频素材类型 '{postfix}'")
@@ -95,9 +98,16 @@ class VideoMaterial:
             pymediainfo.MediaInfo.parse(path, mediainfo_options={"File_TestContinuousFileNames": "0"})  # type: ignore
         # 有视频轨道的视为视频素材
         if len(info.video_tracks):
+            vt = info.video_tracks[0]
             self.material_type = "video"
-            self.duration = int(info.video_tracks[0].duration * 1e3)  # type: ignore
-            self.width, self.height = info.video_tracks[0].width, info.video_tracks[0].height  # type: ignore
+            self.duration = int(vt.duration * 1e3)  # type: ignore
+            self.width, self.height = vt.width, vt.height  # type: ignore
+            rot = getattr(vt, "rotation", None)
+            if rot is not None:
+                try:
+                    self.rotation = float(rot)
+                except (TypeError, ValueError):
+                    self.rotation = 0.0
         # gif文件使用imageio库获取长度
         elif postfix.lower() == ".gif":
             import imageio
