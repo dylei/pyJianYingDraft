@@ -1,5 +1,6 @@
 pymediainfo
 imageio
+opencv-python-headless
 uiautomation>=2
 Send2Trash>=1.8
 customtkinter>=5.2
