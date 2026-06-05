@@ -505,6 +505,7 @@ class DraftSummary:
     meta_ok: bool
     content_ok: bool
     lines: List[str]
+    content: Optional[Dict[str, Any]] = None
 
 
 def summarize_draft(draft_dir: str) -> DraftSummary:
@@ -546,7 +547,7 @@ def summarize_draft(draft_dir: str) -> DraftSummary:
             lines.append("draft_content.json: 无法解析为 JSON。")
         else:
             lines.append("draft_content.json: 文件不存在。")
-        return DraftSummary(name, draft_dir, meta is not None, False, lines)
+        return DraftSummary(name, draft_dir, meta is not None, False, lines, content=None)
 
     cc = content.get("canvas_config") or {}
     w, h = cc.get("width"), cc.get("height")
@@ -600,7 +601,7 @@ def summarize_draft(draft_dir: str) -> DraftSummary:
     if not vids and not auds:
         lines.append("（未在 materials 中发现带 path 的视频/音频；可能为内置素材或结构不同）")
 
-    return DraftSummary(name, draft_dir, meta is not None, True, lines)
+    return DraftSummary(name, draft_dir, meta is not None, True, lines, content=content)
 
 
 def _fmt_tc_us(start_us: int, end_us: int) -> str:
@@ -5152,6 +5153,8 @@ class PreviewAudioLayer:
     render_index: int
     label: str
     speed: float = 1.0
+    timeline_remaining_us: int = 0
+    volume: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -5192,6 +5195,23 @@ def _segment_source_us_at_playhead(seg: Dict[str, Any], playhead_us: int) -> Opt
     else:
         src_us = src_start + off
     return max(0, src_us)
+
+
+def _segment_timeline_remaining_us(seg: Dict[str, Any], playhead_us: int) -> int:
+    """片段在时间轴上还剩多少微秒（用于限制预览音频播放时长）。"""
+    trng = seg.get("target_timerange") or {}
+    try:
+        st = int(trng.get("start", 0))
+        du = int(trng.get("duration", 0))
+    except (TypeError, ValueError):
+        return 0
+    if du <= 0:
+        return 0
+    end_us = st + du
+    ph = max(0, int(playhead_us))
+    if ph >= end_us:
+        return 0
+    return max(0, end_us - ph)
 
 
 def _segment_speed(seg: Dict[str, Any]) -> float:
@@ -5255,9 +5275,9 @@ def _ffplay_audio_seek_args(path_abs: str, sec: float) -> List[str]:
 def _ffplay_audio_args(layer: PreviewAudioLayer, path_abs: str, sec: float) -> List[str]:
     args: List[str] = ["-nodisp", "-autoexit", "-loglevel", "quiet"]
     args.extend(_ffplay_audio_seek_args(path_abs, sec))
-    af = _atempo_filter_for_speed(layer.speed)
-    if af:
-        args.extend(["-af", af])
+    af_parts = _ffmpeg_audio_post_filters(layer)
+    if af_parts:
+        args.extend(["-af", ",".join(af_parts)])
     return args
 
 
@@ -5411,6 +5431,9 @@ def find_audio_layers_at_playhead(content: Dict[str, Any], playhead_us: int) -> 
                     source_us=src_us,
                     render_index=ri,
                     label=_timeline_segment_label(seg, materials),
+                    speed=_segment_audio_playback_rate(seg),
+                    timeline_remaining_us=_segment_timeline_remaining_us(seg, ph),
+                    volume=_preview_playback_volume(seg),
                 )
             )
     audios.sort(key=lambda a: a.render_index)
@@ -5441,6 +5464,23 @@ def _segment_volume(seg: Dict[str, Any]) -> float:
     except (TypeError, ValueError):
         vol = 1.0
     return max(0.0, vol)
+
+
+def _preview_playback_volume(seg: Dict[str, Any]) -> float:
+    """片段音量（与后台混音预览一致，剪映常见 0~8 线性倍率）。"""
+    return max(0.0, min(8.0, _segment_volume(seg)))
+
+
+def _ffmpeg_audio_post_filters(layer: PreviewAudioLayer) -> List[str]:
+    """atempo + volume，供 ffplay -af 或 ffmpeg filter_complex 链接。"""
+    parts: List[str] = []
+    af = _atempo_filter_for_speed(layer.speed)
+    if af:
+        parts.extend(af.split(","))
+    vol = max(0.0, min(8.0, float(layer.volume)))
+    if abs(vol - 1.0) >= 0.001:
+        parts.append(f"volume={vol:.4f}")
+    return parts
 
 
 def _draft_config_video_mute(content: Dict[str, Any]) -> bool:
@@ -5495,6 +5535,7 @@ def _append_playback_audio_hit(
     render_index: int,
     label: str,
     kind: str,
+    playhead_us: int,
 ) -> None:
     identity = _segment_playback_identity(seg, path, kind=kind)
     if identity in seen:
@@ -5508,6 +5549,8 @@ def _append_playback_audio_hit(
                 render_index=render_index,
                 label=label,
                 speed=_segment_audio_playback_rate(seg),
+                timeline_remaining_us=_segment_timeline_remaining_us(seg, playhead_us),
+                volume=_preview_playback_volume(seg),
             ),
             identity,
         )
@@ -5559,6 +5602,7 @@ def _playback_audio_hits(
                 render_index=ri,
                 label=_timeline_segment_label(seg, materials),
                 kind=ttype,
+                playhead_us=ph,
             )
 
     hits.sort(key=lambda item: (item[0].render_index, item[1]))
@@ -5603,9 +5647,69 @@ def kill_playback_audio_procs(procs: Optional[List[subprocess.Popen]]) -> None:
             _terminate_subprocess(proc)
 
 
+def _ffmpeg_playback_layer_filter(index: int, layer: PreviewAudioLayer) -> str:
+    """单轨：源素材精确 atrim + atempo + volume，输出时长与时间轴片段剩余一致。"""
+    sec = max(0.0, layer.source_us / 1_000_000.0)
+    src_span = max(0.001, (layer.timeline_remaining_us / 1_000_000.0) * layer.speed)
+    end_sec = sec + src_span
+    chain = f"[{index}:a]atrim=start={sec:.6f}:end={end_sec:.6f},asetpts=PTS-STARTPTS"
+    for filt in _ffmpeg_audio_post_filters(layer):
+        chain += f",{filt}"
+    return f"{chain}[a{index}]"
+
+
+def _spawn_playback_audio_mixed_pipe(
+    playable: List[PreviewAudioLayer],
+    *,
+    ffplay: str,
+    ffmpeg: str,
+    devnull: Any,
+) -> List[subprocess.Popen]:
+    """ffmpeg 混音 → 单路 ffplay，避免多 ffplay 启动时差。"""
+    cmd: List[str] = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+    for layer in playable:
+        cmd.extend(["-i", os.path.abspath(layer.path)])
+    n = len(playable)
+    filters = [_ffmpeg_playback_layer_filter(i, layer) for i, layer in enumerate(playable)]
+    if n == 1:
+        cmd.extend(["-filter_complex", filters[0], "-map", "[a0]"])
+    else:
+        ins = "".join(f"[a{i}]" for i in range(n))
+        filters.append(f"{ins}amix=inputs={n}:duration=longest:dropout_transition=0[aout]")
+        cmd.extend(["-filter_complex", ";".join(filters), "-map", "[aout]"])
+    cmd.extend(["-vn", "-f", "wav", "pipe:1"])
+    ffmpeg_proc = None
+    try:
+        ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=devnull)
+        ffplay_proc = subprocess.Popen(
+            [
+                ffplay,
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "quiet",
+                "-i",
+                "pipe:0",
+            ],
+            stdin=ffmpeg_proc.stdout,
+            stdout=devnull,
+            stderr=subprocess.PIPE,
+        )
+        if ffmpeg_proc.stdout is not None:
+            ffmpeg_proc.stdout.close()
+        return [ffmpeg_proc, ffplay_proc]
+    except OSError:
+        kill_playback_audio_procs([ffmpeg_proc] if ffmpeg_proc is not None else [])
+        return []
+
+
 def spawn_playback_audio(layers: Tuple[PreviewAudioLayer, ...]) -> List[subprocess.Popen]:
-    """启动单路或多路混音播放（精确 atrim seek → ffplay）；返回需随后终止的子进程。"""
-    playable = [layer for layer in layers if layer.path and os.path.isfile(layer.path)]
+    """单路混音播放：ffmpeg atrim 精确 seek + 片段剩余时长，pipe 进一个 ffplay。"""
+    playable = [
+        layer
+        for layer in layers
+        if layer.path and os.path.isfile(layer.path) and layer.timeline_remaining_us > 0
+    ]
     if not playable:
         return []
 
@@ -5613,116 +5717,88 @@ def spawn_playback_audio(layers: Tuple[PreviewAudioLayer, ...]) -> List[subproce
     ffmpeg = find_ffmpeg()
     devnull = subprocess.DEVNULL
 
+    if ffmpeg and ffplay:
+        procs = _spawn_playback_audio_mixed_pipe(
+            playable, ffplay=ffplay, ffmpeg=ffmpeg, devnull=devnull
+        )
+        if procs:
+            return procs
+
     if len(playable) == 1 and ffplay:
         layer = playable[0]
         sec = max(0.0, layer.source_us / 1_000_000.0)
+        timeline_sec = max(0.001, layer.timeline_remaining_us / 1_000_000.0)
         path_abs = os.path.abspath(layer.path)
+        args: List[str] = [
+            "-nodisp",
+            "-autoexit",
+            "-loglevel",
+            "quiet",
+            "-t",
+            f"{timeline_sec:.6f}",
+        ]
+        args.extend(_ffplay_audio_seek_args(path_abs, sec))
+        af_parts = _ffmpeg_audio_post_filters(layer)
+        if af_parts:
+            args.extend(["-af", ",".join(af_parts)])
         try:
-            proc = subprocess.Popen(
-                [ffplay, *_ffplay_audio_args(layer, path_abs, sec)],
-                stdout=devnull,
-                stderr=devnull,
-            )
+            proc = subprocess.Popen([ffplay, *args], stdout=devnull, stderr=subprocess.PIPE)
         except OSError:
             return []
         return [proc]
 
-    # 多轨：Windows 下 wav pipe 混音不稳定，用多路 ffplay 精确 seek（系统混音）
-    if len(playable) >= 2 and ffplay:
-        procs: List[subprocess.Popen] = []
-        for layer in playable:
-            sec = max(0.0, layer.source_us / 1_000_000.0)
-            path_abs = os.path.abspath(layer.path)
-            try:
-                procs.append(
-                    subprocess.Popen(
-                        [ffplay, *_ffplay_audio_args(layer, path_abs, sec)],
-                        stdout=devnull,
-                        stderr=devnull,
-                    )
-                )
-            except OSError:
-                kill_playback_audio_procs(procs)
-                return []
-        return procs
+    return []
 
-    if ffmpeg and ffplay:
-        cmd: List[str] = [ffmpeg, "-hide_banner", "-loglevel", "error"]
-        for layer in playable:
-            cmd.extend(["-i", os.path.abspath(layer.path)])
-        n = len(playable)
-        if n == 1:
-            sec = max(0.0, playable[0].source_us / 1_000_000.0)
-            cmd.extend(
-                [
-                    "-af",
-                    f"atrim=start={sec:.6f},asetpts=PTS-STARTPTS",
-                    "-vn",
-                    "-f",
-                    "wav",
-                    "pipe:1",
-                ]
-            )
-        else:
-            parts: List[str] = []
-            for i, layer in enumerate(playable):
-                sec = max(0.0, layer.source_us / 1_000_000.0)
-                parts.append(f"[{i}:a]atrim=start={sec:.6f},asetpts=PTS-STARTPTS[a{i}]")
-            ins = "".join(f"[a{i}]" for i in range(n))
-            parts.append(f"{ins}amix=inputs={n}:duration=longest:dropout_transition=0[aout]")
-            cmd.extend(
-                [
-                    "-filter_complex",
-                    ";".join(parts),
-                    "-map",
-                    "[aout]",
-                    "-f",
-                    "wav",
-                    "pipe:1",
-                ]
-            )
-        ffmpeg_proc = None
-        try:
-            ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=devnull)
-            ffplay_proc = subprocess.Popen(
-                [
-                    ffplay,
-                    "-nodisp",
-                    "-autoexit",
-                    "-loglevel",
-                    "quiet",
-                    "-i",
-                    "pipe:0",
-                ],
-                stdin=ffmpeg_proc.stdout,
-                stdout=devnull,
-                stderr=devnull,
-            )
-            if ffmpeg_proc.stdout is not None:
-                ffmpeg_proc.stdout.close()
-            return [ffmpeg_proc, ffplay_proc]
-        except OSError:
-            kill_playback_audio_procs([ffmpeg_proc] if ffmpeg_proc is not None else [])
-            return []
 
-    if not ffplay:
-        return []
-    procs: List[subprocess.Popen] = []
-    for layer in playable:
-        sec = max(0.0, layer.source_us / 1_000_000.0)
-        path_abs = os.path.abspath(layer.path)
+# ffplay 周期性刷新 stderr 状态行；aq=NNKB（NN>0）表示音频队列已有数据（开始缓冲/播放）
+_FFPLAY_AUDIO_QUEUE_RE = re.compile(r"aq=\s*[1-9]\d*KB", re.I)
+
+
+def watch_ffplay_audio_output_ready(
+    proc: subprocess.Popen,
+    on_ready: Callable[[], None],
+    *,
+    timeout_sec: float = 2.5,
+) -> None:
+    """后台读 ffplay stderr，见到音频队列非空即回调 on_ready（须在 UI 线程再改状态）。"""
+    if proc is None:
+        on_ready()
+        return
+
+    fired = threading.Event()
+
+    def _fire() -> None:
+        if fired.is_set():
+            return
+        fired.set()
+        on_ready()
+
+    stderr = proc.stderr
+    if stderr is None:
+        def _fallback() -> None:
+            time.sleep(min(0.15, timeout_sec * 0.1))
+            _fire()
+
+        threading.Thread(target=_fallback, daemon=True, name="ffplay-ready-fallback").start()
+        return
+
+    def _reader() -> None:
+        deadline = time.time() + timeout_sec
         try:
-            procs.append(
-                subprocess.Popen(
-                    [ffplay, *_ffplay_audio_args(layer, path_abs, sec)],
-                    stdout=devnull,
-                    stderr=devnull,
-                )
-            )
+            while time.time() < deadline and proc.poll() is None:
+                raw = stderr.readline()
+                if not raw:
+                    break
+                text = raw.decode("utf-8", errors="replace")
+                if _FFPLAY_AUDIO_QUEUE_RE.search(text):
+                    _fire()
+                    return
         except OSError:
-            kill_playback_audio_procs(procs)
-            return []
-    return procs
+            pass
+        if proc.poll() is None:
+            _fire()
+
+    threading.Thread(target=_reader, daemon=True, name="ffplay-ready-watch").start()
 
 
 # --- 预览：临时低规格多轨合并（从 playhead 起窗口内一次 ffmpeg 出片，单文件播放对齐时间轴）---
@@ -5731,11 +5807,15 @@ PREVIEW_MERGE_PREFETCH_LEAD_US = 4_000_000  # 距段末 4s 开始后台渲下一
 PREVIEW_MERGE_WINDOW_US = PREVIEW_MERGE_CHUNK_US
 PREVIEW_MERGE_CACHE_MAX_AGE_SEC = 7200  # 启动时清除超过 2h 的临时预览
 PREVIEW_MERGE_WIDTH = 480  # 合成宽度；最终仍可按 PREVIEW_MAX_WIDTH 缩小显示
-PREVIEW_MERGE_ENABLED = True
+PREVIEW_MERGE_ENABLED = False
 PREVIEW_MERGE_MIN_TRIM_US = 80_000  # trim 最短 80ms，避免 aac 收不到 packet
-# ffplay 解码/声卡缓冲相对 wall clock 的滞后；字幕查表时略往回对齐听到的内容
-PREVIEW_MERGE_SUBTITLE_LAG_US = 120_000
-PREVIEW_MERGE_SYNC_HOLD_MS = 220  # 合成段切换/首播时等 ffplay 出声再开时钟
+PREVIEW_MERGE_FFPLAY_TITLE_PREFIX = "jyDraftPrev_"
+PREVIEW_SUB_BAR_HEIGHT = 100  # ffplay 播放时底部字幕条高度
+PREVIEW_MERGE_SUBTITLE_LAG_US = 0
+PREVIEW_MERGE_SYNC_HOLD_MS = 180
+PREVIEW_AUDIO_CHUNK_US = 8_000_000
+PREVIEW_AUDIO_PREFETCH_LEAD_US = 2_000_000
+PREVIEW_AUDIO_LATE_ATTACH_US = 250_000
 
 
 def _preview_merge_chunk_end_us(content: Dict[str, Any], t0_us: int, window_us: int) -> int:
@@ -5829,6 +5909,156 @@ def _preview_merge_cache_usable(path: Path) -> bool:
     except OSError:
         return False
     return _ffmpeg_input_has_stream(str(path), "video")
+
+
+def _preview_audio_cache_path(
+    content: Dict[str, Any],
+    t0_us: int,
+    window_us: int,
+) -> Path:
+    fp = _preview_content_fingerprint(content)
+    bucket = int(max(0, t0_us) // 100_000)
+    name = f"a_{fp}_{bucket}_{window_us // 1_000_000}.m4a"
+    return _preview_merge_cache_dir() / name
+
+
+def _preview_audio_cache_usable(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size < 256:
+            return False
+    except OSError:
+        return False
+    return _ffmpeg_input_has_stream(str(path), "audio")
+
+
+def _build_preview_audio_window_ffmpeg_cmd(
+    content: Dict[str, Any],
+    t0_us: int,
+    window_us: int,
+    out_path: str,
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    """构建时间轴窗口 [t0, t0+window] 的混音（adelay 对齐时间轴 T，仅音频）。"""
+    ff = find_ffmpeg()
+    if not ff:
+        return None, "未找到 ffmpeg"
+    t0 = max(0, int(t0_us))
+    t1 = min(int(t0 + window_us), _timeline_end_us(content))
+    if t1 <= t0:
+        return None, "音频窗口无效"
+    window_sec = (t1 - t0) / 1_000_000.0
+    a_clips = _collect_preview_audio_clips(content, t0, t1)
+
+    cmd: List[str] = [ff, "-hide_banner", "-loglevel", "error", "-y"]
+    a_filters: List[str] = []
+    ai = 0
+    for clip in a_clips:
+        if clip.timeline_offset_us >= int(window_us):
+            continue
+        if not _ffmpeg_input_has_stream(clip.path, "audio"):
+            continue
+        delay_ms = max(0, int(clip.timeline_offset_us // 1000))
+        if delay_ms >= int(window_sec * 1000):
+            continue
+        idx, fine = _ffmpeg_add_seek_input(cmd, clip.path, clip.source_start_us)
+        src_dur_sec = clip.source_duration_us / 1_000_000.0
+        vol = max(0.0, min(8.0, clip.volume))
+        chain = (
+            f"[{idx}:a]atrim=start={fine:.6f}:duration={src_dur_sec:.6f},"
+            f"asetpts=PTS-STARTPTS{_atempo_chain_suffix(clip.playback_rate)},"
+            f"volume={vol:.4f},adelay={delay_ms}|{delay_ms},"
+            f"aformat=sample_fmts=fltp:channel_layouts=mono:sample_rates=22050[pa{ai}]"
+        )
+        a_filters.append(chain)
+        ai += 1
+
+    if ai == 1:
+        a_out_label = "[pa0]"
+    elif ai > 1:
+        ins = "".join(f"[pa{i}]" for i in range(ai))
+        a_filters.append(
+            f"{ins}amix=inputs={ai}:duration=longest:dropout_transition=0,"
+            f"aformat=sample_fmts=fltp:channel_layouts=mono:sample_rates=22050[aout]"
+        )
+        a_out_label = "[aout]"
+    if ai == 0:
+        cmd.extend(["-f", "lavfi", "-i", f"anullsrc=r=22050:cl=mono:d={window_sec:.3f}"])
+        cmd.extend(
+            [
+                "-map",
+                "0:a",
+                "-t",
+                f"{window_sec:.6f}",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+                "-ar",
+                "22050",
+                "-ac",
+                "1",
+                out_path,
+            ]
+        )
+        return cmd, None
+
+    cmd.extend(
+        [
+            "-filter_complex",
+            ";".join(a_filters),
+            "-map",
+            a_out_label,
+            "-t",
+            f"{window_sec:.6f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "64k",
+            "-ar",
+            "22050",
+            "-ac",
+            "1",
+            out_path,
+        ]
+    )
+    return cmd, None
+
+
+def render_preview_audio_window(
+    content: Dict[str, Any],
+    t0_us: int,
+    *,
+    window_us: int = PREVIEW_AUDIO_CHUNK_US,
+) -> Tuple[Optional[str], Optional[str]]:
+    """按时间轴混音渲染预览音频段；命中缓存则秒开。"""
+    cache_path = _preview_audio_cache_path(content, t0_us, window_us)
+    if _preview_audio_cache_usable(cache_path):
+        return str(cache_path), None
+    part = cache_path.with_suffix(".part.m4a")
+    try:
+        if part.is_file():
+            part.unlink()
+    except OSError:
+        pass
+    cmd, err = _build_preview_audio_window_ffmpeg_cmd(content, t0_us, window_us, str(part))
+    if not cmd:
+        return None, err or "无法构建音频命令"
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=max(60, int(window_us / 1_000_000) * 6 + 20))
+    except (subprocess.TimeoutExpired, OSError) as ex:
+        return None, str(ex)
+    if proc.returncode != 0 or not part.is_file() or part.stat().st_size < 128:
+        err_tail = (proc.stderr or b"").decode("utf-8", errors="replace")[-800:]
+        try:
+            if part.is_file():
+                part.unlink()
+        except OSError:
+            pass
+        return None, f"时间轴音频渲染失败：{err_tail or proc.returncode}"
+    try:
+        os.replace(str(part), str(cache_path))
+    except OSError:
+        return str(part), None
+    return str(cache_path), None
 
 
 def _delete_merge_preview_file(path: Optional[str]) -> None:
@@ -6205,7 +6435,7 @@ def spawn_merged_preview_audio(
     *,
     start_sec: float = 0.0,
 ) -> List[subprocess.Popen]:
-    """播放合成预览 MP4 的混音轨（与 OpenCV 读同一文件，file 0s = timeline t0）。"""
+    """仅音频 ffplay（非 Windows 或嵌入失败时的回退）。"""
     ffplay = find_ffplay()
     if not ffplay or not merge_path or not os.path.isfile(merge_path):
         return []
@@ -6215,21 +6445,222 @@ def spawn_merged_preview_audio(
         "-nodisp",
         "-autoexit",
         "-loglevel",
-        "quiet",
+        "error",
+        "-volume",
+        "100",
+        "-probesize",
+        "32768",
+        "-analyzeduration",
+        "0",
     ]
     seek = max(0.0, float(start_sec))
     if seek >= 0.05:
         cmd.extend(["-ss", f"{seek:.3f}"])
     cmd.extend(["-i", os.path.abspath(merge_path)])
     try:
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         proc = subprocess.Popen(
             cmd,
             stdout=devnull,
             stderr=devnull,
+            creationflags=creationflags,
         )
     except OSError:
         return []
     return [proc]
+
+
+def _merge_preview_ffplay_title(token: str) -> str:
+    return f"{PREVIEW_MERGE_FFPLAY_TITLE_PREFIX}{token}"
+
+
+def _win_find_window_title_contains(substr: str) -> Optional[int]:
+    if sys.platform != "win32" or not substr:
+        return None
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    found: List[int] = []
+
+    def _callback(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        if substr in buf.value:
+            found.append(int(hwnd))
+            return False
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    user32.EnumWindows(WNDENUMPROC(_callback), 0)
+    return found[0] if found else None
+
+
+def _win_embed_child_window(child_hwnd: int, parent_hwnd: int, width: int, height: int) -> None:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    gwl_style = -16
+    ws_child = 0x40000000
+    ws_visible = 0x10000000
+    ws_caption = 0x00C00000
+    ws_thickframe = 0x00040000
+    ws_popup = 0x80000000
+    swp_no_zorder = 0x0004
+    swp_showwindow = 0x0040
+    user32.SetParent(child_hwnd, parent_hwnd)
+    style = user32.GetWindowLongW(child_hwnd, gwl_style)
+    style &= ~(ws_popup | ws_caption | ws_thickframe)
+    style |= ws_child | ws_visible
+    user32.SetWindowLongW(child_hwnd, gwl_style, style)
+    user32.SetWindowPos(
+        child_hwnd,
+        0,
+        0,
+        0,
+        max(40, int(width)),
+        max(40, int(height)),
+        swp_no_zorder | swp_showwindow,
+    )
+
+
+def _win_resize_embedded_window(child_hwnd: int, width: int, height: int) -> None:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos(
+        child_hwnd,
+        0,
+        0,
+        0,
+        max(40, int(width)),
+        max(40, int(height)),
+        0x0004,
+    )
+
+
+def spawn_merged_preview_player(
+    merge_path: str,
+    *,
+    window_title: str,
+    width: int,
+    height: int,
+    start_sec: float = 0.0,
+) -> Optional[subprocess.Popen]:
+    """ffplay 单路播放合成 MP4（音画一体，窗口标题用于嵌入 Tk）。"""
+    ffplay = find_ffplay()
+    if not ffplay or not merge_path or not os.path.isfile(merge_path):
+        return None
+    devnull = subprocess.DEVNULL
+    cmd: List[str] = [
+        ffplay,
+        "-autoexit",
+        "-loglevel",
+        "quiet",
+        "-window_title",
+        window_title,
+        "-x",
+        str(max(80, int(width))),
+        "-y",
+        str(max(80, int(height))),
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+    ]
+    seek = max(0.0, float(start_sec))
+    if seek >= 0.05:
+        cmd.extend(["-ss", f"{seek:.3f}"])
+    cmd.extend(["-i", os.path.abspath(merge_path)])
+    try:
+        return subprocess.Popen(cmd, stdout=devnull, stderr=devnull)
+    except OSError:
+        return None
+
+
+def _merge_preview_prime_frame(
+    merge_path: str,
+    content: Dict[str, Any],
+    merge_t0_us: int,
+) -> Optional[Tuple[bytes, PreviewPlan]]:
+    """读取合成预览首帧（暂停态缩略图，不启动播放）。"""
+    reader = _MergedPreviewReader()
+    if not reader.open(merge_path):
+        return None
+    reader.sync_file_us(0, force=True)
+    ppm = reader.read_ppm()
+    reader.close()
+    if not ppm:
+        return None
+    return ppm, build_preview_plan(content, int(merge_t0_us))
+
+
+class _MergedPreviewFfplaySession:
+    """合成预览：ffplay 单窗口音画 + 外部 timeline 驱动字幕。"""
+
+    __slots__ = ("proc", "hwnd", "window_title")
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.hwnd: Optional[int] = None
+        self.window_title: str = ""
+
+    def close(self) -> None:
+        if self.proc is not None:
+            _terminate_subprocess(self.proc)
+        self.proc = None
+        self.hwnd = None
+        self.window_title = ""
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def spawn(
+        self,
+        merge_path: str,
+        *,
+        window_title: str,
+        width: int,
+        height: int,
+        start_sec: float = 0.0,
+    ) -> bool:
+        self.close()
+        proc = spawn_merged_preview_player(
+            merge_path,
+            window_title=window_title,
+            width=width,
+            height=height,
+            start_sec=start_sec,
+        )
+        if proc is None:
+            return False
+        self.proc = proc
+        self.window_title = window_title
+        self.hwnd = None
+        return True
+
+    def try_embed(self, parent_hwnd: int, width: int, height: int) -> bool:
+        if not self.alive():
+            return False
+        if sys.platform != "win32":
+            return True
+        if self.hwnd:
+            _win_resize_embedded_window(self.hwnd, width, height)
+            return True
+        hwnd = _win_find_window_title_contains(self.window_title)
+        if hwnd is None:
+            return False
+        _win_embed_child_window(hwnd, parent_hwnd, width, height)
+        self.hwnd = hwnd
+        return True
 
 
 class _MergedPreviewReader:
@@ -6416,12 +6847,14 @@ class _MergedPreviewVideoWorker:
         return True
 
 
-SCRUB_THUMB_FPS = 4.0
+SCRUB_THUMB_FPS = 2.5
 SCRUB_THUMB_STEP_US = int(1_000_000 / SCRUB_THUMB_FPS)
-PREVIEW_MAX_WIDTH = 280
-SCRUB_THUMB_WIDTH = PREVIEW_MAX_WIDTH
-PREVIEW_WARM_INITIAL_SEC = 60.0
+PREVIEW_MAX_WIDTH = 256
+SCRUB_THUMB_WIDTH = 256
+PREVIEW_WARM_INITIAL_SEC = 30.0
 PREVIEW_WARM_WINDOW_SEC = 50.0
+PREVIEW_WARM_SCRUB_FOLLOW_SEC = 12.0
+PREVIEW_WARM_SCRUB_THROTTLE_MS = 220
 PREVIEW_WARM_IDLE_MS = 1200
 PREVIEW_PLAY_SYNC_HOLD_MS = 160
 PREVIEW_PLAY_SYNC_TIMEOUT_MS = 2500
@@ -6852,6 +7285,40 @@ def start_preview_thumbnail_warm(content: Optional[Dict[str, Any]], cache: _Thum
         return
     for path in _collect_preview_video_paths(content):
         _start_warm_path(path, cache, start_sec=0.0, duration_sec=PREVIEW_WARM_INITIAL_SEC)
+
+
+def start_preview_foreground_warm_on_load(content: Dict[str, Any], cache: _ThumbnailStripCache) -> None:
+    """草稿加载后预热前景视频缩略图条（拖动预览主要依赖此缓存）。"""
+    plan = build_preview_plan(content, 0)
+    if not plan.videos:
+        return
+    top = plan.videos[-1]
+    total_sec = max(8.0, _timeline_end_us(content) / 1_000_000.0)
+    duration_sec = min(PREVIEW_WARM_INITIAL_SEC, total_sec)
+    _start_warm_path(top.path, cache, start_sec=0.0, duration_sec=duration_sec)
+    fg_abs = os.path.abspath(top.path)
+    for path in _collect_preview_video_paths(content):
+        if os.path.abspath(path) == fg_abs:
+            continue
+        _start_warm_path(path, cache, start_sec=0.0, duration_sec=min(12.0, duration_sec))
+
+
+def warm_preview_strip_near_plan(
+    plan: PreviewPlan,
+    cache: _ThumbnailStripCache,
+    *,
+    window_sec: float = PREVIEW_WARM_SCRUB_FOLLOW_SEC,
+) -> None:
+    """拖动时在播放头附近按需补预热缩略图条。"""
+    if not plan.videos:
+        return
+    top = plan.videos[-1]
+    if cache.has_bucket(top.path, top.source_us):
+        return
+    half = max(4.0, float(window_sec)) / 2.0
+    center_sec = max(0.0, top.source_us / 1_000_000.0)
+    start_sec = max(0.0, center_sec - half)
+    _start_warm_path(top.path, cache, start_sec=start_sec, duration_sec=float(window_sec))
 
 
 def warm_preview_for_plan(plan: PreviewPlan, cache: _ThumbnailStripCache) -> None:
@@ -8151,7 +8618,7 @@ def run_app() -> None:
     root.geometry(f"{win_w}x{win_h}")
     root.update_idletasks()
     _center_window_on_screen(root, win_w, win_h)
-    _cleanup_stale_preview_merge_cache()
+    threading.Thread(target=_cleanup_stale_preview_merge_cache, daemon=True, name="preview-cache-cleanup").start()
 
     _ensure_local_pyjianyingdraft_on_path()
     auth_client: Any = None
@@ -8466,7 +8933,12 @@ def run_app() -> None:
             preview_state["frame_cache"].clear()
             preview_state["thumb_cache"].clear()
         if raw is not None:
-            start_preview_thumbnail_warm(raw, preview_state["thumb_cache"])
+            def _deferred_thumb_warm() -> None:
+                cur = timeline_content_cache[0]
+                if isinstance(cur, dict):
+                    start_preview_foreground_warm_on_load(cur, preview_state["thumb_cache"])
+
+            root.after(200, _deferred_thumb_warm)
 
         pct = int(round(100.0 * timeline_zoom["pps"] / DEFAULT_TIMELINE_PPS))
         timeline_zoom_label_var.set(f"缩放 {pct}%")
@@ -8578,8 +9050,17 @@ def run_app() -> None:
     ).pack(anchor="w", padx=10, pady=(8, 2))
     preview_img_host = ctk.CTkFrame(preview_col, fg_color=("gray88", "gray18"), corner_radius=8)
     preview_img_host.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+    preview_video_host = tk.Frame(preview_img_host, bg="#1a1a1a", highlightthickness=0)
+    preview_video_host.pack(fill="both", expand=True, padx=3, pady=3)
     preview_canvas = tk.Canvas(preview_img_host, bg="#1a1a1a", highlightthickness=0)
-    preview_canvas.pack(fill="both", expand=True, padx=3, pady=3)
+    preview_canvas.place(relx=0, rely=0, relwidth=1, relheight=1, x=0, y=0)
+    preview_sub_overlay = tk.Canvas(
+        preview_img_host,
+        bg="#1a1a1a",
+        highlightthickness=0,
+        bd=0,
+        height=PREVIEW_SUB_BAR_HEIGHT,
+    )
     preview_ctrl = ctk.CTkFrame(preview_col, fg_color=("gray82", "gray22"), corner_radius=6, height=36)
     preview_ctrl.pack(fill="x", padx=8, pady=(0, 4))
     preview_ctrl.pack_propagate(False)
@@ -8610,6 +9091,7 @@ def run_app() -> None:
         "scrub_busy": False,
         "last_worker_ms": 0,
         "warm_interrupted_for_scrub": False,
+        "last_scrub_warm_ms": 0.0,
         "warm_idle_after_id": None,
         "ui_apply_scheduled": False,
         "ui_apply_pending": None,
@@ -8642,7 +9124,10 @@ def run_app() -> None:
         "play_arm_us": None,
         "play_audio_alive_since": None,
         "play_audio_arm_started_at": None,
+        "play_audio_output_ready": False,
+        "play_audio_ready_gen": 0,
         "play_prime_ready": False,
+        "play_prime_gen": 0,
         "play_mode": "live",
         "merge_path": None,
         "merge_t0_us": 0,
@@ -8656,6 +9141,20 @@ def run_app() -> None:
         "merge_prefetch_gen": 0,
         "merge_waiting_next": False,
         "merge_pause_timeline_us": None,
+        "merge_ffplay_session": None,
+        "merge_ffplay_token": 0,
+        "merge_ffplay_embedded": False,
+        "merge_ffplay_fallback": False,
+        "audio_chunk_t0_us": None,
+        "audio_chunk_end_us": None,
+        "audio_chunk_path": None,
+        "audio_next_path": None,
+        "audio_next_t0_us": None,
+        "audio_next_end_us": None,
+        "audio_prefetch_busy": False,
+        "audio_prefetch_gen": 0,
+        "audio_waiting_next": False,
+        "audio_pause_timeline_us": None,
     }
 
     def _playback_timeline_us() -> Optional[int]:
@@ -8668,10 +9167,139 @@ def run_app() -> None:
         return start_us + elapsed_us
 
     def _playback_subtitle_us(timeline_us: int) -> int:
-        """合成预览：字幕略滞后 wall clock，对齐 ffplay 实际出声时刻。"""
-        if preview_state.get("play_mode") == "merge" and _preview_is_playing():
-            return max(0, int(timeline_us) - PREVIEW_MERGE_SUBTITLE_LAG_US)
         return int(timeline_us)
+
+    def _preview_host_inner_size() -> Tuple[int, int]:
+        try:
+            preview_video_host.update_idletasks()
+            cw = max(80, int(preview_video_host.winfo_width()))
+            ch = max(80, int(preview_video_host.winfo_height()))
+        except tk.TclError:
+            cw, ch = PREVIEW_MAX_WIDTH, 360
+        return cw, ch
+
+    def _merge_ffplay_session() -> _MergedPreviewFfplaySession:
+        sess = preview_state.get("merge_ffplay_session")
+        if not isinstance(sess, _MergedPreviewFfplaySession):
+            sess = _MergedPreviewFfplaySession()
+            preview_state["merge_ffplay_session"] = sess
+        return sess
+
+    def _show_merge_ffplay_ui() -> None:
+        preview_canvas.place_forget()
+        try:
+            cw = max(80, int(preview_video_host.winfo_width()))
+        except tk.TclError:
+            cw = PREVIEW_MAX_WIDTH
+        preview_sub_overlay.configure(width=cw, height=PREVIEW_SUB_BAR_HEIGHT)
+        preview_sub_overlay.place(relx=0, rely=1.0, relwidth=1, anchor="sw")
+        preview_sub_overlay.lift()
+
+    def _hide_merge_ffplay_ui() -> None:
+        preview_sub_overlay.place_forget()
+        preview_sub_overlay.delete("preview_sub")
+        preview_canvas.place(relx=0, rely=0, relwidth=1, relheight=1, x=0, y=0)
+
+    def _stop_merged_preview_ffplay() -> None:
+        sess = preview_state.get("merge_ffplay_session")
+        if isinstance(sess, _MergedPreviewFfplaySession):
+            sess.close()
+        preview_state["merge_ffplay_embedded"] = False
+        preview_state["merge_ffplay_fallback"] = False
+        _hide_merge_ffplay_ui()
+
+    def _mark_merge_audio_spawned() -> None:
+        now = time.time()
+        preview_state["play_audio_alive_since"] = now
+        preview_state["play_audio_arm_started_at"] = now
+        preview_state["play_audio_output_ready"] = False
+
+    def _attach_playback_audio_ready_watch(procs: List[Any]) -> None:
+        if not procs:
+            return
+        ffplay_proc = procs[-1]
+        ready_gen = int(preview_state.get("gen", 0))
+        preview_state["play_audio_ready_gen"] = ready_gen
+        preview_state["play_audio_output_ready"] = False
+
+        def _on_ready() -> None:
+            def _ui() -> None:
+                if ready_gen != int(preview_state.get("play_audio_ready_gen", 0)):
+                    return
+                if not _preview_is_playing():
+                    return
+                preview_state["play_audio_output_ready"] = True
+
+            try:
+                root.after(0, _ui)
+            except tk.TclError:
+                pass
+
+        watch_ffplay_audio_output_ready(
+            ffplay_proc,
+            _on_ready,
+            timeout_sec=PREVIEW_PLAY_SYNC_TIMEOUT_MS / 1000.0,
+        )
+
+    def _start_merged_preview_ffplay(*, start_sec: float = 0.0) -> bool:
+        """单路 ffplay 播放合成 MP4（Windows 嵌入预览区；失败则回退 OpenCV+仅音频）。"""
+        merge_path = preview_state.get("merge_path")
+        if not merge_path or not os.path.isfile(str(merge_path)):
+            return False
+        sess = preview_state.get("merge_ffplay_session")
+        if isinstance(sess, _MergedPreviewFfplaySession) and sess.alive():
+            if preview_state.get("merge_ffplay_fallback"):
+                return bool(preview_state.get("play_audio_procs"))
+            return True
+        cw, ch = _preview_host_inner_size()
+        token = int(preview_state.get("merge_ffplay_token") or 0) + 1
+        preview_state["merge_ffplay_token"] = token
+        title = _merge_preview_ffplay_title(str(token))
+        player = _merge_ffplay_session()
+        if sys.platform == "win32" and player.spawn(
+            str(merge_path),
+            window_title=title,
+            width=cw,
+            height=ch,
+            start_sec=start_sec,
+        ):
+            preview_state["merge_ffplay_fallback"] = False
+            preview_state["merge_ffplay_embedded"] = False
+            preview_state["play_audio_procs"] = [player.proc]
+            preview_state["play_audio_proc"] = player.proc
+            _mark_merge_audio_spawned()
+            return True
+        preview_state["merge_ffplay_fallback"] = True
+        _stop_merged_preview_ffplay()
+        worker = preview_state.get("play_video_worker")
+        content = timeline_content_cache[0]
+        if isinstance(worker, _MergedPreviewVideoWorker) and isinstance(content, dict):
+            merge_t0 = int(preview_state.get("merge_t0_us") or preview_state.get("play_start_us") or 0)
+            file_us = int(max(0.0, float(start_sec) * 1_000_000))
+            worker.switch_chunk(str(merge_path), merge_t0, file_us=file_us)
+        procs = spawn_merged_preview_audio(str(merge_path), start_sec=start_sec)
+        preview_state["play_audio_procs"] = procs
+        preview_state["play_audio_proc"] = procs[-1] if procs else None
+        if procs:
+            _mark_merge_audio_spawned()
+        return bool(procs)
+
+    def _try_embed_merged_preview_ffplay() -> bool:
+        if preview_state.get("merge_ffplay_fallback"):
+            return True
+        player = preview_state.get("merge_ffplay_session")
+        if not isinstance(player, _MergedPreviewFfplaySession) or not player.alive():
+            return False
+        cw, ch = _preview_host_inner_size()
+        try:
+            parent_hwnd = int(preview_video_host.winfo_id())
+        except tk.TclError:
+            return False
+        if not player.try_embed(parent_hwnd, cw, ch):
+            return False
+        preview_state["merge_ffplay_embedded"] = True
+        _show_merge_ffplay_ui()
+        return True
 
     def _cancel_playback_arm() -> None:
         aid = preview_state.get("play_clock_arm_after_id")
@@ -8686,7 +9314,7 @@ def run_app() -> None:
         preview_state["play_clock_arm_after_id"] = root.after(40, _poll_playback_arm)
 
     def _arm_playback_clock(playhead_us: int) -> None:
-        """音频缓冲就绪后，与时间轴/字幕/画面同一时刻起跑。"""
+        """音视频就绪后，以当前时刻起跑（不再用固定 hold 偏移）。"""
         _cancel_playback_arm()
         preview_state["play_audio_alive_since"] = None
         preview_state["play_audio_arm_started_at"] = None
@@ -8696,23 +9324,6 @@ def run_app() -> None:
         preview_state["play_wall_t0"] = time.time()
         preview_state["play_subtitle_frame_idx"] = None
         preview_state["play_last_ph_redraw_us"] = -1
-        content = timeline_content_cache[0]
-        worker = preview_state.get("play_video_worker")
-        if isinstance(worker, _MergedPreviewVideoWorker) and not preview_state.get("play_video_worker_started"):
-            if isinstance(content, dict):
-                worker.start(
-                    get_state=_playback_worker_state,
-                    fps=_draft_preview_fps(content),
-                )
-                preview_state["play_video_worker_started"] = True
-        elif isinstance(worker, _PlaybackVideoWorker) and not preview_state.get("play_video_worker_started"):
-            if isinstance(content, dict):
-                worker.start(
-                    content,
-                    get_state=_playback_worker_state,
-                    fps=_draft_preview_fps(content),
-                )
-                preview_state["play_video_worker_started"] = True
         _preview_play_tick()
 
     def _poll_playback_arm() -> None:
@@ -8720,34 +9331,74 @@ def run_app() -> None:
         if not _preview_is_playing():
             return
         if not preview_state.get("play_prime_ready"):
-            _repoll_playback_arm()
-            return
+            started_at = float(preview_state.get("play_audio_arm_started_at") or time.time())
+            if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
+                preview_state["play_prime_ready"] = True
+            else:
+                _repoll_playback_arm()
+                return
         us = int(preview_state.get("play_arm_us") or preview_state.get("play_start_us") or 0)
         content = timeline_content_cache[0]
         procs = preview_state.get("play_audio_procs") or []
         use_merge = preview_state.get("play_mode") == "merge"
         if use_merge:
-            if not procs:
-                merge_path = preview_state.get("merge_path")
-                if merge_path and os.path.isfile(str(merge_path)):
-                    procs = spawn_merged_preview_audio(str(merge_path))
-                    preview_state["play_audio_procs"] = procs
-                    preview_state["play_audio_proc"] = procs[-1] if procs else None
-            if procs:
-                if any(p is None or p.poll() is not None for p in procs):
+            if not (preview_state.get("play_audio_procs") or []):
+                if not _start_merged_preview_ffplay():
                     started_at = float(preview_state.get("play_audio_arm_started_at") or time.time())
                     if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
                         _arm_playback_clock(us)
+                    else:
+                        _repoll_playback_arm()
+                    return
+            procs = preview_state.get("play_audio_procs") or []
+            if procs and any(p is None or p.poll() is not None for p in procs):
+                started_at = float(preview_state.get("play_audio_arm_started_at") or time.time())
+                if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
+                    _arm_playback_clock(us)
+                else:
+                    _repoll_playback_arm()
+                return
+            if not preview_state.get("merge_ffplay_fallback") and not preview_state.get("merge_ffplay_embedded"):
+                if not _try_embed_merged_preview_ffplay():
+                    _repoll_playback_arm()
+                    return
+            alive_since = preview_state.get("play_audio_alive_since")
+            if alive_since is None:
+                preview_state["play_audio_alive_since"] = time.time()
+                _repoll_playback_arm()
+                return
+            if (time.time() - float(alive_since)) * 1000.0 < PREVIEW_MERGE_SYNC_HOLD_MS:
+                _repoll_playback_arm()
+                return
+            _arm_playback_clock(us)
+            return
+
+        if preview_state.get("play_mode") == "scrub":
+            hits = _playback_audio_hits(content, us) if isinstance(content, dict) else ()
+            procs = preview_state.get("play_audio_procs") or []
+            if hits:
+                if not procs:
+                    _ensure_scrub_preview_audio(content, us, force=True)
+                    procs = preview_state.get("play_audio_procs") or []
+                if procs:
+                    if any(p is None or p.poll() is not None for p in procs):
+                        started_at = float(
+                            preview_state.get("play_audio_arm_started_at") or time.time()
+                        )
+                        if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
+                            _arm_playback_clock(us)
+                        else:
+                            _repoll_playback_arm()
                         return
-                    _repoll_playback_arm()
-                    return
-                alive_since = preview_state.get("play_audio_alive_since")
-                if alive_since is None:
-                    preview_state["play_audio_alive_since"] = time.time()
-                    _repoll_playback_arm()
-                    return
-                if (time.time() - float(alive_since)) * 1000.0 < PREVIEW_MERGE_SYNC_HOLD_MS:
-                    _repoll_playback_arm()
+                    alive_since = preview_state.get("play_audio_alive_since")
+                    if not preview_state.get("play_audio_output_ready"):
+                        started_at = float(alive_since or preview_state.get("play_audio_arm_started_at") or time.time())
+                        if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
+                            preview_state["play_audio_output_ready"] = True
+                        else:
+                            _repoll_playback_arm()
+                            return
+                    _arm_playback_clock(us)
                     return
             _arm_playback_clock(us)
             return
@@ -8781,7 +9432,8 @@ def run_app() -> None:
     def _schedule_playback_arm(playhead_us: int) -> None:
         _cancel_playback_arm()
         preview_state["play_arm_us"] = int(playhead_us)
-        preview_state["play_audio_alive_since"] = None
+        if not (preview_state.get("play_audio_procs") or []):
+            preview_state["play_audio_alive_since"] = None
         preview_state["play_audio_arm_started_at"] = time.time()
         preview_state["play_clock_arm_after_id"] = root.after(40, _poll_playback_arm)
 
@@ -8809,10 +9461,13 @@ def run_app() -> None:
                 pass
 
     def _stop_playback_audio() -> None:
+        _stop_merged_preview_ffplay()
         kill_playback_audio_procs(preview_state.get("play_audio_procs"))
         preview_state["play_audio_procs"] = None
         preview_state["play_audio_proc"] = None
         preview_state["play_audio_key"] = None
+        preview_state["play_audio_output_ready"] = False
+        preview_state["play_audio_ready_gen"] = int(preview_state.get("play_audio_ready_gen", 0)) + 1
 
     def _start_playback_audio(content: Dict[str, Any], playhead_us: int) -> None:
         hits = _playback_audio_hits(content, playhead_us)
@@ -8836,6 +9491,8 @@ def run_app() -> None:
         preview_state["play_audio_procs"] = procs
         preview_state["play_audio_proc"] = procs[-1]
         preview_state["play_audio_key"] = key
+        _mark_merge_audio_spawned()
+        _attach_playback_audio_ready_watch(procs)
         if need_resync and _preview_is_playing():
             _schedule_playback_arm(playhead_us)
 
@@ -8916,17 +9573,40 @@ def run_app() -> None:
         preview_state["preview_sub_layout"] = None
         preview_state["play_subtitle_frame_idx"] = None
         preview_state["play_prime_ready"] = False
+        preview_state["play_audio_alive_since"] = None
+        preview_state["play_audio_arm_started_at"] = None
+        _hide_merge_ffplay_ui()
+        preview_state["audio_chunk_path"] = None
+        preview_state["audio_next_path"] = None
+        preview_state["audio_prefetch_busy"] = False
+        preview_state["audio_waiting_next"] = False
+        preview_state["audio_pause_timeline_us"] = None
+        preview_state["audio_prefetch_gen"] = int(preview_state.get("audio_prefetch_gen") or 0) + 1
+        preview_state["audio_chunk_t0_us"] = None
+        preview_state["audio_chunk_end_us"] = None
         _preview_play_btn_set("▶")
 
     def _refresh_playback_subtitles(timeline_us: int) -> None:
-        """播放中仅刷新字幕层（合成模式下略滞后 wall clock 以对齐 ffplay）。"""
-        layout = preview_state.get("preview_sub_layout")
-        if not layout or preview_state.get("photo") is None:
-            return
+        """播放中刷新字幕（合成单路 ffplay 时画在透明 overlay 上）。"""
         content = timeline_content_cache[0]
         if not isinstance(content, dict):
             return
         plan = build_preview_plan(content, _playback_subtitle_us(timeline_us))
+        if (
+            preview_state.get("play_mode") == "merge"
+            and preview_state.get("merge_ffplay_embedded")
+            and not preview_state.get("merge_ffplay_fallback")
+        ):
+            cw, _ch = _preview_host_inner_size()
+            bar_h = PREVIEW_SUB_BAR_HEIGHT
+            preview_sub_overlay.configure(width=cw, height=bar_h)
+            preview_sub_overlay.delete("preview_sub")
+            _draw_preview_subtitle_overlays(preview_sub_overlay, plan.texts, cw, bar_h)
+            preview_state["preview_sub_layout"] = (0, 0, cw, bar_h)
+            return
+        layout = preview_state.get("preview_sub_layout")
+        if not layout or preview_state.get("photo") is None:
+            return
         ox, oy, iw, ih = layout
         _draw_preview_subtitle_overlays(preview_canvas, plan.texts, iw, ih, offset_x=ox, offset_y=oy)
 
@@ -8998,12 +9678,6 @@ def run_app() -> None:
         next_end_i = int(next_end)
         file_us = max(0, int(timeline_us) - next_t0_i)
         _stop_playback_audio()
-        worker = preview_state.get("play_video_worker")
-        if isinstance(worker, _MergedPreviewVideoWorker):
-            if not worker.switch_chunk(str(next_path), next_t0_i, file_us=file_us):
-                _stop_preview_playback()
-                _preview_show_message("无法切换下一段预览")
-                return
         preview_state["merge_path"] = str(next_path)
         preview_state["merge_t0_us"] = next_t0_i
         preview_state["merge_chunk_t0_us"] = next_t0_i
@@ -9015,12 +9689,20 @@ def run_app() -> None:
         preview_state["merge_pause_timeline_us"] = None
         preview_state["merge_prefetch_gen"] = int(preview_state.get("merge_prefetch_gen") or 0) + 1
         file_sec = max(0.0, float(file_us) / 1_000_000.0)
-        procs = spawn_merged_preview_audio(str(next_path), start_sec=file_sec)
-        preview_state["play_audio_procs"] = procs
-        preview_state["play_audio_proc"] = procs[-1] if procs else None
+        if not _start_merged_preview_ffplay(start_sec=file_sec):
+            _stop_preview_playback()
+            _preview_show_message("无法切换下一段预览")
+            return
+        if preview_state.get("merge_ffplay_fallback"):
+            worker = preview_state.get("play_video_worker")
+            if isinstance(worker, _MergedPreviewVideoWorker):
+                if not worker.switch_chunk(str(next_path), next_t0_i, file_us=file_us):
+                    _stop_preview_playback()
+                    _preview_show_message("无法切换下一段预览")
+                    return
+        preview_state["merge_ffplay_embedded"] = False
         preview_state["play_wall_t0"] = None
         preview_state["play_subtitle_frame_idx"] = None
-        preview_state["play_audio_alive_since"] = None
         try:
             preview_info_var.set(
                 f"合成预览 · {_fmt_us_as_timecode(next_t0_i)}～{_fmt_us_as_timecode(next_end_i)}"
@@ -9049,7 +9731,308 @@ def run_app() -> None:
             _start_merge_chunk_prefetch(content, chunk_end)
         return True
 
+    def _timeline_audio_chunk_end(content: Dict[str, Any], t0_us: int) -> int:
+        return min(int(t0_us) + PREVIEW_AUDIO_CHUNK_US, _timeline_end_us(content))
+
+    def _start_timeline_audio_prefetch(content: Dict[str, Any], next_t0_us: int) -> None:
+        if preview_state.get("audio_prefetch_busy") or preview_state.get("audio_next_path"):
+            return
+        total_us = _timeline_end_us(content)
+        if int(next_t0_us) >= total_us:
+            return
+        gen = int(preview_state.get("audio_prefetch_gen") or 0) + 1
+        preview_state["audio_prefetch_gen"] = gen
+        preview_state["audio_prefetch_busy"] = True
+
+        def _bg() -> None:
+            path, _err = render_preview_audio_window(
+                content, int(next_t0_us), window_us=PREVIEW_AUDIO_CHUNK_US
+            )
+
+            def _done() -> None:
+                preview_state["audio_prefetch_busy"] = False
+                if gen != int(preview_state.get("audio_prefetch_gen") or 0):
+                    return
+                if not _preview_is_playing() or preview_state.get("play_mode") != "scrub":
+                    return
+                if not path:
+                    return
+                _track_merge_preview_path(path)
+                preview_state["audio_next_path"] = path
+                preview_state["audio_next_t0_us"] = int(next_t0_us)
+                preview_state["audio_next_end_us"] = _timeline_audio_chunk_end(content, int(next_t0_us))
+                if preview_state.get("audio_waiting_next"):
+                    pause_us = preview_state.get("audio_pause_timeline_us")
+                    if pause_us is not None:
+                        _advance_timeline_audio_chunk(int(pause_us))
+
+            root.after(0, _done)
+
+        threading.Thread(target=_bg, daemon=True, name="preview-audio-prefetch").start()
+
+    def _advance_timeline_audio_chunk(timeline_us: int) -> None:
+        content = timeline_content_cache[0]
+        if not isinstance(content, dict):
+            _stop_preview_playback()
+            return
+        next_path = preview_state.get("audio_next_path")
+        next_t0 = preview_state.get("audio_next_t0_us")
+        next_end = preview_state.get("audio_next_end_us")
+        if not next_path or next_t0 is None or next_end is None:
+            return
+        next_t0_i = int(next_t0)
+        next_end_i = int(next_end)
+        preview_state["audio_next_path"] = None
+        preview_state["audio_next_t0_us"] = None
+        preview_state["audio_next_end_us"] = None
+        preview_state["audio_waiting_next"] = False
+        preview_state["audio_pause_timeline_us"] = None
+        preview_state["audio_prefetch_gen"] = int(preview_state.get("audio_prefetch_gen") or 0) + 1
+        _spawn_scrub_preview_audio(
+            content,
+            next_t0_i,
+            str(next_path),
+            t0_us=next_t0_i,
+            end_us=next_end_i,
+        )
+        preview_state["play_wall_t0"] = None
+        preview_state["play_subtitle_frame_idx"] = None
+        try:
+            preview_info_var.set(
+                f"时间轴音频 · {_fmt_us_as_timecode(next_t0_i)}～{_fmt_us_as_timecode(next_end_i)}"
+            )
+        except Exception:
+            pass
+        _schedule_playback_arm(int(timeline_us))
+        if next_end_i < _timeline_end_us(content):
+            _start_timeline_audio_prefetch(content, next_end_i)
+
+    def _maybe_prefetch_timeline_audio_chunk(content: Dict[str, Any], timeline_us: int) -> None:
+        chunk_end = int(preview_state.get("audio_chunk_end_us") or 0)
+        total_us = _timeline_end_us(content)
+        if chunk_end >= total_us:
+            return
+        if int(timeline_us) < chunk_end - PREVIEW_AUDIO_PREFETCH_LEAD_US:
+            return
+        _start_timeline_audio_prefetch(content, chunk_end)
+
+    def _try_continue_timeline_audio(content: Dict[str, Any], timeline_us: int) -> bool:
+        if preview_state.get("play_mode") != "scrub":
+            return False
+        if preview_state.get("audio_waiting_next"):
+            if preview_state.get("audio_next_path") and preview_state.get("audio_pause_timeline_us") is not None:
+                _advance_timeline_audio_chunk(int(preview_state["audio_pause_timeline_us"]))
+            return True
+        chunk_end = int(preview_state.get("audio_chunk_end_us") or 0)
+        total_us = _timeline_end_us(content)
+        if chunk_end <= 0 or int(timeline_us) < chunk_end:
+            return False
+        if chunk_end >= total_us:
+            return False
+        if not preview_state.get("audio_next_path"):
+            preview_state["audio_waiting_next"] = True
+            preview_state["audio_pause_timeline_us"] = chunk_end
+            preview_state["play_wall_t0"] = None
+            _preview_show_message("正在准备下一段时间轴音频…")
+            if not preview_state.get("audio_prefetch_busy"):
+                _start_timeline_audio_prefetch(content, chunk_end)
+            return True
+        _advance_timeline_audio_chunk(chunk_end)
+        return True
+
+    def _ensure_scrub_preview_audio(
+        content: Dict[str, Any],
+        timeline_us: int,
+        *,
+        force: bool = False,
+    ) -> None:
+        """播放中：按当前时间轴位置立即 ffplay 出声（不等待后台 chunk 渲染）。"""
+        hits = _playback_audio_hits(content, int(timeline_us))
+        if not hits:
+            if preview_state.get("play_audio_procs"):
+                _stop_playback_audio()
+            return
+        sig = _playback_audio_signature(hits)
+        procs = preview_state.get("play_audio_procs") or []
+        alive = any(p is not None and p.poll() is None for p in procs)
+        if alive and not force and sig == preview_state.get("play_audio_key"):
+            return
+        old_key = preview_state.get("play_audio_key")
+        need_resync = old_key is not None and old_key != sig
+        if alive:
+            _stop_playback_audio()
+        layers = tuple(layer for layer, _key in hits)
+        new_procs = spawn_playback_audio(layers)
+        preview_state["play_audio_procs"] = new_procs or None
+        preview_state["play_audio_proc"] = new_procs[-1] if new_procs else None
+        preview_state["play_audio_key"] = sig if new_procs else None
+        if new_procs:
+            _mark_merge_audio_spawned()
+            _attach_playback_audio_ready_watch(new_procs)
+            try:
+                preview_info_var.set(
+                    f"预览音频 · {_fmt_us_as_timecode(int(timeline_us))}"
+                )
+            except Exception:
+                pass
+        elif not find_ffplay():
+            try:
+                preview_info_var.set("（未找到 ffplay，无法播放预览音频）")
+            except Exception:
+                pass
+        if need_resync and _preview_is_playing():
+            preview_state["play_wall_t0"] = None
+            _schedule_playback_arm(int(timeline_us))
+
+    def _mark_playback_prime_ready() -> None:
+        if not _preview_is_playing():
+            return
+        preview_state["play_prime_ready"] = True
+
+    def _start_playback_preview_prime(content: Dict[str, Any], playhead_us: int) -> None:
+        """播放起跑前：拉取当前播放头画面（与 ffplay 启动并行）。"""
+        us = int(playhead_us)
+        plan = build_preview_plan(content, us)
+        prime_gen = int(preview_state.get("gen", 0))
+        preview_state["play_prime_gen"] = prime_gen
+        preview_state["play_prime_ready"] = False
+
+        if not plan.videos:
+            _preview_sync_labels(us, plan)
+            _mark_playback_prime_ready()
+            return
+
+        thumb_cache = preview_state["thumb_cache"]
+        frame_cache = preview_state["frame_cache"]
+        instant = fetch_instant_scrub_frame(plan, thumb_cache)
+        if not instant:
+            top = plan.videos[-1]
+            instant = frame_cache.get(top.path, top.source_us)
+        if instant:
+            _queue_preview_apply(instant, plan, prime_gen, subtitle_us=us)
+            _preview_sync_labels(us, plan)
+            _mark_playback_prime_ready()
+            return
+
+        try:
+            preview_info_var.set("准备预览画面…")
+        except Exception:
+            pass
+        _preview_sync_timecode(us, content)
+
+        def _worker() -> None:
+            img = fetch_scrub_frame_fast(plan, frame_cache=frame_cache)
+
+            def _ui() -> None:
+                if not _preview_is_playing():
+                    return
+                if prime_gen != int(preview_state.get("gen", 0)):
+                    return
+                if img:
+                    _queue_preview_apply(img, plan, prime_gen, subtitle_us=us)
+                _preview_sync_labels(us, plan)
+                _mark_playback_prime_ready()
+
+            root.after(0, _ui)
+
+        threading.Thread(target=_worker, daemon=True, name="preview-play-prime").start()
+
+    def _spawn_scrub_preview_audio(
+        content: Dict[str, Any],
+        timeline_us: int,
+        path: Optional[str],
+        *,
+        t0_us: int,
+        end_us: int,
+    ) -> List[Any]:
+        """启动时间轴音频 ffplay；失败则回退到当前播放头的 live 混音。"""
+        _stop_playback_audio()
+        procs: List[Any] = []
+        if path and os.path.isfile(str(path)):
+            _track_merge_preview_path(path)
+            procs = spawn_merged_preview_audio(str(path), start_sec=0.0)
+        if not procs:
+            layers = find_playback_audio_layers(content, int(timeline_us))
+            if layers:
+                procs = spawn_playback_audio(layers)
+        preview_state["play_audio_procs"] = procs or None
+        preview_state["play_audio_proc"] = procs[-1] if procs else None
+        preview_state["audio_chunk_t0_us"] = int(t0_us)
+        preview_state["audio_chunk_end_us"] = int(end_us)
+        preview_state["audio_chunk_path"] = path
+        if procs:
+            _mark_merge_audio_spawned()
+            _attach_playback_audio_ready_watch(procs)
+            try:
+                preview_info_var.set(
+                    f"时间轴音频 · {_fmt_us_as_timecode(int(t0_us))}～"
+                    f"{_fmt_us_as_timecode(int(end_us))}"
+                )
+            except Exception:
+                pass
+        elif find_playback_audio_layers(content, int(timeline_us)):
+            try:
+                preview_info_var.set("（时间轴音频渲染失败，live 回退也未启动 ffplay）")
+            except Exception:
+                pass
+        elif not find_ffplay():
+            try:
+                preview_info_var.set("（未找到 ffplay，无法播放预览音频）")
+            except Exception:
+                pass
+        return procs
+
+    def _start_timeline_audio_chunk_play(content: Dict[str, Any], t0_us: int, *, gen: int) -> None:
+        win_s = PREVIEW_AUDIO_CHUNK_US // 1_000_000
+        try:
+            preview_info_var.set(
+                f"准备时间轴音频（{_fmt_us_as_timecode(t0_us)} 起 {win_s}s）…"
+            )
+        except Exception:
+            pass
+
+        def _bg() -> None:
+            path: Optional[str] = None
+            err: Optional[str] = None
+            try:
+                path, err = render_preview_audio_window(
+                    content, int(t0_us), window_us=PREVIEW_AUDIO_CHUNK_US
+                )
+            except Exception as ex:
+                err = str(ex)
+
+            def _done() -> None:
+                if not _preview_is_playing() or gen != int(preview_state.get("gen", 0)):
+                    return
+                end_us = _timeline_audio_chunk_end(content, int(t0_us))
+                attach_us = int(t0_us)
+                cur_us = _playback_timeline_us()
+                if cur_us is not None:
+                    attach_us = int(cur_us)
+                window_sec = max(0.001, (end_us - int(t0_us)) / 1_000_000.0)
+                start_sec = max(0.0, (attach_us - int(t0_us)) / 1_000_000.0)
+                if path and start_sec < window_sec - 0.08:
+                    _stop_playback_audio()
+                    _track_merge_preview_path(path)
+                    procs = spawn_merged_preview_audio(str(path), start_sec=start_sec)
+                    if procs:
+                        preview_state["play_audio_procs"] = procs
+                        preview_state["play_audio_proc"] = procs[-1]
+                        _mark_merge_audio_spawned()
+                elif not (preview_state.get("play_audio_procs") or []):
+                    _ensure_scrub_preview_audio(content, attach_us, force=True)
+                if preview_state.get("play_wall_t0") is None:
+                    preview_state["play_prime_ready"] = True
+                    _schedule_playback_arm(int(t0_us))
+                if end_us < _timeline_end_us(content):
+                    _start_timeline_audio_prefetch(content, end_us)
+
+            root.after(0, _done)
+
+        threading.Thread(target=_bg, daemon=True, name="preview-audio-chunk").start()
+
     def _preview_play_tick() -> None:
+        """播放 = 时间轴指针自动前进 + 与拖动相同的预览取帧。"""
         preview_state["play_after_id"] = None
         if not _preview_is_playing():
             return
@@ -9058,78 +10041,45 @@ def run_app() -> None:
             _stop_preview_playback()
             return
         fps = _draft_preview_fps(content)
-        step_us = max(1, int(1_000_000.0 / fps))
         tick_ms = max(16, int(1000.0 / fps))
 
-        if preview_state.get("play_mode") == "merge" and preview_state.get("merge_waiting_next"):
-            if preview_state.get("merge_next_path") and preview_state.get("merge_pause_timeline_us") is not None:
-                _advance_merge_chunk(int(preview_state["merge_pause_timeline_us"]))
-            if _preview_is_playing():
-                preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
-            return
-
         if preview_state.get("play_wall_t0") is None:
-            return
-        timeline_us = _playback_timeline_us()
-        if timeline_us is None:
-            return
-        subtitle_frame_idx = timeline_us // step_us
-        total_us = _timeline_end_us(content)
-        if preview_state.get("play_mode") == "merge":
-            _maybe_prefetch_next_merge_chunk(content, timeline_us)
-            if _try_continue_merge_playback(content, timeline_us):
+            if preview_state.get("play_clock_arm_after_id") is not None:
                 if _preview_is_playing():
                     preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
                 return
+            preview_state["play_wall_t0"] = time.time()
+            preview_state["play_start_us"] = int(
+                preview_state.get("play_start_us") or replace_state.get("playhead_us") or 0
+            )
+
+        timeline_us = _playback_timeline_us()
+        if timeline_us is None:
+            return
+
+        total_us = _timeline_end_us(content)
         if timeline_us >= total_us:
-            timeline_us = total_us
             set_ph = replace_state.get("_set_playhead")
             if callable(set_ph):
                 try:
-                    set_ph(timeline_us, notify=False)
+                    set_ph(total_us, notify=True, redraw=True)
                 except Exception:
                     pass
-            _preview_sync_timecode(timeline_us)
             _stop_preview_playback()
             return
 
-        worker = preview_state.get("play_video_worker")
-        if isinstance(worker, _MergedPreviewVideoWorker):
-            item = worker.take_latest()
-            if item is not None:
-                ppm, plan, _frame_us, gen = item
-                if gen == int(preview_state.get("gen", 0)):
-                    _queue_preview_apply(
-                        ppm, plan, gen, subtitle_us=_playback_subtitle_us(timeline_us)
-                    )
-        elif isinstance(worker, _PlaybackVideoWorker):
-            item = worker.take_latest()
-            if item is not None:
-                ppm, plan, _frame_us, gen = item
-                if gen == int(preview_state.get("gen", 0)):
-                    _queue_preview_apply(
-                        ppm, plan, gen, subtitle_us=_playback_subtitle_us(timeline_us)
-                    )
-            if not build_preview_plan(content, timeline_us).videos:
-                _stop_preview_playback()
-                return
-        elif preview_state.get("play_mode") != "merge" and not build_preview_plan(content, timeline_us).videos:
-            _stop_preview_playback()
-            return
+        if preview_state.get("play_mode") == "scrub":
+            procs = preview_state.get("play_audio_procs") or []
+            if not any(p is not None and p.poll() is None for p in procs):
+                _ensure_scrub_preview_audio(content, timeline_us)
 
-        if preview_state.get("play_subtitle_frame_idx") != subtitle_frame_idx:
-            preview_state["play_subtitle_frame_idx"] = subtitle_frame_idx
-            _refresh_playback_subtitles(timeline_us)
-
-        last_redraw = int(preview_state.get("play_last_ph_redraw_us") or -1)
-        redraw_ph = last_redraw < 0 or abs(timeline_us - last_redraw) >= max(step_us * 2, 80_000)
         set_ph = replace_state.get("_set_playhead")
         if callable(set_ph):
             try:
-                set_ph(timeline_us, notify=False, redraw=redraw_ph)
+                set_ph(timeline_us, notify=True, redraw=True)
             except TypeError:
                 try:
-                    set_ph(timeline_us, notify=False)
+                    set_ph(timeline_us, notify=True)
                 except Exception:
                     pass
             except Exception:
@@ -9137,19 +10087,10 @@ def run_app() -> None:
         else:
             replace_state["playhead_us"] = timeline_us
             preview_state["pending_us"] = timeline_us
-        if redraw_ph:
-            preview_state["play_last_ph_redraw_us"] = timeline_us
-        _preview_sync_timecode(timeline_us)
+            on_playhead_changed(timeline_us)
 
-        procs = preview_state.get("play_audio_procs")
-        if procs:
-            alive = [p for p in procs if p is not None and p.poll() is None]
-            if not alive:
-                preview_state["play_audio_procs"] = None
-                preview_state["play_audio_proc"] = None
-                preview_state["play_audio_key"] = None
-        if preview_state.get("play_mode") != "merge":
-            _sync_playback_audio_if_needed(content, timeline_us)
+        preview_state["play_last_ph_redraw_us"] = timeline_us
+        _maybe_warm_scrub_strip(build_preview_plan(content, timeline_us))
 
         if _preview_is_playing():
             preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
@@ -9163,127 +10104,49 @@ def run_app() -> None:
             return
         us = int(replace_state.get("playhead_us") or preview_state.get("pending_us") or 0)
         plan = build_preview_plan(content, us)
-        if not plan.videos:
-            _preview_show_message("（当前时间无视频）")
+        audio_hits = _playback_audio_hits(content, us)
+        if not plan.videos and not audio_hits:
+            _preview_show_message("（当前时间无视频/音频）")
             return
-        preview_state["thumb_cache"].interrupt_warming()
+        total_us = _timeline_end_us(content)
+        if us >= total_us:
+            return
+
+        _hide_merge_ffplay_ui()
         old_worker = preview_state.get("play_video_worker")
         if isinstance(old_worker, (_PlaybackVideoWorker, _MergedPreviewVideoWorker)):
             old_worker.close()
-        fps = _draft_preview_fps(content)
+        _stop_playback_audio()
+        _queue_merge_preview_file_deletion(preview_state.get("merge_session_paths"))
+
         preview_state["playing"] = True
+        preview_state["play_mode"] = "scrub"
         preview_state["play_wall_t0"] = None
         preview_state["play_start_us"] = us
-        preview_state["play_last_frame_idx"] = None
-        preview_state["play_last_video_key"] = None
-        preview_state["play_display_us"] = us
         preview_state["play_last_ph_redraw_us"] = -1
-        preview_state["play_subtitle_frame_idx"] = None
+        preview_state["play_video_worker"] = None
         preview_state["play_video_worker_started"] = False
         preview_state["play_prime_ready"] = False
+        preview_state["merge_path"] = None
+        preview_state["merge_next_path"] = None
+        preview_state["audio_chunk_path"] = None
+        preview_state["audio_next_path"] = None
+        preview_state["audio_prefetch_busy"] = False
+        preview_state["audio_waiting_next"] = False
+        preview_state["audio_pause_timeline_us"] = None
+        preview_state["audio_prefetch_gen"] = int(preview_state.get("audio_prefetch_gen") or 0) + 1
         preview_state["gen"] = int(preview_state.get("gen", 0)) + 1
-        gen = int(preview_state.get("gen", 0))
         _preview_play_btn_set("⏸")
-
-        use_merge = PREVIEW_MERGE_ENABLED and find_ffmpeg() is not None
-        if use_merge:
-            _stop_playback_audio()
-            _queue_merge_preview_file_deletion(preview_state.get("merge_session_paths"))
-            preview_state["play_mode"] = "merge"
-            preview_state["merge_t0_us"] = us
-            preview_state["merge_window_us"] = PREVIEW_MERGE_CHUNK_US
-            preview_state["merge_chunk_t0_us"] = us
-            preview_state["merge_chunk_end_us"] = _preview_merge_chunk_end_us(content, us, PREVIEW_MERGE_CHUNK_US)
-            preview_state["merge_next_path"] = None
-            preview_state["merge_prefetch_busy"] = False
-            preview_state["merge_waiting_next"] = False
-            preview_state["merge_pause_timeline_us"] = None
-            preview_state["merge_prefetch_gen"] = 0
-            preview_state["play_video_worker"] = None
-            win_s = PREVIEW_MERGE_CHUNK_US // 1_000_000
-            _preview_show_message(
-                f"正在合成预览（从 {_fmt_us_as_timecode(us)} 起 {win_s}s，播放中继续合成后续）…"
-            )
-
-            def _render_merge_bg() -> None:
-                path, err = render_preview_merge_window(
-                    content, us, window_us=PREVIEW_MERGE_CHUNK_US
-                )
-                def _on_merge_done() -> None:
-                    if not _preview_is_playing() or gen != int(preview_state.get("gen", 0)):
-                        return
-                    if not path:
-                        preview_state["playing"] = False
-                        preview_state["play_mode"] = "live"
-                        _preview_play_btn_set("▶")
-                        _preview_show_message(f"合成失败：{err or '未知错误'}")
-                        return
-                    worker = _MergedPreviewVideoWorker()
-                    preview_state["play_video_worker"] = worker
-                    preview_state["merge_path"] = path
-                    _track_merge_preview_path(path)
-                    preview_state["merge_chunk_end_us"] = _preview_merge_chunk_end_us(
-                        content, us, PREVIEW_MERGE_CHUNK_US
-                    )
-                    if worker.prime_first_frame(path, content, us, gen=gen) is None:
-                        preview_state["playing"] = False
-                        preview_state["play_mode"] = "live"
-                        _preview_play_btn_set("▶")
-                        _preview_show_message("无法打开合成预览")
-                        worker.close()
-                        preview_state["play_video_worker"] = None
-                        return
-                    first = worker.take_latest()
-                    if first is not None:
-                        ppm, plan0, _, _g = first
-                        try:
-                            _apply_preview_image(ppm, plan0, gen, silent=True, subtitle_us=us)
-                        except Exception:
-                            pass
-                    try:
-                        preview_info_var.set(
-                            f"合成预览 · {_fmt_us_as_timecode(us)}～"
-                            f"{_fmt_us_as_timecode(int(preview_state['merge_chunk_end_us']))}"
-                        )
-                    except Exception:
-                        pass
-                    preview_state["play_prime_ready"] = True
-                    _schedule_playback_arm(us)
-                    chunk_end = int(preview_state.get("merge_chunk_end_us") or 0)
-                    if chunk_end < _timeline_end_us(content):
-                        _start_merge_chunk_prefetch(content, chunk_end)
-
-                root.after(0, _on_merge_done)
-
-            threading.Thread(target=_render_merge_bg, daemon=True, name="preview-merge-render").start()
-            return
-
-        preview_state["play_mode"] = "live"
-        worker = _PlaybackVideoWorker()
-        preview_state["play_video_worker"] = worker
-
-        def _prime_first_frame_bg() -> None:
-            try:
-                worker.prime_first_frame(content, us, fps=fps, gen=gen)
-                first = worker.take_latest()
-            except Exception:
-                first = None
-
-            def _on_prime_done() -> None:
-                if not _preview_is_playing() or gen != int(preview_state.get("gen", 0)):
-                    return
-                preview_state["play_prime_ready"] = True
-                if first is not None:
-                    ppm, plan0, _, _g = first
-                    try:
-                        _apply_preview_image(ppm, plan0, gen, silent=True, subtitle_us=us)
-                    except Exception:
-                        pass
-                _schedule_playback_arm(us)
-
-            root.after(0, _on_prime_done)
-
-        threading.Thread(target=_prime_first_frame_bg, daemon=True, name="preview-prime").start()
+        _interrupt_warm_for_scrub()
+        _cancel_warm_idle_timer()
+        try:
+            preview_info_var.set("准备预览…")
+        except Exception:
+            pass
+        if audio_hits:
+            _ensure_scrub_preview_audio(content, us, force=True)
+        _start_playback_preview_prime(content, us)
+        _schedule_playback_arm(us)
 
     preview_play_btn = ctk.CTkButton(
         preview_ctrl,
@@ -9427,6 +10290,19 @@ def run_app() -> None:
             pass
 
     def _schedule_preview_relayout(_event: Any = None) -> None:
+        if (
+            preview_state.get("play_mode") == "merge"
+            and preview_state.get("merge_ffplay_embedded")
+            and not preview_state.get("merge_ffplay_fallback")
+        ):
+            player = preview_state.get("merge_ffplay_session")
+            if isinstance(player, _MergedPreviewFfplaySession) and player.hwnd:
+                cw, ch = _preview_host_inner_size()
+                _win_resize_embedded_window(player.hwnd, cw, ch)
+                preview_sub_overlay.configure(width=cw, height=PREVIEW_SUB_BAR_HEIGHT)
+                timeline_us = _playback_timeline_us()
+                if timeline_us is not None:
+                    _refresh_playback_subtitles(timeline_us)
         if preview_state.get("last_preview_ppm") is None:
             return
         cw, ch = _preview_canvas_inner_size()
@@ -9443,6 +10319,7 @@ def run_app() -> None:
         preview_state["preview_resize_after_id"] = root.after(60, _relayout_preview_from_cache)
 
     preview_canvas.bind("<Configure>", _schedule_preview_relayout, add="+")
+    preview_video_host.bind("<Configure>", _schedule_preview_relayout, add="+")
 
     def _apply_preview_image(
         img_bytes: bytes,
@@ -9509,14 +10386,14 @@ def run_app() -> None:
             return
         preview_state["warm_interrupted_for_scrub"] = True
         _cancel_warm_idle_timer()
-        preview_state["thumb_cache"].interrupt_warming()
+        # 不终止缩略图预热 ffmpeg：拖动时仍需要后台持续写入 thumb_cache
 
     def _schedule_warm_near_playhead(playhead_us: int) -> None:
         _cancel_warm_idle_timer()
 
         def _idle_warm() -> None:
             preview_state["warm_idle_after_id"] = None
-            if _preview_is_scrubbing():
+            if _preview_is_scrubbing() or _preview_is_playing():
                 return
             content = timeline_content_cache[0]
             if not isinstance(content, dict):
@@ -9538,22 +10415,31 @@ def run_app() -> None:
         _queue_preview_apply(instant, plan, gen)
         return True
 
-    def _run_fast_preview_fetch(plan: PreviewPlan, us: int) -> None:
-        if preview_state.get("scrub_busy"):
+    def _maybe_warm_scrub_strip(plan: PreviewPlan) -> None:
+        now_ms = time.time() * 1000.0
+        last_ms = float(preview_state.get("last_scrub_warm_ms") or 0.0)
+        if now_ms - last_ms < PREVIEW_WARM_SCRUB_THROTTLE_MS:
             return
-        preview_state["scrub_busy"] = True
-        preview_state["last_worker_ms"] = time.time() * 1000.0
+        preview_state["last_scrub_warm_ms"] = now_ms
+        warm_preview_strip_near_plan(plan, preview_state["thumb_cache"])
+
+    def _run_fast_preview_fetch(plan: PreviewPlan, us: int) -> None:
+        interactive = _preview_is_scrubbing() or _preview_is_playing()
+        if preview_state.get("scrub_busy") and not interactive:
+            return
         gen = int(preview_state.get("gen", 0)) + 1
         preview_state["gen"] = gen
+        preview_state["scrub_busy"] = True
+        preview_state["last_worker_ms"] = time.time() * 1000.0
         frame_cache = preview_state["frame_cache"]
 
         def worker() -> None:
             img = fetch_scrub_frame_fast(plan, frame_cache=frame_cache)
 
             def ui() -> None:
-                preview_state["scrub_busy"] = False
                 if gen != int(preview_state.get("gen", 0)):
                     return
+                preview_state["scrub_busy"] = False
                 if img:
                     _queue_preview_apply(img, plan, gen)
                 latest = preview_state.get("pending_us")
@@ -9600,14 +10486,18 @@ def run_app() -> None:
             _preview_sync_labels(us, plan)
         if not plan.videos:
             if _preview_is_playing():
-                _stop_preview_playback()
+                return
             _preview_show_message("（当前时间无视频）")
             return
 
         if _preview_is_playing() or _preview_is_scrubbing():
             if _try_instant_scrub_preview(plan):
+                if _preview_is_scrubbing() or _preview_is_playing():
+                    _maybe_warm_scrub_strip(plan)
                 return
-            if not preview_state.get("scrub_busy"):
+            if _preview_is_scrubbing() or _preview_is_playing():
+                _maybe_warm_scrub_strip(plan)
+            if not preview_state.get("scrub_busy") or _preview_is_scrubbing() or _preview_is_playing():
                 _run_fast_preview_fetch(plan, us)
             return
 
@@ -10629,7 +11519,7 @@ def run_app() -> None:
     def _export_pool_preset_name_list(base_s: str, draft_folder_name: str) -> List[str]:
         return export_pool_preset_names_for_draft(base_s, draft_folder_name)
 
-    def _apply_export_pool_preset_choice(choice: str) -> None:
+    def _apply_export_pool_preset_choice(choice: str, *, redraw_timeline: bool = True) -> None:
         base_s = draft_root.get().strip()
         dn = (selected_name or "").strip()
         if is_pool_export_default_menu_preset(choice):
@@ -10673,10 +11563,11 @@ def run_app() -> None:
                 ui_sync()
             except Exception:
                 pass
-        try:
-            refresh_timeline_panel_data(None, reset_selection=False)
-        except Exception:
-            pass
+        if redraw_timeline:
+            try:
+                refresh_timeline_panel_data(None, reset_selection=False)
+            except Exception:
+                pass
 
     def on_pool_preset_menu_change(choice: str) -> None:
         if pool_preset_suppress["v"]:
@@ -10717,7 +11608,7 @@ def run_app() -> None:
         if reset_memory or not base_s or not os.path.isdir(base_s):
             _apply_export_pool_preset_choice(POOL_EXPORT_PRESET_DEFAULT)
 
-    def sync_export_pool_preset_for_draft(draft_folder_name: str) -> None:
+    def sync_export_pool_preset_for_draft(draft_folder_name: str, *, skip_timeline_redraw: bool = False) -> None:
         """切换草稿后：按该稿记录恢复下拉项与上次选用的预设。"""
         base_s = draft_root.get().strip()
         if not base_s or not os.path.isdir(base_s):
@@ -10739,7 +11630,7 @@ def run_app() -> None:
             pool_preset_var.set(last)
         finally:
             pool_preset_suppress["v"] = False
-        _apply_export_pool_preset_choice(last)
+        _apply_export_pool_preset_choice(last, redraw_timeline=not skip_timeline_redraw)
 
     def on_save_export_pool_preset() -> None:
         from customtkinter import CTkInputDialog
@@ -11964,20 +12855,54 @@ def run_app() -> None:
         replace_state["encrypted"] = encrypted
         replace_state["content_ok"] = bool(summary.content_ok)
         raw_timeline: Optional[Dict[str, Any]] = None
-        if summary.content_ok and _file_exists_nonempty(content_path) and not encrypted:
-            raw_timeline = _safe_read_json(content_path)
-            if raw_timeline:
-                replace_state["style_refs"] = list_style_segments_from_content(raw_timeline)
-                try:
-                    from pyJianYingDraft.script_file import ScriptFile
+        if summary.content_ok and not encrypted and isinstance(summary.content, dict):
+            raw_timeline = summary.content
 
-                    script = ScriptFile.load_from_parsed_json(raw_timeline, content_path)
-                    replace_state["refs"] = list_replaceable_media_segments_from_script(script)
-                except Exception as e:
-                    replace_state["refs"] = []
-                    detail.insert("end", f"\n\n【替换音视频槽解析失败】{e}")
-        refresh_timeline_panel_data(raw_timeline)
-        sync_export_pool_preset_for_draft(folder_name)
+        def _finish_draft_load() -> None:
+            if selected_name != folder_name:
+                return
+            sync_export_pool_preset_for_draft(folder_name, skip_timeline_redraw=True)
+            refresh_timeline_panel_data(raw_timeline)
+            if raw_timeline is not None:
+
+                def _load_replace_refs_bg() -> None:
+                    refs: List[Any] = []
+                    err_msg: Optional[str] = None
+                    try:
+                        from pyJianYingDraft.script_file import ScriptFile
+
+                        script = ScriptFile.load_from_parsed_json(raw_timeline, content_path)
+                        refs = list_replaceable_media_segments_from_script(script)
+                    except Exception as e:
+                        err_msg = str(e)
+
+                    def _on_refs_loaded() -> None:
+                        if selected_name != folder_name:
+                            return
+                        if err_msg:
+                            replace_state["refs"] = []
+                            try:
+                                detail.insert("end", f"\n\n【替换音视频槽解析失败】{err_msg}")
+                            except tk.TclError:
+                                pass
+                            return
+                        replace_state["refs"] = refs
+                        ui_sync = replace_state.get("_on_timeline_selection_ui")
+                        if callable(ui_sync):
+                            try:
+                                ui_sync()
+                            except Exception:
+                                pass
+
+                    root.after(0, _on_refs_loaded)
+
+                threading.Thread(
+                    target=_load_replace_refs_bg,
+                    daemon=True,
+                    name="draft-refs-load",
+                ).start()
+
+        root.after(0, _finish_draft_load)
 
     def _redraw_list_scroll(*, reset_scroll: bool = False) -> None:
         """CTkScrollableFrame 在子控件批量 destroy/pack 后，内部 Canvas 的 scrollregion 可能不更新，导致列表看起来没刷新。"""
