@@ -5256,8 +5256,8 @@ def _atempo_filter_for_speed(speed: float) -> Optional[str]:
 PREVIEW_AUDIO_FINE_SEEK_SEC = 0.15
 
 
-def _ffplay_audio_seek_args(path_abs: str, sec: float) -> List[str]:
-    """混合 seek：粗定位在 -i 前（快），余量在 -i 后（准），避免关键帧导致口播落后字幕。"""
+def _ffmpeg_hybrid_seek_args(path_abs: str, sec: float) -> List[str]:
+    """混合 seek：粗定位在 -i 前（快），余量在 -i 后（准），避免关键帧落到片段开头。"""
     if sec < 0.001:
         return ["-i", path_abs]
     fine_window = min(PREVIEW_AUDIO_FINE_SEEK_SEC, sec)
@@ -5272,8 +5272,12 @@ def _ffplay_audio_seek_args(path_abs: str, sec: float) -> List[str]:
     return args
 
 
+def _ffplay_audio_seek_args(path_abs: str, sec: float) -> List[str]:
+    return _ffmpeg_hybrid_seek_args(path_abs, sec)
+
+
 def _ffplay_audio_args(layer: PreviewAudioLayer, path_abs: str, sec: float) -> List[str]:
-    args: List[str] = ["-nodisp", "-autoexit", "-loglevel", "quiet"]
+    args: List[str] = ["-nodisp", "-autoexit", "-hide_banner"]
     args.extend(_ffplay_audio_seek_args(path_abs, sec))
     af_parts = _ffmpeg_audio_post_filters(layer)
     if af_parts:
@@ -5686,8 +5690,7 @@ def _spawn_playback_audio_mixed_pipe(
                 ffplay,
                 "-nodisp",
                 "-autoexit",
-                "-loglevel",
-                "quiet",
+                "-hide_banner",
                 "-i",
                 "pipe:0",
             ],
@@ -5732,8 +5735,7 @@ def spawn_playback_audio(layers: Tuple[PreviewAudioLayer, ...]) -> List[subproce
         args: List[str] = [
             "-nodisp",
             "-autoexit",
-            "-loglevel",
-            "quiet",
+            "-hide_banner",
             "-t",
             f"{timeline_sec:.6f}",
         ]
@@ -5750,54 +5752,74 @@ def spawn_playback_audio(layers: Tuple[PreviewAudioLayer, ...]) -> List[subproce
     return []
 
 
-# ffplay 周期性刷新 stderr 状态行；aq=NNKB（NN>0）表示音频队列已有数据（开始缓冲/播放）
-_FFPLAY_AUDIO_QUEUE_RE = re.compile(r"aq=\s*[1-9]\d*KB", re.I)
+# ffplay 周期性刷新 stderr 状态行；M-A 播放时间 + aq>0 表示音频已在输出
+_FFPLAY_AUDIO_PLAYING_RE = re.compile(
+    r"M-A:\s*(\d+(?:\.\d+)?).*?\baq=\s*([1-9]\d*)KB",
+    re.I,
+)
+PREVIEW_AUDIO_READY_MIN_PLAY_SEC = 0.04
+
+
+def _ffplay_stderr_audio_ma_sec(text: str) -> Optional[float]:
+    m = _FFPLAY_AUDIO_PLAYING_RE.search(text)
+    if not m:
+        return None
+    try:
+        ma = float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    if ma < PREVIEW_AUDIO_READY_MIN_PLAY_SEC:
+        return None
+    return ma
 
 
 def watch_ffplay_audio_output_ready(
     proc: subprocess.Popen,
-    on_ready: Callable[[], None],
+    on_ready: Callable[[float], None],
     *,
     timeout_sec: float = 2.5,
 ) -> None:
-    """后台读 ffplay stderr，见到音频队列非空即回调 on_ready（须在 UI 线程再改状态）。"""
+    """后台读 ffplay stderr，M-A 时间推进且 aq 非空时视为已出声。"""
     if proc is None:
-        on_ready()
+        on_ready(0.0)
         return
 
     fired = threading.Event()
 
-    def _fire() -> None:
+    def _fire(ma_sec: float = 0.0) -> None:
         if fired.is_set():
             return
+        if proc.poll() is not None:
+            return
         fired.set()
-        on_ready()
+        on_ready(ma_sec)
 
     stderr = proc.stderr
     if stderr is None:
         def _fallback() -> None:
             time.sleep(min(0.15, timeout_sec * 0.1))
-            _fire()
+            _fire(0.0)
 
         threading.Thread(target=_fallback, daemon=True, name="ffplay-ready-fallback").start()
         return
 
     def _reader() -> None:
-        deadline = time.time() + timeout_sec
         try:
-            while time.time() < deadline and proc.poll() is None:
+            while proc.poll() is None:
                 raw = stderr.readline()
                 if not raw:
                     break
                 text = raw.decode("utf-8", errors="replace")
-                if _FFPLAY_AUDIO_QUEUE_RE.search(text):
-                    _fire()
+                ma_sec = _ffplay_stderr_audio_ma_sec(text)
+                if ma_sec is not None:
+                    _fire(ma_sec)
                     return
         except OSError:
             pass
-        if proc.poll() is None:
-            _fire()
 
+    timer = threading.Timer(timeout_sec, lambda: _fire(0.0))
+    timer.daemon = True
+    timer.start()
     threading.Thread(target=_reader, daemon=True, name="ffplay-ready-watch").start()
 
 
@@ -6855,9 +6877,14 @@ PREVIEW_WARM_INITIAL_SEC = 30.0
 PREVIEW_WARM_WINDOW_SEC = 50.0
 PREVIEW_WARM_SCRUB_FOLLOW_SEC = 12.0
 PREVIEW_WARM_SCRUB_THROTTLE_MS = 220
+PREVIEW_PLAY_WARM_AHEAD_SEC = 24.0
+PREVIEW_PLAY_WARM_THROTTLE_MS = 180
+PREVIEW_PLAY_SUBTITLE_THROTTLE_MS = 80
 PREVIEW_WARM_IDLE_MS = 1200
 PREVIEW_PLAY_SYNC_HOLD_MS = 160
 PREVIEW_PLAY_SYNC_TIMEOUT_MS = 2500
+PREVIEW_PLAY_PRIME_TIMEOUT_MS = 8000
+PREVIEW_PLAY_PREFETCH_STEPS = 1
 
 
 class _PlaybackVideoReader:
@@ -7205,10 +7232,7 @@ def _warm_video_thumbnail_strip(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-ss",
-        f"{start_sec:.3f}",
-        "-i",
-        path_abs,
+        *_ffmpeg_hybrid_seek_args(path_abs, start_sec),
     ]
     if duration_sec is not None and duration_sec > 0:
         cmd.extend(["-t", f"{float(duration_sec):.3f}"])
@@ -7343,6 +7367,34 @@ def warm_preview_near_playhead(
     warm_preview_for_plan(build_preview_plan(content, playhead_us), cache)
 
 
+def warm_preview_play_ahead(
+    content: Dict[str, Any],
+    playhead_us: int,
+    cache: _ThumbnailStripCache,
+) -> None:
+    """点击播放时从当前播放头向前预热缩略图条，减少暂停再继续时的取帧空窗。"""
+    plan = build_preview_plan(content, int(playhead_us))
+    if not plan.videos:
+        return
+    top = plan.videos[-1]
+    center_sec = max(0.0, top.source_us / 1_000_000.0)
+    start_sec = max(0.0, center_sec - 1.0)
+    _start_warm_path(
+        top.path,
+        cache,
+        start_sec=start_sec,
+        duration_sec=PREVIEW_PLAY_WARM_AHEAD_SEC + 1.0,
+    )
+
+
+def preview_thumb_bucket_key(plan: PreviewPlan) -> Optional[Tuple[str, int]]:
+    if not plan.videos:
+        return None
+    top = plan.videos[-1]
+    bucket = int(top.source_us // SCRUB_THUMB_STEP_US) * SCRUB_THUMB_STEP_US
+    return (os.path.abspath(top.path), bucket)
+
+
 def _collect_preview_video_paths(content: Dict[str, Any]) -> List[str]:
     materials = content.get("materials") if isinstance(content.get("materials"), dict) else {}
     seen: set = set()
@@ -7364,12 +7416,36 @@ def _collect_preview_video_paths(content: Dict[str, Any]) -> List[str]:
     return out
 
 
-def fetch_instant_scrub_frame(plan: PreviewPlan, thumb_cache: _ThumbnailStripCache) -> Optional[bytes]:
-    """拖动时从缩略图条取最近帧（仅最前景视频层，不回落到底层）。"""
+def fetch_instant_scrub_frame(
+    plan: PreviewPlan,
+    thumb_cache: _ThumbnailStripCache,
+    *,
+    exact: bool = False,
+) -> Optional[bytes]:
+    """拖动时从缩略图条取帧；exact=True 时仅当当前 bucket 已预热（播放起跑用）。"""
     if not plan.videos:
         return None
     top = plan.videos[-1]
+    if exact and not thumb_cache.has_bucket(top.path, top.source_us):
+        return None
     return thumb_cache.nearest(top.path, top.source_us)
+
+
+def fetch_play_start_preview_frame(
+    plan: PreviewPlan,
+    thumb_cache: _ThumbnailStripCache,
+    frame_cache: _PreviewFrameCache,
+) -> Optional[bytes]:
+    """播放起跑画面：与首次从 t=0 播放相同标准——精确帧或已预热的当前 bucket，不用 distant nearest。"""
+    if not plan.videos:
+        return None
+    top = plan.videos[-1]
+    hit = frame_cache.get(top.path, top.source_us)
+    if hit:
+        return hit
+    if thumb_cache.has_bucket(top.path, top.source_us):
+        return thumb_cache.nearest(top.path, top.source_us)
+    return None
 
 
 def fetch_scrub_frame_fast(
@@ -7377,15 +7453,16 @@ def fetch_scrub_frame_fast(
     *,
     max_width: int = SCRUB_THUMB_WIDTH,
     frame_cache: Optional[_PreviewFrameCache] = None,
+    skip_cache: bool = False,
 ) -> Optional[bytes]:
-    """拖动时的快速单帧：仅最前景视频，低分辨率 PPM + fast seek。"""
+    """单帧预览：混合 seek（与音频 atrim 同精度），避免 -ss 在 -i 前落到关键帧/片段头。"""
     if not plan.videos:
         return None
     layer = plan.videos[-1]
     ff = find_ffmpeg()
     if not ff or not os.path.isfile(layer.path):
         return None
-    if frame_cache is not None:
+    if frame_cache is not None and not skip_cache:
         hit = frame_cache.get(layer.path, layer.source_us)
         if hit:
             return hit
@@ -7396,10 +7473,7 @@ def fetch_scrub_frame_fast(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-ss",
-        f"{sec:.3f}",
-        "-i",
-        path_abs,
+        *_ffmpeg_hybrid_seek_args(path_abs, sec),
         "-frames:v",
         "1",
         "-an",
@@ -7420,6 +7494,28 @@ def fetch_scrub_frame_fast(
     if frame_cache is not None:
         frame_cache.put(layer.path, layer.source_us, proc.stdout)
     return proc.stdout
+
+
+def prefetch_playback_ahead_frames(
+    content: Dict[str, Any],
+    start_us: int,
+    frame_cache: _PreviewFrameCache,
+    *,
+    steps: int = 2,
+) -> None:
+    """播放起跑前同步预取后续若干缩略图步长处的帧，避免 arm 后音频先行、画面卡在暂停帧。"""
+    total_us = _timeline_end_us(content)
+    if total_us <= 0:
+        return
+    for step in range(1, max(1, int(steps)) + 1):
+        t_us = min(int(start_us) + step * SCRUB_THUMB_STEP_US, max(0, total_us - 1))
+        plan = build_preview_plan(content, t_us)
+        if not plan.videos:
+            break
+        top = plan.videos[-1]
+        if frame_cache.get(top.path, top.source_us):
+            continue
+        fetch_scrub_frame_fast(plan, frame_cache=frame_cache)
 
 
 def _ppm_pixel_offset(ppm_bytes: bytes) -> Optional[int]:
@@ -9126,7 +9222,11 @@ def run_app() -> None:
         "play_audio_arm_started_at": None,
         "play_audio_output_ready": False,
         "play_audio_ready_gen": 0,
+        "play_audio_ready_ma_sec": 0.0,
         "play_prime_ready": False,
+        "play_last_instant_bucket": None,
+        "play_last_sub_refresh_ms": 0.0,
+        "scrub_fetch_gen": 0,
         "play_prime_gen": 0,
         "play_mode": "live",
         "merge_path": None,
@@ -9155,6 +9255,8 @@ def run_app() -> None:
         "audio_prefetch_gen": 0,
         "audio_waiting_next": False,
         "audio_pause_timeline_us": None,
+        "playback_session_active": False,
+        "play_pause_timeline_us": None,
     }
 
     def _playback_timeline_us() -> Optional[int]:
@@ -9222,13 +9324,16 @@ def run_app() -> None:
         preview_state["play_audio_ready_gen"] = ready_gen
         preview_state["play_audio_output_ready"] = False
 
-        def _on_ready() -> None:
+        def _on_ready(_ma_sec: float = 0.0) -> None:
             def _ui() -> None:
                 if ready_gen != int(preview_state.get("play_audio_ready_gen", 0)):
                     return
                 if not _preview_is_playing():
                     return
+                preview_state["play_audio_ready_ma_sec"] = max(0.0, float(_ma_sec))
                 preview_state["play_audio_output_ready"] = True
+                if preview_state.get("play_mode") != "scrub":
+                    _try_arm_playback_when_ready()
 
             try:
                 root.after(0, _ui)
@@ -9313,17 +9418,65 @@ def run_app() -> None:
     def _repoll_playback_arm() -> None:
         preview_state["play_clock_arm_after_id"] = root.after(40, _poll_playback_arm)
 
+    def _playback_video_ready(playhead_us: int) -> bool:
+        """视频已绘制到 canvas 且与播放头对齐，时间轴可以起跑。"""
+        if not preview_state.get("play_prime_ready"):
+            return False
+        content = timeline_content_cache[0]
+        if not isinstance(content, dict):
+            return True
+        plan = build_preview_plan(content, int(playhead_us))
+        if plan.videos and preview_state.get("photo") is None:
+            return False
+        display = preview_state.get("play_display_us")
+        if plan.videos and display is None:
+            return False
+        if display is not None and abs(int(display) - int(playhead_us)) > SCRUB_THUMB_STEP_US:
+            return False
+        return True
+
+    def _try_arm_playback_when_ready() -> None:
+        """非 scrub 模式：等音频 aq 就绪后 arm。"""
+        if not _preview_is_playing():
+            return
+        if preview_state.get("play_wall_t0") is not None:
+            return
+        if not preview_state.get("play_prime_ready"):
+            return
+        if preview_state.get("play_mode") == "scrub":
+            return
+        us = int(preview_state.get("play_arm_us") or preview_state.get("play_start_us") or 0)
+        content = timeline_content_cache[0]
+        hits = (
+            _playback_audio_hits(content, us) if isinstance(content, dict) else ()
+        )
+        if hits and not preview_state.get("play_audio_output_ready"):
+            return
+        _arm_playback_clock(us)
+
     def _arm_playback_clock(playhead_us: int) -> None:
-        """音视频就绪后，以当前时刻起跑（不再用固定 hold 偏移）。"""
+        """scrub：先启动时间轴再 spawn ffplay（音频略晚于红线，避免超前）。"""
+        if preview_state.get("play_wall_t0") is not None:
+            return
         _cancel_playback_arm()
         preview_state["play_audio_alive_since"] = None
         preview_state["play_audio_arm_started_at"] = None
         if not _preview_is_playing():
             return
-        preview_state["play_start_us"] = int(playhead_us)
+        us = int(playhead_us)
+        preview_state["play_start_us"] = us
         preview_state["play_wall_t0"] = time.time()
         preview_state["play_subtitle_frame_idx"] = None
         preview_state["play_last_ph_redraw_us"] = -1
+        content = timeline_content_cache[0]
+        if isinstance(content, dict) and preview_state.get("play_mode") == "scrub":
+            hits = _playback_audio_hits(content, us)
+            if hits:
+                _ensure_scrub_preview_audio(content, us, force=True)
+        try:
+            preview_info_var.set("")
+        except Exception:
+            pass
         _preview_play_tick()
 
     def _poll_playback_arm() -> None:
@@ -9332,11 +9485,15 @@ def run_app() -> None:
             return
         if not preview_state.get("play_prime_ready"):
             started_at = float(preview_state.get("play_audio_arm_started_at") or time.time())
-            if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
-                preview_state["play_prime_ready"] = True
-            else:
-                _repoll_playback_arm()
+            if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_PRIME_TIMEOUT_MS:
+                try:
+                    preview_info_var.set("（预览画面准备超时，已停止）")
+                except Exception:
+                    pass
+                _stop_preview_playback()
                 return
+            _repoll_playback_arm()
+            return
         us = int(preview_state.get("play_arm_us") or preview_state.get("play_start_us") or 0)
         content = timeline_content_cache[0]
         procs = preview_state.get("play_audio_procs") or []
@@ -9374,32 +9531,9 @@ def run_app() -> None:
             return
 
         if preview_state.get("play_mode") == "scrub":
-            hits = _playback_audio_hits(content, us) if isinstance(content, dict) else ()
-            procs = preview_state.get("play_audio_procs") or []
-            if hits:
-                if not procs:
-                    _ensure_scrub_preview_audio(content, us, force=True)
-                    procs = preview_state.get("play_audio_procs") or []
-                if procs:
-                    if any(p is None or p.poll() is not None for p in procs):
-                        started_at = float(
-                            preview_state.get("play_audio_arm_started_at") or time.time()
-                        )
-                        if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
-                            _arm_playback_clock(us)
-                        else:
-                            _repoll_playback_arm()
-                        return
-                    alive_since = preview_state.get("play_audio_alive_since")
-                    if not preview_state.get("play_audio_output_ready"):
-                        started_at = float(alive_since or preview_state.get("play_audio_arm_started_at") or time.time())
-                        if (time.time() - started_at) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
-                            preview_state["play_audio_output_ready"] = True
-                        else:
-                            _repoll_playback_arm()
-                            return
-                    _arm_playback_clock(us)
-                    return
+            if not _playback_video_ready(us):
+                _repoll_playback_arm()
+                return
             _arm_playback_clock(us)
             return
 
@@ -9540,7 +9674,42 @@ def run_app() -> None:
 
         preview_state["merge_delete_after_id"] = root.after(max(200, int(delay_ms)), _flush)
 
+    def _clear_playback_session() -> None:
+        preview_state["playback_session_active"] = False
+        preview_state["play_pause_timeline_us"] = None
+
+    def _pause_preview_playback() -> None:
+        """暂停：停时钟与音频，保留画面/缩略图/帧缓存（会话仍有效，可快速续播）。"""
+        preview_state["playing"] = False
+        _cancel_playback_arm()
+        aid = preview_state.get("play_after_id")
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            preview_state["play_after_id"] = None
+        pause_us = _playback_timeline_us()
+        if pause_us is None:
+            pause_us = int(
+                replace_state.get("playhead_us")
+                or timeline_select.get("playhead_us")
+                or preview_state.get("pending_us")
+                or 0
+            )
+        preview_state["play_pause_timeline_us"] = int(pause_us)
+        preview_state["playback_session_active"] = True
+        _stop_playback_audio()
+        preview_state["play_wall_t0"] = None
+        preview_state["play_prime_ready"] = False
+        preview_state["play_audio_output_ready"] = False
+        preview_state["play_audio_ready_ma_sec"] = 0.0
+        preview_state["scrub_fetch_gen"] = int(preview_state.get("scrub_fetch_gen") or 0) + 1
+        preview_state["scrub_busy"] = False
+        _preview_play_btn_set("▶")
+
     def _stop_preview_playback() -> None:
+        _clear_playback_session()
         preview_state["playing"] = False
         _cancel_playback_arm()
         aid = preview_state.get("play_after_id")
@@ -9573,8 +9742,13 @@ def run_app() -> None:
         preview_state["preview_sub_layout"] = None
         preview_state["play_subtitle_frame_idx"] = None
         preview_state["play_prime_ready"] = False
+        preview_state["play_last_instant_bucket"] = None
         preview_state["play_audio_alive_since"] = None
         preview_state["play_audio_arm_started_at"] = None
+        preview_state["play_audio_ready_ma_sec"] = 0.0
+        preview_state["scrub_fetch_gen"] = int(preview_state.get("scrub_fetch_gen") or 0) + 1
+        preview_state["scrub_busy"] = False
+        preview_state["frame_cache"].clear()
         _hide_merge_ffplay_ui()
         preview_state["audio_chunk_path"] = None
         preview_state["audio_next_path"] = None
@@ -9609,6 +9783,27 @@ def run_app() -> None:
             return
         ox, oy, iw, ih = layout
         _draw_preview_subtitle_overlays(preview_canvas, plan.texts, iw, ih, offset_x=ox, offset_y=oy)
+
+    def _refresh_playback_subtitles_throttled(timeline_us: int) -> None:
+        now_ms = time.time() * 1000.0
+        last_ms = float(preview_state.get("play_last_sub_refresh_ms") or 0.0)
+        if now_ms - last_ms < PREVIEW_PLAY_SUBTITLE_THROTTLE_MS:
+            return
+        preview_state["play_last_sub_refresh_ms"] = now_ms
+        _refresh_playback_subtitles(timeline_us)
+
+    def _update_playback_preview_frame(content: Dict[str, Any], timeline_us: int) -> None:
+        """播放中仅在新缩略图 bucket 时换帧，避免每 tick 触发 notify/ffmpeg。"""
+        plan = build_preview_plan(content, int(timeline_us))
+        if not plan.videos:
+            return
+        bucket_key = preview_thumb_bucket_key(plan)
+        if bucket_key is not None and bucket_key == preview_state.get("play_last_instant_bucket"):
+            return
+        if _try_instant_scrub_preview(plan):
+            return
+        if not preview_state.get("scrub_busy"):
+            _run_fast_preview_fetch(plan, int(timeline_us))
 
     def _start_merge_chunk_prefetch(content: Dict[str, Any], next_t0_us: int) -> None:
         if preview_state.get("merge_prefetch_busy") or preview_state.get("merge_next_path"):
@@ -9884,13 +10079,21 @@ def run_app() -> None:
             preview_state["play_wall_t0"] = None
             _schedule_playback_arm(int(timeline_us))
 
+    def _current_playhead_us() -> int:
+        return int(
+            replace_state.get("playhead_us")
+            or timeline_select.get("playhead_us")
+            or preview_state.get("pending_us")
+            or 0
+        )
+
     def _mark_playback_prime_ready() -> None:
         if not _preview_is_playing():
             return
         preview_state["play_prime_ready"] = True
 
     def _start_playback_preview_prime(content: Dict[str, Any], playhead_us: int) -> None:
-        """播放起跑前：拉取当前播放头画面（与 ffplay 启动并行）。"""
+        """播放起跑：当前播放头精确画面就绪后再 spawn 音频、arm 时钟。"""
         us = int(playhead_us)
         plan = build_preview_plan(content, us)
         prime_gen = int(preview_state.get("gen", 0))
@@ -9904,14 +10107,10 @@ def run_app() -> None:
 
         thumb_cache = preview_state["thumb_cache"]
         frame_cache = preview_state["frame_cache"]
-        instant = fetch_instant_scrub_frame(plan, thumb_cache)
-        if not instant:
-            top = plan.videos[-1]
-            instant = frame_cache.get(top.path, top.source_us)
+        warm_preview_play_ahead(content, us, thumb_cache)
+        instant = fetch_play_start_preview_frame(plan, thumb_cache, frame_cache)
         if instant:
-            _queue_preview_apply(instant, plan, prime_gen, subtitle_us=us)
-            _preview_sync_labels(us, plan)
-            _mark_playback_prime_ready()
+            _finish_playback_prime(content, us, plan, prime_gen, instant)
             return
 
         try:
@@ -9921,17 +10120,12 @@ def run_app() -> None:
         _preview_sync_timecode(us, content)
 
         def _worker() -> None:
-            img = fetch_scrub_frame_fast(plan, frame_cache=frame_cache)
+            img = fetch_scrub_frame_fast(
+                plan, frame_cache=frame_cache, skip_cache=True
+            )
 
             def _ui() -> None:
-                if not _preview_is_playing():
-                    return
-                if prime_gen != int(preview_state.get("gen", 0)):
-                    return
-                if img:
-                    _queue_preview_apply(img, plan, prime_gen, subtitle_us=us)
-                _preview_sync_labels(us, plan)
-                _mark_playback_prime_ready()
+                _finish_playback_prime(content, us, plan, prime_gen, img)
 
             root.after(0, _ui)
 
@@ -10048,10 +10242,7 @@ def run_app() -> None:
                 if _preview_is_playing():
                     preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
                 return
-            preview_state["play_wall_t0"] = time.time()
-            preview_state["play_start_us"] = int(
-                preview_state.get("play_start_us") or replace_state.get("playhead_us") or 0
-            )
+            return
 
         timeline_us = _playback_timeline_us()
         if timeline_us is None:
@@ -10076,10 +10267,10 @@ def run_app() -> None:
         set_ph = replace_state.get("_set_playhead")
         if callable(set_ph):
             try:
-                set_ph(timeline_us, notify=True, redraw=True)
+                set_ph(timeline_us, notify=False, redraw=True)
             except TypeError:
                 try:
-                    set_ph(timeline_us, notify=True)
+                    set_ph(timeline_us, notify=False)
                 except Exception:
                     pass
             except Exception:
@@ -10087,22 +10278,70 @@ def run_app() -> None:
         else:
             replace_state["playhead_us"] = timeline_us
             preview_state["pending_us"] = timeline_us
-            on_playhead_changed(timeline_us)
 
+        _preview_sync_timecode(timeline_us, content)
         preview_state["play_last_ph_redraw_us"] = timeline_us
-        _maybe_warm_scrub_strip(build_preview_plan(content, timeline_us))
+        if preview_state.get("play_mode") == "scrub":
+            _update_playback_preview_frame(content, timeline_us)
+            _refresh_playback_subtitles_throttled(timeline_us)
+            _maybe_warm_scrub_strip(build_preview_plan(content, timeline_us))
 
         if _preview_is_playing():
             preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
 
+    def _can_fast_resume_playback(content: Dict[str, Any], us: int) -> bool:
+        if not preview_state.get("playback_session_active"):
+            return False
+        paused_us = preview_state.get("play_pause_timeline_us")
+        if paused_us is None:
+            return False
+        if abs(int(us) - int(paused_us)) > SCRUB_THUMB_STEP_US // 4:
+            return False
+        if preview_state.get("photo") is None:
+            return False
+        display_us = preview_state.get("play_display_us")
+        if display_us is None:
+            return False
+        if abs(int(display_us) - int(us)) > SCRUB_THUMB_STEP_US:
+            return False
+        plan = build_preview_plan(content, us)
+        return bool(plan.videos or _playback_audio_hits(content, us))
+
+    def _fast_resume_preview_playback(content: Dict[str, Any], us: int) -> None:
+        """暂停后续播：先确认画面就绪，再与音频同时起跑。"""
+        us = int(us)
+        plan = build_preview_plan(content, us)
+        prime_gen = int(preview_state.get("gen", 0))
+        preview_state["playing"] = True
+        preview_state["play_mode"] = "scrub"
+        preview_state["play_wall_t0"] = None
+        preview_state["play_start_us"] = us
+        preview_state["play_arm_us"] = us
+        preview_state["play_last_ph_redraw_us"] = -1
+        preview_state["play_prime_ready"] = False
+        preview_state["play_audio_ready_ma_sec"] = 0.0
+        preview_state["play_audio_output_ready"] = False
+        _preview_play_btn_set("⏸")
+        try:
+            preview_info_var.set("准备续播画面…")
+        except Exception:
+            pass
+        warm_preview_play_ahead(content, us, preview_state["thumb_cache"])
+        ppm = preview_state.get("last_preview_ppm")
+        if ppm and preview_state.get("photo") is not None:
+            _finish_playback_prime(content, us, plan, prime_gen, ppm)
+        else:
+            _start_playback_preview_prime(content, us)
+        _schedule_playback_arm(us)
+
     def _toggle_preview_playback() -> None:
         if _preview_is_playing():
-            _stop_preview_playback()
+            _pause_preview_playback()
             return
         content = timeline_content_cache[0]
         if not isinstance(content, dict):
             return
-        us = int(replace_state.get("playhead_us") or preview_state.get("pending_us") or 0)
+        us = _current_playhead_us()
         plan = build_preview_plan(content, us)
         audio_hits = _playback_audio_hits(content, us)
         if not plan.videos and not audio_hits:
@@ -10112,6 +10351,11 @@ def run_app() -> None:
         if us >= total_us:
             return
 
+        if _can_fast_resume_playback(content, us):
+            _fast_resume_preview_playback(content, us)
+            return
+
+        _clear_playback_session()
         _hide_merge_ffplay_ui()
         old_worker = preview_state.get("play_video_worker")
         if isinstance(old_worker, (_PlaybackVideoWorker, _MergedPreviewVideoWorker)):
@@ -10127,6 +10371,10 @@ def run_app() -> None:
         preview_state["play_video_worker"] = None
         preview_state["play_video_worker_started"] = False
         preview_state["play_prime_ready"] = False
+        preview_state["play_last_instant_bucket"] = None
+        preview_state["play_audio_ready_ma_sec"] = 0.0
+        preview_state["scrub_fetch_gen"] = int(preview_state.get("scrub_fetch_gen") or 0) + 1
+        preview_state["frame_cache"].clear()
         preview_state["merge_path"] = None
         preview_state["merge_next_path"] = None
         preview_state["audio_chunk_path"] = None
@@ -10143,8 +10391,6 @@ def run_app() -> None:
             preview_info_var.set("准备预览…")
         except Exception:
             pass
-        if audio_hits:
-            _ensure_scrub_preview_audio(content, us, force=True)
         _start_playback_preview_prime(content, us)
         _schedule_playback_arm(us)
 
@@ -10180,6 +10426,7 @@ def run_app() -> None:
 
     root.bind("<KeyPress-space>", _on_preview_space_key, add="+")
     replace_state["_stop_preview_playback"] = _stop_preview_playback
+    replace_state["_pause_preview_playback"] = _pause_preview_playback
 
     def _schedule_preview_apply(
         img_bytes: bytes,
@@ -10200,7 +10447,7 @@ def run_app() -> None:
                 return
             preview_state["ui_apply_pending"] = None
             img_b, plan_b, gen_b, sub_us = pending
-            if gen_b != int(preview_state.get("gen", 0)):
+            if not _preview_is_playing() and gen_b != int(preview_state.get("gen", 0)):
                 return
             try:
                 _apply_preview_image(img_b, plan_b, gen_b, subtitle_us=sub_us)
@@ -10260,6 +10507,10 @@ def run_app() -> None:
         oy = max(0, (ch - ih) // 2)
         preview_canvas.create_image(ox, oy, anchor="nw", image=photo, tags=("preview_img",))
         texts = plan.texts
+        if subtitle_us is None and _preview_is_playing():
+            timeline_us = _playback_timeline_us()
+            if timeline_us is not None:
+                subtitle_us = _playback_subtitle_us(timeline_us)
         if subtitle_us is not None:
             content = timeline_content_cache[0]
             if isinstance(content, dict):
@@ -10332,7 +10583,61 @@ def run_app() -> None:
         preview_state["last_preview_ppm"] = img_bytes
         preview_state["last_preview_plan"] = plan
         preview_state["last_preview_subtitle_us"] = subtitle_us
+        preview_state["play_display_us"] = int(plan.playhead_us)
         return _layout_preview_ppm(img_bytes, plan, gen, subtitle_us=subtitle_us, silent=silent)
+
+    def _apply_playback_frame_sync(
+        img_bytes: bytes,
+        plan: PreviewPlan,
+        *,
+        subtitle_us: Optional[int] = None,
+    ) -> None:
+        """播放中同步换帧（不走 root.after 队列，避免音频已走、画面仍停旧帧）。"""
+        gen = int(preview_state.get("gen", 0))
+        try:
+            _apply_preview_image(img_bytes, plan, gen, subtitle_us=subtitle_us)
+        except Exception:
+            return
+        bucket_key = preview_thumb_bucket_key(plan)
+        if bucket_key is not None:
+            preview_state["play_last_instant_bucket"] = bucket_key
+
+    def _finish_playback_prime(
+        content: Dict[str, Any],
+        us: int,
+        plan: PreviewPlan,
+        gen: int,
+        img_bytes: Optional[bytes],
+    ) -> None:
+        """播放起跑：同步绘制 + 预取后续帧；音频在 arm 时钟时 spawn。"""
+        if not _preview_is_playing() or gen != int(preview_state.get("gen", 0)):
+            return
+        if img_bytes:
+            try:
+                _apply_preview_image(img_bytes, plan, gen, subtitle_us=us)
+            except Exception:
+                pass
+        bucket_key = preview_thumb_bucket_key(plan)
+        if bucket_key is not None:
+            preview_state["play_last_instant_bucket"] = bucket_key
+        _preview_sync_labels(us, plan)
+        try:
+            root.update_idletasks()
+        except tk.TclError:
+            pass
+        _mark_playback_prime_ready()
+        frame_cache = preview_state["frame_cache"]
+        prime_us = int(us)
+        prime_gen = int(gen)
+
+        def _prefetch_bg() -> None:
+            prefetch_playback_ahead_frames(
+                content, prime_us, frame_cache, steps=PREVIEW_PLAY_PREFETCH_STEPS
+            )
+
+        threading.Thread(
+            target=_prefetch_bg, daemon=True, name="preview-play-prefetch"
+        ).start()
 
     def _queue_preview_apply(
         img_bytes: bytes,
@@ -10407,9 +10712,31 @@ def run_app() -> None:
         _schedule_warm_near_playhead(playhead_us)
 
     def _try_instant_scrub_preview(plan: PreviewPlan) -> bool:
-        instant = fetch_instant_scrub_frame(plan, preview_state["thumb_cache"])
+        playing = _preview_is_playing()
+        instant = fetch_instant_scrub_frame(
+            plan, preview_state["thumb_cache"], exact=playing
+        )
         if not instant:
             return False
+        bucket_key = preview_thumb_bucket_key(plan)
+        if _preview_is_playing() and bucket_key is not None:
+            if (
+                bucket_key == preview_state.get("play_last_instant_bucket")
+                and preview_state.get("photo") is not None
+            ):
+                timeline_us = _playback_timeline_us()
+                if timeline_us is not None:
+                    _refresh_playback_subtitles(timeline_us)
+                return True
+            preview_state["play_last_instant_bucket"] = bucket_key
+            timeline_us = _playback_timeline_us()
+            sub_us = (
+                _playback_subtitle_us(timeline_us)
+                if timeline_us is not None
+                else int(plan.playhead_us)
+            )
+            _apply_playback_frame_sync(instant, plan, subtitle_us=sub_us)
+            return True
         gen = int(preview_state.get("gen", 0)) + 1
         preview_state["gen"] = gen
         _queue_preview_apply(instant, plan, gen)
@@ -10418,7 +10745,12 @@ def run_app() -> None:
     def _maybe_warm_scrub_strip(plan: PreviewPlan) -> None:
         now_ms = time.time() * 1000.0
         last_ms = float(preview_state.get("last_scrub_warm_ms") or 0.0)
-        if now_ms - last_ms < PREVIEW_WARM_SCRUB_THROTTLE_MS:
+        throttle_ms = (
+            PREVIEW_PLAY_WARM_THROTTLE_MS
+            if _preview_is_playing()
+            else PREVIEW_WARM_SCRUB_THROTTLE_MS
+        )
+        if now_ms - last_ms < throttle_ms:
             return
         preview_state["last_scrub_warm_ms"] = now_ms
         warm_preview_strip_near_plan(plan, preview_state["thumb_cache"])
@@ -10427,21 +10759,41 @@ def run_app() -> None:
         interactive = _preview_is_scrubbing() or _preview_is_playing()
         if preview_state.get("scrub_busy") and not interactive:
             return
-        gen = int(preview_state.get("gen", 0)) + 1
-        preview_state["gen"] = gen
+        playing = _preview_is_playing()
+        if playing:
+            fetch_gen = int(preview_state.get("scrub_fetch_gen") or 0) + 1
+            preview_state["scrub_fetch_gen"] = fetch_gen
+            worker_token = fetch_gen
+            apply_gen = int(preview_state.get("gen", 0))
+        else:
+            apply_gen = int(preview_state.get("gen", 0)) + 1
+            preview_state["gen"] = apply_gen
+            worker_token = apply_gen
         preview_state["scrub_busy"] = True
         preview_state["last_worker_ms"] = time.time() * 1000.0
         frame_cache = preview_state["frame_cache"]
+        bucket_key = preview_thumb_bucket_key(plan)
 
         def worker() -> None:
             img = fetch_scrub_frame_fast(plan, frame_cache=frame_cache)
 
             def ui() -> None:
-                if gen != int(preview_state.get("gen", 0)):
+                if playing:
+                    if worker_token != int(preview_state.get("scrub_fetch_gen") or 0):
+                        return
+                elif worker_token != int(preview_state.get("gen", 0)):
                     return
                 preview_state["scrub_busy"] = False
                 if img:
-                    _queue_preview_apply(img, plan, gen)
+                    if playing and bucket_key is not None:
+                        preview_state["play_last_instant_bucket"] = bucket_key
+                    timeline_us = _playback_timeline_us()
+                    sub_us = (
+                        _playback_subtitle_us(timeline_us)
+                        if timeline_us is not None
+                        else int(plan.playhead_us)
+                    )
+                    _queue_preview_apply(img, plan, apply_gen, subtitle_us=sub_us)
                 latest = preview_state.get("pending_us")
                 if (
                     latest is not None
@@ -10479,6 +10831,7 @@ def run_app() -> None:
         plan = build_preview_plan(content, us)
         if _preview_is_playing():
             _preview_sync_time_only(us)
+            return
         elif _preview_is_scrubbing():
             _preview_sync_time_only(us)
             _interrupt_warm_for_scrub()
