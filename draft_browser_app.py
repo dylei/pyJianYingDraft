@@ -5814,6 +5814,7 @@ def watch_ffplay_audio_output_ready(
     *,
     timeout_sec: float = 2.5,
     arm_on_aq_only: bool = False,
+    min_ma_sec: float = PREVIEW_AUDIO_READY_MIN_PLAY_SEC,
 ) -> None:
     """后台读 ffplay stderr；续播可仅用 aq 非空触发（比 M-A 更早）。"""
     if proc is None:
@@ -5847,7 +5848,7 @@ def watch_ffplay_audio_output_ready(
                     break
                 text = raw.decode("utf-8", errors="replace")
                 ma_sec = _ffplay_stderr_audio_ma_sec(text)
-                if ma_sec is not None:
+                if ma_sec is not None and ma_sec >= float(min_ma_sec):
                     _fire(ma_sec)
                     return
                 if arm_on_aq_only and _FFPLAY_AUDIO_QUEUE_RE.search(text):
@@ -9387,11 +9388,20 @@ def run_app() -> None:
             except tk.TclError:
                 pass
 
+        preroll_ms = int(preview_state.get("play_audio_preroll_ms") or 0)
+        if preroll_ms > 0:
+            min_ma_sec = max(
+                PREVIEW_AUDIO_READY_MIN_PLAY_SEC,
+                preroll_ms / 1000.0 - PREVIEW_AUDIO_OUTPUT_LATENCY_SEC,
+            )
+        else:
+            min_ma_sec = PREVIEW_AUDIO_READY_MIN_PLAY_SEC
         watch_ffplay_audio_output_ready(
             ffplay_proc,
             _on_ready,
             timeout_sec=PREVIEW_PLAY_SYNC_TIMEOUT_MS / 1000.0,
             arm_on_aq_only=arm_on_aq_only,
+            min_ma_sec=min_ma_sec,
         )
 
     def _start_merged_preview_ffplay(*, start_sec: float = 0.0) -> bool:
@@ -9505,12 +9515,17 @@ def run_app() -> None:
         ma = 0.0
         if hits:
             ma = max(0.0, float(preview_state.get("play_audio_ready_ma_sec") or 0.0))
+            preroll_ms = int(preview_state.get("play_audio_preroll_ms") or 0)
+            if preroll_ms > 0:
+                ma = max(0.0, ma - preroll_ms / 1000.0)
         preview_state["play_wall_t0"] = time.time() - ma + (
             PREVIEW_AUDIO_OUTPUT_LATENCY_SEC if hits else 0.0
         )
         preview_state["play_subtitle_frame_idx"] = None
         preview_state["play_last_ph_redraw_us"] = -1
-        preview_state["play_last_instant_bucket"] = None
+        if not preview_state.get("play_fast_resume_arm"):
+            preview_state["play_last_instant_bucket"] = None
+        preview_state["play_fast_resume_arm"] = False
         timeline_us = _playback_timeline_us()
         if timeline_us is None:
             timeline_us = us
@@ -10123,6 +10138,7 @@ def run_app() -> None:
         timeline_us: int,
         *,
         force: bool = False,
+        resume: bool = False,
     ) -> None:
         """播放中：按当前时间轴位置立即 ffplay 出声（不等待后台 chunk 渲染）。"""
         hits = _playback_audio_hits(content, int(timeline_us))
@@ -10140,7 +10156,7 @@ def run_app() -> None:
         if alive:
             _stop_playback_audio()
         layers = tuple(layer for layer, _key in hits)
-        preroll_ms = 0
+        preroll_ms = 0 if resume else PREVIEW_SCRUB_AUDIO_PREROLL_MS
         new_procs = spawn_playback_audio(layers, preroll_ms=preroll_ms)
         preview_state["play_audio_procs"] = new_procs or None
         preview_state["play_audio_proc"] = new_procs[-1] if new_procs else None
@@ -10149,13 +10165,14 @@ def run_app() -> None:
             _mark_merge_audio_spawned()
             preview_state["play_audio_output_ready"] = False
             preview_state["play_audio_preroll_ms"] = preroll_ms
-            _attach_playback_audio_ready_watch(new_procs)
-            try:
-                preview_info_var.set(
-                    f"预览音频 · {_fmt_us_as_timecode(int(timeline_us))}"
-                )
-            except Exception:
-                pass
+            _attach_playback_audio_ready_watch(new_procs, arm_on_aq_only=resume)
+            if not resume:
+                try:
+                    preview_info_var.set(
+                        f"预览音频 · {_fmt_us_as_timecode(int(timeline_us))}"
+                    )
+                except Exception:
+                    pass
         elif not find_ffplay():
             try:
                 preview_info_var.set("（未找到 ffplay，无法播放预览音频）")
@@ -10186,14 +10203,7 @@ def run_app() -> None:
         if not plan.videos:
             _preview_sync_labels(us, plan)
             _mark_playback_prime_ready()
-            hits = _playback_audio_hits(content, us)
-            if hits:
-                _ensure_scrub_preview_audio(content, us, force=True)
-            else:
-                preview_state["play_audio_output_ready"] = True
-            _try_sync_scrub_play_start()
-            if preview_state.get("play_wall_t0") is None:
-                _schedule_play_sync_poll()
+            _arm_scrub_playback_sync(content, us)
             return
 
         thumb_cache = preview_state["thumb_cache"]
@@ -10446,32 +10456,27 @@ def run_app() -> None:
         if preview_state.get("play_wall_t0") is None:
             _schedule_play_sync_poll()
 
-    def _start_scrub_play_immediate(
+    def _arm_scrub_playback_sync(
         content: Dict[str, Any],
         us: int,
-        *,
-        resume: bool = False,
     ) -> None:
-        """续播 / canvas 已有画面：只恢复 clock 与音频，不重设 canvas。"""
+        """canvas 已有画面：spawn 音频，等 M-A 就绪后与时间轴一起开 clock。"""
         us = int(us)
         _cancel_playback_arm()
         preview_state["play_start_us"] = us
         preview_state["play_arm_us"] = us
+        preview_state["play_wall_t0"] = None
         preview_state["play_prime_ready"] = True
-        preview_state["play_audio_output_ready"] = True
+        preview_state["play_audio_output_ready"] = False
         preview_state["play_audio_ready_ma_sec"] = 0.0
-        preview_state["play_wall_t0"] = time.time()
         preview_state["play_subtitle_frame_idx"] = None
-        if resume:
-            preview_state["playback_session_active"] = False
-            preview_state["play_pause_timeline_us"] = None
-        else:
-            preview_state["play_last_ph_redraw_us"] = -1
+        preview_state["play_fast_resume_arm"] = False
+        preview_state["play_last_ph_redraw_us"] = -1
 
         set_ph = replace_state.get("_set_playhead")
         if callable(set_ph):
             try:
-                set_ph(us, notify=False, redraw=not resume)
+                set_ph(us, notify=False, redraw=True)
             except TypeError:
                 try:
                     set_ph(us, notify=False)
@@ -10482,20 +10487,24 @@ def run_app() -> None:
         else:
             replace_state["playhead_us"] = us
             preview_state["pending_us"] = us
-        if not resume:
-            preview_state["play_last_ph_redraw_us"] = us
+        preview_state["play_last_ph_redraw_us"] = us
         _preview_sync_timecode(us, content)
-        if not resume:
-            _refresh_playback_subtitles(us)
+        _refresh_playback_subtitles(us)
 
-        if _playback_audio_hits(content, us):
+        hits = _playback_audio_hits(content, us)
+        if hits:
+            try:
+                preview_info_var.set("同步音频…")
+            except Exception:
+                pass
             _ensure_scrub_preview_audio(content, us, force=True)
+        else:
+            preview_state["play_audio_output_ready"] = True
 
-        try:
-            preview_info_var.set("")
-        except Exception:
-            pass
-        _preview_play_tick()
+        _try_sync_scrub_play_start()
+        if preview_state.get("play_wall_t0") is None:
+            _schedule_play_sync_poll()
+            _preview_play_tick()
 
         thumb_cache = preview_state["thumb_cache"]
         frame_cache = preview_state["frame_cache"]
@@ -10510,6 +10519,28 @@ def run_app() -> None:
             target=_warm_bg, daemon=True, name="preview-play-warm"
         ).start()
 
+    def _resume_scrub_playback(content: Dict[str, Any], us: int) -> None:
+        """暂停后续播：不重绘 canvas、不等 M-A/preroll，立即恢复 wall clock。"""
+        us = int(us)
+        _cancel_playback_arm()
+        preview_state["play_start_us"] = us
+        preview_state["play_arm_us"] = us
+        preview_state["play_wall_t0"] = time.time()
+        preview_state["play_prime_ready"] = True
+        preview_state["play_audio_output_ready"] = True
+        preview_state["play_audio_ready_ma_sec"] = 0.0
+        preview_state["play_fast_resume_arm"] = True
+        preview_state["playback_session_active"] = False
+        preview_state["play_pause_timeline_us"] = None
+        try:
+            preview_info_var.set("")
+        except Exception:
+            pass
+        hits = _playback_audio_hits(content, us)
+        if hits:
+            _ensure_scrub_preview_audio(content, us, force=True, resume=True)
+        _preview_play_tick()
+
     def _begin_scrub_play(
         content: Dict[str, Any],
         us: int,
@@ -10517,9 +10548,12 @@ def run_app() -> None:
         video_ready: bool,
         resume: bool = False,
     ) -> None:
-        """统一播放入口：冷启动等音画就绪；续播 canvas 有帧则立即起跑。"""
+        """冷启动先 prime 再 spawn 音频；canvas 有帧则等音画同步后一起开 clock。"""
+        if resume:
+            _resume_scrub_playback(content, int(us))
+            return
         if video_ready:
-            _start_scrub_play_immediate(content, int(us), resume=resume)
+            _arm_scrub_playback_sync(content, int(us))
             return
 
         us = int(us)
@@ -10546,16 +10580,6 @@ def run_app() -> None:
             preview_state["pending_us"] = us
         preview_state["play_last_ph_redraw_us"] = us
         _preview_sync_timecode(us, content)
-
-        hits = _playback_audio_hits(content, us)
-        if hits:
-            try:
-                preview_info_var.set("准备预览…")
-            except Exception:
-                pass
-            _ensure_scrub_preview_audio(content, us, force=True)
-        else:
-            preview_state["play_audio_output_ready"] = True
 
         preview_state["play_prime_ready"] = False
         _start_playback_preview_prime(content, us)
@@ -10852,9 +10876,7 @@ def run_app() -> None:
         except tk.TclError:
             pass
         _mark_playback_prime_ready()
-        _try_sync_scrub_play_start()
-        if preview_state.get("play_wall_t0") is None:
-            _schedule_play_sync_poll()
+        _arm_scrub_playback_sync(content, us)
 
     def _queue_preview_apply(
         img_bytes: bytes,
