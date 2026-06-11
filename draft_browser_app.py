@@ -266,6 +266,61 @@ def segment_has_replace_config(
     return bool(segment_replace_status_lines(draft_name, ref, pool))
 
 
+def segment_pool_key_from_timeline_track(
+    draft_name: str,
+    track: Dict[str, Any],
+    segment_index_raw: int,
+    content: Optional[Dict[str, Any]] = None,
+) -> str:
+    """由时间轴轨道 + 片段下标构造 segment_export_pool 键（无需预解析 MediaSegmentRef）。"""
+    dn = (draft_name or "").strip()
+    tid = str(track.get("id", "") or "").strip()
+    if tid:
+        return f"{dn}\0{tid}\0{segment_index_raw}"
+    nm_raw = track.get("name", "")
+    tname = "" if nm_raw is None else (nm_raw if isinstance(nm_raw, str) else str(nm_raw))
+    tname = tname.strip()
+    ttype = str(track.get("type", "")).strip().lower()
+    type_idx = 0
+    if content and isinstance(content, dict):
+        tidx = _track_index_in_content(content, track)
+        if tidx is not None:
+            mo = _media_track_ordinal_at_index(content, tidx)
+            if mo is not None:
+                type_idx = mo
+    return f"{dn}\0{ttype}\0{tname}\0{type_idx}\0{segment_index_raw}"
+
+
+def _segment_export_pool_entry_has_config(cfg: Any) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    if str(cfg.get("dir", "") or "").strip() or str(cfg.get("replace_file", "") or "").strip():
+        return True
+    return normalize_style_pool_config(cfg) is not None
+
+
+def timeline_segment_has_configured_slot(
+    draft_name: str,
+    track: Dict[str, Any],
+    segment_index_raw: int,
+    pool: Dict[str, Any],
+    *,
+    content: Optional[Dict[str, Any]] = None,
+    media_ref: Optional[MediaSegmentRef] = None,
+    style_ref: Optional[StyleSegmentRef] = None,
+) -> bool:
+    """时间轴片段是否在 segment_export_pool 中已配置替换（含 refs 尚未解析完成时的回退查键）。"""
+    if segment_has_replace_config(draft_name, media_ref, pool):
+        return True
+    if segment_has_style_config(draft_name, style_ref, pool):
+        return True
+    dn = (draft_name or "").strip()
+    if not dn or not isinstance(pool, dict):
+        return False
+    k = segment_pool_key_from_timeline_track(dn, track, segment_index_raw, content)
+    return _segment_export_pool_entry_has_config(pool.get(k))
+
+
 def draft_has_any_segment_export_pool(draft_name: str, pool: Optional[Dict[str, Any]]) -> bool:
     """该草稿在 segment_export_pool 中是否配置了替换目录/文件或花字/贴纸槽（导出 MP4 时可套用）。"""
     dn = (draft_name or "").strip()
@@ -3679,6 +3734,39 @@ def save_draft_root_preference(root_p: str) -> None:
     os.replace(tmp, path)
 
 
+_DEFAULT_PREVIEW_MP4_DIR = r"D:\下载\【竖屏预览版】-剪映模板"
+
+
+def _preview_mp4_dir_pref_path() -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "preview_mp4_dir_preference.json"
+
+
+def load_preview_mp4_dir_preference() -> str:
+    path = _preview_mp4_dir_pref_path()
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            saved = str((data or {}).get("preview_mp4_dir") or "").strip()
+            if saved:
+                return saved
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    return _DEFAULT_PREVIEW_MP4_DIR
+
+
+def save_preview_mp4_dir_preference(dir_p: str) -> None:
+    path = _preview_mp4_dir_pref_path()
+    tmp = path.with_suffix(".json.tmp")
+    norm = os.path.normpath(str(dir_p).strip())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"preview_mp4_dir": norm}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 def _export_mp4_ui_pref_path() -> Path:
     ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
     d = Path(ada) / "pyJianYingDraft_browser"
@@ -4062,6 +4150,23 @@ def _draft_list_item_wraplength(
     return max(96, base_w - max(0, indent) - max(0, reserved_right))
 
 
+_DRAFT_LIST_ROW_PAD = 4
+_DRAFT_TREE_TOGGLE_BTN_W = 32
+_DRAFT_TREE_TOGGLE_BTN_PAD = 4
+_DRAFT_LIST_BOX_LABEL_PAD = 8
+_DRAFT_LIST_TOP_LEAF_PAD = 12
+
+
+def _draft_list_child_pad_left(parent_indent: int) -> int:
+    """子稿行左缩进：与父稿（含展开钮）标题文字左缘对齐。"""
+    return (
+        _DRAFT_LIST_ROW_PAD
+        + max(0, int(parent_indent))
+        + _DRAFT_TREE_TOGGLE_BTN_W
+        + _DRAFT_TREE_TOGGLE_BTN_PAD
+    )
+
+
 def _bind_draft_name_tooltip(widget: Any, full_name: str) -> None:
     """悬停显示完整草稿名（换行后仍过长时可用）。"""
     tip_ref: List[Optional[Any]] = [None]
@@ -4157,6 +4262,8 @@ def _make_draft_list_click_box(
     on_click: Any,
     wraplength: int,
     subtitle: str = "",
+    title_font: Any = None,
+    subtitle_font: Any = None,
 ) -> Any:
     """可点击、长名自动换行的草稿列表项。"""
     import customtkinter as ctk
@@ -4169,7 +4276,7 @@ def _make_draft_list_click_box(
         anchor="w",
         justify="left",
         wraplength=wraplength,
-        font=ctk.CTkFont(size=13),
+        font=title_font or ctk.CTkFont(size=13),
     )
     lbl.pack(fill="x", padx=8, pady=(6, 4 if subtitle else 6))
     if subtitle:
@@ -4177,7 +4284,7 @@ def _make_draft_list_click_box(
             box,
             text=subtitle,
             anchor="w",
-            font=ctk.CTkFont(size=11),
+            font=subtitle_font or ctk.CTkFont(size=11),
             text_color=("gray48", "gray58"),
         )
         sub.pack(fill="x", padx=8, pady=(0, 6))
@@ -4804,6 +4911,27 @@ def sync_by_parent_with_folder_name_inference(
     return changed
 
 
+def scan_draft_list_tree_data(base: str) -> Dict[str, Any]:
+    """扫描草稿根目录并构建左侧树形列表所需数据（可缓存，避免重复 stat）。"""
+    items = list_draft_folders(base)
+    fam = prune_draft_families(base, load_draft_families(base))
+    all_names = {n for n, _ in items}
+    sync_by_parent_with_folder_name_inference(base, fam, all_names)
+    by_parent: Dict[str, List[str]] = dict(fam.get("by_parent") or {})
+    sort_keys = {n: _draft_list_sort_key(base, n) for n in all_names}
+    child_set: set[str] = set()
+    for kids in by_parent.values():
+        child_set.update(kids)
+    top_level = [n for n in all_names if n not in child_set]
+    top_level.sort(key=lambda n: sort_keys[n], reverse=True)
+    return {
+        "items": items,
+        "by_parent": by_parent,
+        "sort_keys": sort_keys,
+        "top_level": top_level,
+    }
+
+
 def merge_remapped_pool_and_cursor_into_replace_state(
     replace_state: Dict[str, Any],
     remapped_pool: Dict[str, Any],
@@ -5151,16 +5279,55 @@ _DRAFTPATH_PLACEHOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 _PREVIEW_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"})
-_DRAFT_PREVIEW_MP4_NAME = "预览.mp4"
 
 
-def _find_draft_preview_mp4(draft_dir: str) -> str:
-    """草稿目录内的预渲染预览 MP4（存在则优先用于播放预览）。"""
-    root = (draft_dir or "").strip()
+def _preview_mp4_name_candidates(folder_name: str) -> List[str]:
+    """预览 MP4 文件名候选：完整名 → 去扩展名 → 逐级去掉末尾 _N 子稿后缀。"""
+    name = (folder_name or "").strip()
+    if not name:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        s = (raw or "").strip()
+        if not s or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    _add(name)
+    stem = os.path.splitext(name)[0]
+    if stem != name:
+        _add(stem)
+    current = name
+    while True:
+        m = _CHILD_DRAFT_SUFFIX_RE.search(current)
+        if not m:
+            break
+        parent = current[: m.start()].rstrip()
+        if not parent:
+            break
+        _add(parent)
+        parent_stem = os.path.splitext(parent)[0]
+        if parent_stem != parent:
+            _add(parent_stem)
+        current = parent
+    return out
+
+
+def _find_draft_preview_mp4(draft_folder_name: str, preview_dir: str) -> str:
+    """在配置的预览目录中查找与草稿同名的 MP4；子稿 xxx_1 可匹配 xxx.mp4。"""
+    root = (preview_dir or "").strip()
     if not root or not os.path.isdir(root):
         return ""
-    path = os.path.join(os.path.abspath(root), _DRAFT_PREVIEW_MP4_NAME)
-    return path if os.path.isfile(path) else ""
+    root_abs = os.path.abspath(root)
+    for base in _preview_mp4_name_candidates(draft_folder_name):
+        for ext in (".mp4", ".MP4", ".m4v", ".M4V"):
+            path = os.path.join(root_abs, base + ext)
+            if os.path.isfile(path):
+                return os.path.normpath(path)
+    return ""
 
 
 def _is_preview_image_path(path: str) -> bool:
@@ -8505,9 +8672,14 @@ def populate_timeline_panel(
             style_here = find_style_ref_for_timeline_segment(
                 rs.get("style_refs") or [], tr, orig_i, content
             )
-            if draft_nm and (
-                segment_has_replace_config(draft_nm, r_here, pool_ui)
-                or segment_has_style_config(draft_nm, style_here, pool_ui)
+            if draft_nm and timeline_segment_has_configured_slot(
+                draft_nm,
+                tr,
+                orig_i,
+                pool_ui,
+                content=content if isinstance(content, dict) else None,
+                media_ref=r_here,
+                style_ref=style_here,
             ):
                 seg_fill, seg_text = ("#257a42", "#d4ffe3")
             rid = canvas.create_rectangle(
@@ -9362,6 +9534,7 @@ def run_app() -> None:
             login_btn.configure(text="登录")
 
     draft_root = ctk.StringVar(value=initial_draft_root_for_ui())
+    preview_mp4_dir = ctk.StringVar(value=load_preview_mp4_dir_preference())
     selected_name: Optional[str] = None
 
     main = ctk.CTkFrame(root, fg_color="transparent")
@@ -9417,6 +9590,24 @@ def run_app() -> None:
 
     path_entry = ctk.CTkEntry(draft_panel, placeholder_text="草稿根目录…", height=30)
     path_entry.pack(fill="x", padx=10, pady=(0, 6))
+
+    preview_mp4_row = ctk.CTkFrame(draft_panel, fg_color="transparent")
+    preview_mp4_row.pack(fill="x", padx=10, pady=(0, 6))
+    ctk.CTkLabel(
+        preview_mp4_row,
+        text="预览 MP4 目录",
+        font=ctk.CTkFont(size=11),
+        text_color=("gray45", "gray60"),
+        anchor="w",
+    ).pack(fill="x", pady=(0, 2))
+    preview_mp4_entry_row = ctk.CTkFrame(preview_mp4_row, fg_color="transparent")
+    preview_mp4_entry_row.pack(fill="x")
+    preview_mp4_entry = ctk.CTkEntry(
+        preview_mp4_entry_row,
+        placeholder_text="与草稿同名的 MP4 所在目录…",
+        height=30,
+    )
+    preview_mp4_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
     list_frame = ctk.CTkScrollableFrame(draft_panel, label_text="草稿列表", corner_radius=10)
     list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -9719,9 +9910,54 @@ def run_app() -> None:
         if not isinstance(raw, dict):
             return
         timeline_zoom["pps"] = _calc_timeline_fit_pps(raw, _timeline_viewport_width())
-        refresh_timeline_panel_data(None, reset_selection=False)
+        refresh_timeline_panel_data(None, reset_selection=False, immediate_timeline=True)
 
-    def refresh_timeline_panel_data(raw: Optional[Dict[str, Any]] = None, *, reset_selection: bool = True) -> None:
+    _timeline_panel_redraw_after: List[Optional[str]] = [None]
+
+    def _cancel_timeline_panel_redraw_deferred() -> None:
+        aid = _timeline_panel_redraw_after[0]
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            _timeline_panel_redraw_after[0] = None
+
+    def _populate_timeline_panel_now() -> None:
+        def _wheel_zoom_step(direction: int) -> None:
+            if timeline_content_cache[0] is None:
+                return
+            fac = 1.12 if direction > 0 else 1.0 / 1.12
+            pps = float(timeline_zoom["pps"] * fac)
+            pps = max(14.0, min(420.0, pps))
+            if abs(pps - timeline_zoom["pps"]) < 0.01:
+                return
+            timeline_zoom["pps"] = pps
+            refresh_timeline_panel_data(None, reset_selection=False)
+
+        populate_timeline_panel(
+            timeline_inner,
+            timeline_content_cache[0],
+            selection=timeline_select,
+            status_label=timeline_sel_label,
+            status_replace_highlight_label=timeline_replace_highlight_label,
+            replace_state=replace_state,
+            pixels_per_second=timeline_zoom["pps"],
+            wheel_zoom_step=_wheel_zoom_step if timeline_content_cache[0] else None,
+        )
+        ui_sync = replace_state.get("_on_timeline_selection_ui")
+        if callable(ui_sync):
+            try:
+                ui_sync()
+            except Exception:
+                pass
+
+    def refresh_timeline_panel_data(
+        raw: Optional[Dict[str, Any]] = None,
+        *,
+        reset_selection: bool = True,
+        immediate_timeline: bool = False,
+    ) -> None:
         if raw is not None:
             stop_play = replace_state.get("_stop_preview_playback")
             if callable(stop_play):
@@ -9767,33 +10003,30 @@ def run_app() -> None:
         else:
             timeline_duration_var.set("")
 
-        def _wheel_zoom_step(direction: int) -> None:
-            if timeline_content_cache[0] is None:
-                return
-            fac = 1.12 if direction > 0 else 1.0 / 1.12
-            pps = float(timeline_zoom["pps"] * fac)
-            pps = max(14.0, min(420.0, pps))
-            if abs(pps - timeline_zoom["pps"]) < 0.01:
-                return
-            timeline_zoom["pps"] = pps
-            refresh_timeline_panel_data(None, reset_selection=False)
+        if raw is not None or reset_selection or immediate_timeline:
+            _cancel_timeline_panel_redraw_deferred()
+            _populate_timeline_panel_now()
+        else:
+            if _timeline_panel_redraw_after[0] is None:
+                def _deferred_populate() -> None:
+                    _timeline_panel_redraw_after[0] = None
+                    _populate_timeline_panel_now()
 
-        populate_timeline_panel(
-            timeline_inner,
-            timeline_content_cache[0],
-            selection=timeline_select,
-            status_label=timeline_sel_label,
-            status_replace_highlight_label=timeline_replace_highlight_label,
-            replace_state=replace_state,
-            pixels_per_second=timeline_zoom["pps"],
-            wheel_zoom_step=_wheel_zoom_step if timeline_content_cache[0] else None,
-        )
-        ui_sync = replace_state.get("_on_timeline_selection_ui")
-        if callable(ui_sync):
-            try:
-                ui_sync()
-            except Exception:
-                pass
+                _timeline_panel_redraw_after[0] = root.after(50, _deferred_populate)
+            if not reset_selection:
+                try:
+                    refresh_timeline_segment_status_if_selected()
+                except Exception:
+                    pass
+                ph = int(timeline_select.get("playhead_us") or replace_state.get("playhead_us") or 0)
+                cb_ph = replace_state.get("_on_playhead_change")
+                if callable(cb_ph):
+                    try:
+                        cb_ph(ph)
+                    except Exception:
+                        pass
+                return
+
         if not reset_selection:
             try:
                 refresh_timeline_segment_status_if_selected()
@@ -9826,13 +10059,13 @@ def run_app() -> None:
         if abs(pps - timeline_zoom["pps"]) < 0.01:
             return
         timeline_zoom["pps"] = pps
-        refresh_timeline_panel_data(None, reset_selection=False)
+        refresh_timeline_panel_data(None, reset_selection=False, immediate_timeline=True)
 
     def timeline_zoom_reset() -> None:
         if timeline_content_cache[0] is None:
             return
         timeline_zoom["pps"] = DEFAULT_TIMELINE_PPS
-        refresh_timeline_panel_data(None, reset_selection=False)
+        refresh_timeline_panel_data(None, reset_selection=False, immediate_timeline=True)
 
     ctk.CTkButton(zoom_bar, text="−", width=30, command=lambda: timeline_zoom_mult(1 / 1.18)).pack(
         side="left", padx=2
@@ -10000,10 +10233,11 @@ def run_app() -> None:
         return ""
 
     def _draft_preview_mp4_path() -> str:
-        return _find_draft_preview_mp4(_current_draft_dir())
+        folder_name = (replace_state.get("timeline_draft_name") or "").strip()
+        return _find_draft_preview_mp4(folder_name, preview_mp4_dir.get().strip())
 
     def _playback_end_us(content: Dict[str, Any]) -> int:
-        """预览播放结束位置：草稿「预览.mp4」以文件时长为准，否则用草稿时间轴总长。"""
+        """预览播放结束位置：外部同名 MP4 以文件时长为准，否则用草稿时间轴总长。"""
         if preview_state.get("draft_preview_mp4"):
             mp4_end = preview_state.get("draft_preview_mp4_end_us")
             if mp4_end:
@@ -11458,7 +11692,7 @@ def run_app() -> None:
         _preview_play_tick()
 
     def _begin_draft_preview_mp4_play(content: Dict[str, Any], us: int) -> None:
-        """草稿目录存在「预览.mp4」时：ffplay 单路音画，从时间轴当前位置 seek 播放。"""
+        """预览目录存在与草稿同名的 MP4 时：ffplay 单路音画，从时间轴当前位置 seek 播放。"""
         mp4 = _draft_preview_mp4_path()
         if not mp4:
             return
@@ -11511,10 +11745,10 @@ def run_app() -> None:
         start_sec = max(0.0, us / 1_000_000.0)
         if not _start_merged_preview_ffplay(start_sec=start_sec, force=True):
             _stop_preview_playback()
-            _preview_show_message("无法播放预览.mp4（请确认已安装 ffplay）")
+            _preview_show_message("无法播放预览 MP4（请确认预览目录中有同名文件且已安装 ffplay）")
             return
         try:
-            preview_info_var.set(f"预览.mp4 · {_fmt_us_as_timecode(us)}")
+            preview_info_var.set(f"预览 MP4 · {_fmt_us_as_timecode(us)}")
         except Exception:
             pass
         _refresh_playback_subtitles(us)
@@ -13719,7 +13953,7 @@ def run_app() -> None:
                         last_child = draft_to_export
                         need_refresh = True
                 if need_refresh and last_child:
-                    root.after(0, refresh_list)
+                    root.after(0, lambda: (_invalidate_draft_list_scan_cache(), refresh_list()))
                     root.after(0, lambda c=last_child: show_draft(c))
                 elif did_inplace_pool_export:
                     root.after(0, lambda n=name: show_draft(n))
@@ -13909,7 +14143,7 @@ def run_app() -> None:
                     created.append(child_name)
                 if created:
                     last_child = created[-1]
-                    root.after(0, refresh_list)
+                    root.after(0, lambda: (_invalidate_draft_list_scan_cache(), refresh_list()))
                     root.after(0, lambda c=last_child: show_draft(c))
             except Exception as e:
                 err = e
@@ -14204,12 +14438,19 @@ def run_app() -> None:
     _export_busy_widgets.extend([backup_chk, gen_sub_chk, mp4_child_chk])
 
     collapsed_parents: set[str] = set()
+    _draft_list_scan_cache: Dict[str, Any] = {"root": "", "payload": None}
     _mdl2_chevron = "Segoe MDL2 Assets" in tkfont.families()
     draft_tree_toggle_font = (
         ctk.CTkFont(family="Segoe MDL2 Assets", size=11)
         if _mdl2_chevron
         else ctk.CTkFont(size=12)
     )
+    draft_list_title_font = ctk.CTkFont(size=13)
+    draft_list_sub_font = ctk.CTkFont(size=11)
+
+    def _invalidate_draft_list_scan_cache() -> None:
+        _draft_list_scan_cache["root"] = ""
+        _draft_list_scan_cache["payload"] = None
 
     def draft_tree_toggle_symbol(expanded: bool) -> str:
         if _mdl2_chevron:
@@ -14366,6 +14607,7 @@ def run_app() -> None:
                     return
                 template_status_var.set(f"已导入「{folder_name}」")
                 _set_left_tab("drafts")
+                _invalidate_draft_list_scan_cache()
                 refresh_list(reset_list_scroll=False)
                 if folder_name:
                     show_draft(folder_name)
@@ -14389,6 +14631,7 @@ def run_app() -> None:
                 save_draft_root_preference(p)
             except OSError:
                 pass
+        _invalidate_draft_list_scan_cache()
         refresh_list()
         refresh_export_pool_preset_bar(reset_memory=True)
 
@@ -14399,6 +14642,25 @@ def run_app() -> None:
         if p:
             set_path(p)
 
+    def set_preview_mp4_dir(p: str) -> None:
+        p = (p or "").strip()
+        preview_mp4_dir.set(p)
+        preview_mp4_entry.delete(0, "end")
+        preview_mp4_entry.insert(0, p)
+        if p:
+            try:
+                save_preview_mp4_dir_preference(p)
+            except OSError:
+                pass
+
+    def choose_preview_mp4_dir() -> None:
+        from tkinter import filedialog
+
+        initial = preview_mp4_dir.get().strip() or _DEFAULT_PREVIEW_MP4_DIR
+        p = filedialog.askdirectory(title="选择预览 MP4 目录", initialdir=initial)
+        if p:
+            set_preview_mp4_dir(p)
+
     btn_row = ctk.CTkFrame(draft_panel, fg_color="transparent")
     btn_row.pack(fill="x", padx=12, pady=(0, 8))
     ctk.CTkButton(btn_row, text="浏览…", width=100, command=choose_folder).pack(side="left", padx=(0, 8))
@@ -14408,8 +14670,15 @@ def run_app() -> None:
         width=72,
         fg_color="transparent",
         border_width=1,
-        command=lambda: refresh_list(),
+        command=lambda: (_invalidate_draft_list_scan_cache(), refresh_list()),
     ).pack(side="left")
+
+    ctk.CTkButton(
+        preview_mp4_entry_row,
+        text="浏览…",
+        width=72,
+        command=choose_preview_mp4_dir,
+    ).pack(side="right")
 
     btn_row2 = ctk.CTkFrame(draft_panel, fg_color="transparent")
     btn_row2.pack(fill="x", padx=12, pady=(0, 8))
@@ -14479,6 +14748,7 @@ def run_app() -> None:
             return
 
         messagebox.showinfo("完成", f"已生成示例草稿「{name}」。\n在剪映中打开前，可先在右侧点击查看明文详情。")
+        _invalidate_draft_list_scan_cache()
         refresh_list()
         show_draft(name)
 
@@ -14564,6 +14834,7 @@ def run_app() -> None:
                     pass
                 if err:
                     messagebox.showerror("删除失败", err)
+                _invalidate_draft_list_scan_cache()
                 refresh_list(reset_list_scroll=True)
 
             root.after_idle(finish)
@@ -14691,6 +14962,12 @@ def run_app() -> None:
                                         pass
                                     return
                                 replace_state["refs"] = refs
+                                try:
+                                    refresh_timeline_panel_data(
+                                        None, reset_selection=False, immediate_timeline=True
+                                    )
+                                except Exception:
+                                    pass
                                 ui_sync = replace_state.get("_on_timeline_selection_ui")
                                 if callable(ui_sync):
                                     try:
@@ -14735,26 +15012,35 @@ def run_app() -> None:
         except tk.TclError:
             pass
 
-    def refresh_list(*, reset_list_scroll: bool = False) -> None:
+    def refresh_list(
+        *,
+        reset_list_scroll: bool = False,
+        reselect_draft: bool = True,
+        rescan_folders: bool = True,
+    ) -> None:
         nonlocal draft_buttons, selected_name
         prev_selected = selected_name
         for w in list_frame.winfo_children():
             w.destroy()
         draft_buttons = []
-        selected_name = None
-        replace_state["refs"] = []
-        replace_state["style_refs"] = []
-        replace_state["encrypted"] = False
-        replace_state["content_ok"] = False
-        replace_state["timeline_draft_name"] = ""
-        replace_state["timeline_draft_dir"] = ""
-        refresh_timeline_panel_data(None)
+        if reselect_draft:
+            selected_name = None
+            replace_state["refs"] = []
+            replace_state["style_refs"] = []
+            replace_state["encrypted"] = False
+            replace_state["content_ok"] = False
+            replace_state["timeline_draft_name"] = ""
+            replace_state["timeline_draft_dir"] = ""
+            refresh_timeline_panel_data(None)
+        else:
+            selected_name = prev_selected
 
         base = draft_root.get().strip()
         if not base:
             ctk.CTkLabel(list_frame, text="请选择草稿目录").pack(pady=20)
-            detail.delete("1.0", "end")
-            detail.insert("1.0", "在上方「浏览」中选择剪映草稿文件夹。\n\n常见路径：\n%LOCALAPPDATA%\\JianyingPro\\User Data\\Projects\\com.lveditor.draft")
+            if reselect_draft:
+                detail.delete("1.0", "end")
+                detail.insert("1.0", "在上方「浏览」中选择剪映草稿文件夹。\n\n常见路径：\n%LOCALAPPDATA%\\JianyingPro\\User Data\\Projects\\com.lveditor.draft")
             _redraw_list_scroll(reset_scroll=reset_list_scroll)
             return
         if not os.path.isdir(base):
@@ -14762,45 +15048,64 @@ def run_app() -> None:
             _redraw_list_scroll(reset_scroll=reset_list_scroll)
             return
 
-        items = list_draft_folders(base)
+        if rescan_folders or _draft_list_scan_cache.get("root") != base or not _draft_list_scan_cache.get("payload"):
+            tree_data = scan_draft_list_tree_data(base)
+            _draft_list_scan_cache["root"] = base
+            _draft_list_scan_cache["payload"] = tree_data
+        else:
+            tree_data = _draft_list_scan_cache["payload"]
+
+        items = tree_data["items"]
         if not items:
             ctk.CTkLabel(list_frame, text="（空）").pack(pady=20)
-            detail.delete("1.0", "end")
-            detail.insert("1.0", "当前根目录下没有草稿文件夹。")
+            if reselect_draft:
+                detail.delete("1.0", "end")
+                detail.insert("1.0", "当前根目录下没有草稿文件夹。")
             _redraw_list_scroll(reset_scroll=reset_list_scroll)
             return
 
-        fam = prune_draft_families(base, load_draft_families(base))
-        all_names = {n for n, _ in items}
-        sync_by_parent_with_folder_name_inference(base, fam, all_names)
-        by_parent: Dict[str, List[str]] = dict(fam.get("by_parent") or {})
-        child_set: set[str] = set()
-        for kids in by_parent.values():
-            child_set.update(kids)
-        top_level = [n for n in all_names if n not in child_set]
-        top_level.sort(key=lambda n: _draft_list_sort_key(base, n), reverse=True)
+        by_parent: Dict[str, List[str]] = dict(tree_data["by_parent"])
+        sort_keys: Dict[str, Tuple[float, int]] = dict(tree_data["sort_keys"])
+        top_level: List[str] = list(tree_data["top_level"])
 
-        def add_leaf_button(container: Any, folder_name: str, *, indent: int) -> None:
-            pad_l = 12 + max(0, indent)
-            wrap = _draft_list_item_wraplength(indent=indent)
+        def add_leaf_button(
+            container: Any,
+            folder_name: str,
+            *,
+            indent: int,
+            parent_indent: Optional[int] = None,
+        ) -> None:
+            if parent_indent is not None:
+                pad_l = _draft_list_child_pad_left(parent_indent)
+                wrap_indent = max(0, pad_l - _DRAFT_LIST_TOP_LEAF_PAD)
+            else:
+                pad_l = _DRAFT_LIST_TOP_LEAF_PAD + max(0, indent)
+                wrap_indent = indent
+            wrap = _draft_list_item_wraplength(indent=wrap_indent)
             b = _make_draft_list_click_box(
                 container,
                 folder_name,
                 row_kind="leaf",
                 on_click=lambda n=folder_name: show_draft(n),
                 wraplength=wrap,
+                title_font=draft_list_title_font,
             )
-            b._wrap_indent = indent  # type: ignore[attr-defined]
+            b._wrap_indent = wrap_indent  # type: ignore[attr-defined]
             b.pack(fill="x", pady=2, padx=(pad_l, 4))
             draft_buttons.append(b)
 
-        def render_draft_subtree(folder_name: str, *, indent: int) -> None:
+        def render_draft_subtree(
+            folder_name: str,
+            *,
+            indent: int,
+            parent_indent: Optional[int] = None,
+        ) -> None:
             """递归展示父子草稿（支持 A → A_1 → A_1_1 等多级）。"""
             children = list(by_parent.get(folder_name) or [])
             if children:
                 expanded = folder_name not in collapsed_parents
                 row = ctk.CTkFrame(list_frame, fg_color="transparent")
-                row.pack(fill="x", pady=2, padx=(4 + max(0, indent), 4))
+                row.pack(fill="x", pady=2, padx=(_DRAFT_LIST_ROW_PAD + max(0, indent), 4))
 
                 def _mk_toggle(pn: str = folder_name) -> Any:
                     def _inner() -> None:
@@ -14808,7 +15113,7 @@ def run_app() -> None:
                             collapsed_parents.discard(pn)
                         else:
                             collapsed_parents.add(pn)
-                        refresh_list()
+                        refresh_list(reselect_draft=False, rescan_folders=False)
 
                     return _inner
 
@@ -14832,6 +15137,8 @@ def run_app() -> None:
                     on_click=lambda n=folder_name: show_draft(n),
                     wraplength=wrap,
                     subtitle=f"· {n_sub} 个子稿",
+                    title_font=draft_list_title_font,
+                    subtitle_font=draft_list_sub_font,
                 )
                 pb._wrap_indent = indent  # type: ignore[attr-defined]
                 pb._wrap_reserved = 36  # type: ignore[attr-defined]
@@ -14839,25 +15146,28 @@ def run_app() -> None:
                 draft_buttons.append(pb)
 
                 if expanded:
-                    ch_sorted = sorted(children, key=lambda c: _draft_list_sort_key(base, c), reverse=True)
+                    ch_sorted = sorted(children, key=lambda c: sort_keys.get(c, (0.0, 0)), reverse=True)
                     for ch in ch_sorted:
-                        render_draft_subtree(ch, indent=indent + 8)
+                        render_draft_subtree(ch, indent=indent + 8, parent_indent=indent)
             else:
-                add_leaf_button(list_frame, folder_name, indent=indent)
+                add_leaf_button(list_frame, folder_name, indent=indent, parent_indent=parent_indent)
 
         for name in top_level:
             render_draft_subtree(name, indent=0)
 
-        if prev_selected and os.path.isdir(os.path.join(base, prev_selected)):
-            show_draft(prev_selected)
+        if reselect_draft:
+            if prev_selected and os.path.isdir(os.path.join(base, prev_selected)):
+                show_draft(prev_selected)
+            else:
+                detail.delete("1.0", "end")
+                detail.insert(
+                    "1.0",
+                    "请从左侧选择草稿。\n\n"
+                    "「替换素材」与导出槽位会改当前草稿的素材引用；导出 MP4 仅在勾选「导出生成子草稿」时复制为子稿；"
+                    "未勾选时临时套用槽位导出后自动还原 draft_content.json。父子关系记在本地应用数据中。",
+                )
         else:
-            detail.delete("1.0", "end")
-            detail.insert(
-                "1.0",
-                "请从左侧选择草稿。\n\n"
-                "「替换素材」与导出槽位会改当前草稿的素材引用；导出 MP4 仅在勾选「导出生成子草稿」时复制为子稿；"
-                "未勾选时临时套用槽位导出后自动还原 draft_content.json。父子关系记在本地应用数据中。",
-            )
+            highlight_selection()
 
         _redraw_list_scroll(reset_scroll=reset_list_scroll)
 
@@ -14872,43 +15182,61 @@ def run_app() -> None:
                 save_draft_root_preference(p)
             except OSError:
                 pass
+        _invalidate_draft_list_scan_cache()
         refresh_list()
         refresh_export_pool_preset_bar(reset_memory=True)
 
+    def _commit_preview_mp4_dir_entry(_event: Any = None) -> None:
+        p = preview_mp4_entry.get().strip()
+        if p == (preview_mp4_dir.get() or "").strip():
+            return
+        preview_mp4_dir.set(p)
+        if p:
+            try:
+                save_preview_mp4_dir_preference(p)
+            except OSError:
+                pass
+
     path_entry.bind("<Return>", lambda _e: _commit_path_entry())
     path_entry.bind("<FocusOut>", lambda _e: _commit_path_entry())
+    preview_mp4_entry.bind("<Return>", lambda _e: _commit_preview_mp4_dir_entry())
+    preview_mp4_entry.bind("<FocusOut>", lambda _e: _commit_preview_mp4_dir_entry())
 
     # init path
     if draft_root.get():
         path_entry.insert(0, draft_root.get())
+    if preview_mp4_dir.get():
+        preview_mp4_entry.insert(0, preview_mp4_dir.get())
     refresh_list()
     refresh_export_pool_preset_bar(reset_memory=True)
-    try:
-        sync_harvested_text_effects_to_pool_file()
-    except OSError:
+
+    def _deferred_startup_pool_sync() -> None:
         try:
-            ensure_text_effect_pool_template_file()
+            sync_harvested_text_effects_to_pool_file()
+        except OSError:
+            try:
+                ensure_text_effect_pool_template_file()
+            except OSError:
+                pass
+        try:
+            _st_added, _st_pruned, _st_path = sync_harvested_stickers_to_pool_file()
+            if _st_pruned > 0:
+                print(f"[贴纸] 启动：已从配置文件清理 {_st_pruned} 个无效 id")
+        except OSError:
+            try:
+                ensure_sticker_pool_template_file()
+            except OSError:
+                pass
+        try:
+            print_text_effect_pool_startup_summary()
+            rep_st = build_sticker_pool_report(resync=False)
+            print(
+                f"[贴纸] 启动：可用 {rep_st.get('valid_count', 0)} 个"
+                f"（配置 {rep_st.get('listed_count', 0)} 个 id）"
+            )
+            print(f"[贴纸] 配置：{rep_st.get('pool_path', '')}")
         except OSError:
             pass
-    try:
-        _st_added, _st_pruned, _st_path = sync_harvested_stickers_to_pool_file()
-        if _st_pruned > 0:
-            print(f"[贴纸] 启动：已从配置文件清理 {_st_pruned} 个无效 id")
-    except OSError:
-        try:
-            ensure_sticker_pool_template_file()
-        except OSError:
-            pass
-    try:
-        print_text_effect_pool_startup_summary()
-        rep_st = build_sticker_pool_report(resync=False)
-        print(
-            f"[贴纸] 启动：可用 {rep_st.get('valid_count', 0)} 个"
-            f"（配置 {rep_st.get('listed_count', 0)} 个 id）"
-        )
-        print(f"[贴纸] 配置：{rep_st.get('pool_path', '')}")
-    except OSError:
-        pass
 
     from tkinter import messagebox as _mb_startup
 
@@ -14926,6 +15254,7 @@ def run_app() -> None:
         root.destroy()
         return
     refresh_auth_bar()
+    root.after(300, _deferred_startup_pool_sync)
     root.mainloop()
 
 
