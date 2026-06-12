@@ -4443,6 +4443,12 @@ def _clean_export_pool_presets_dict(raw: Any) -> Dict[str, Dict[str, Any]]:
                 except (TypeError, ValueError):
                     cur[str(ck)] = 0
         if not seg and not cur:
+            if blob.get("_preset_shell"):
+                clean[name] = {
+                    "segment_export_pool": {},
+                    "export_pool_sequential_cursor": {},
+                    "_preset_shell": True,
+                }
             continue
         clean[name] = {"segment_export_pool": seg, "export_pool_sequential_cursor": cur}
     return clean
@@ -4591,6 +4597,130 @@ def persist_working_export_pool_snapshot(draft_root: str, draft_folder_name: str
         ),
     }
     save_export_pool_store(dr, store)
+
+
+def draft_working_export_pool_has_config(draft_root: str, draft_folder_name: str) -> bool:
+    """某草稿在本地 store 的 working_pool（下拉「(默认)」）是否含槽位配置。"""
+    dn = (draft_folder_name or "").strip()
+    dr = (draft_root or "").strip()
+    if not dn or not dr or not os.path.isdir(dr):
+        return False
+    b = (load_export_pool_store(dr).get("by_draft") or {}).get(dn) or {}
+    wp = b.get("working_pool") if isinstance(b, dict) else None
+    if not isinstance(wp, dict):
+        return False
+    seg = wp.get("segment_export_pool")
+    return _segment_export_pool_has_saveable_config(seg if isinstance(seg, dict) else {})
+
+
+def clear_working_export_pool_for_draft(draft_root: str, draft_folder_name: str) -> None:
+    """清除某草稿下拉「(默认)」工作台的槽位配置（不影响命名预设）。"""
+    dn = (draft_folder_name or "").strip()
+    dr = (draft_root or "").strip()
+    if not dn or not dr:
+        return
+    store = load_export_pool_store(dr)
+    b = _export_pool_by_draft_bucket_mut(store, dn)
+    b["working_pool"] = {
+        "segment_export_pool": {},
+        "export_pool_sequential_cursor": {},
+    }
+    save_export_pool_store(dr, store)
+
+
+def _strip_draft_keys_from_export_pool_blob(blob: Dict[str, Any], draft_name: str) -> Dict[str, Any]:
+    """从预设 blob 中移除属于指定草稿文件夹名的槽位键。"""
+    dn = (draft_name or "").strip()
+    if not dn:
+        return {"segment_export_pool": {}, "export_pool_sequential_cursor": {}}
+    prefix = dn + "\0"
+    seg_in = blob.get("segment_export_pool") or {}
+    cur_in = blob.get("export_pool_sequential_cursor") or {}
+    seg: Dict[str, Any] = {}
+    if isinstance(seg_in, dict):
+        for k, v in seg_in.items():
+            if isinstance(k, str) and not k.startswith(prefix):
+                seg[k] = v
+    cur: Dict[str, int] = {}
+    if isinstance(cur_in, dict):
+        for k, v in cur_in.items():
+            if isinstance(k, str) and not k.startswith(prefix):
+                try:
+                    cur[k] = int(v)
+                except (TypeError, ValueError):
+                    cur[k] = 0
+    return {"segment_export_pool": seg, "export_pool_sequential_cursor": cur}
+
+
+def _export_pool_blob_is_empty(blob: Dict[str, Any]) -> bool:
+    seg = blob.get("segment_export_pool") if isinstance(blob.get("segment_export_pool"), dict) else {}
+    cur = blob.get("export_pool_sequential_cursor") if isinstance(blob.get("export_pool_sequential_cursor"), dict) else {}
+    return not _segment_export_pool_has_saveable_config(seg) and not cur
+
+
+def draft_export_pool_preset_has_config(
+    draft_root: str, draft_folder_name: str, choice: str
+) -> bool:
+    """当前草稿在指定预设（默认或命名）下是否已有槽位配置。"""
+    if is_pool_export_default_menu_preset(choice):
+        return draft_working_export_pool_has_config(draft_root, draft_folder_name)
+    blob = get_export_pool_preset_blob_for_draft(draft_root, draft_folder_name, choice)
+    if not isinstance(blob, dict):
+        return False
+    seg = blob.get("segment_export_pool")
+    return _segment_export_pool_has_saveable_config(seg if isinstance(seg, dict) else {})
+
+
+def clear_export_pool_preset_for_draft(
+    draft_root: str, draft_folder_name: str, choice: str
+) -> bool:
+    """清除当前草稿在指定预设下的全部槽位配置；命名预设名保留（空壳）。返回是否写入了磁盘。"""
+    dn = (draft_folder_name or "").strip()
+    dr = (draft_root or "").strip()
+    if not dn or not dr:
+        return False
+    if is_pool_export_default_menu_preset(choice):
+        if not draft_working_export_pool_has_config(dr, dn):
+            return False
+        clear_working_export_pool_for_draft(dr, dn)
+        return True
+    preset_name = str(choice).strip()
+    if not preset_name or is_pool_export_default_menu_preset(preset_name):
+        return False
+    empty_shell: Dict[str, Any] = {
+        "segment_export_pool": {},
+        "export_pool_sequential_cursor": {},
+        "_preset_shell": True,
+    }
+    store = load_export_pool_store(dr)
+    changed = False
+    b = _export_pool_by_draft_bucket_mut(store, dn)
+    pr = b.get("presets")
+    if not isinstance(pr, dict):
+        b["presets"] = {}
+        pr = b["presets"]
+    if preset_name in pr or not (
+        isinstance(store.get("legacy_presets"), dict)
+        and preset_name in (store.get("legacy_presets") or {})
+    ):
+        pr[preset_name] = dict(empty_shell)
+        changed = True
+    if not changed:
+        leg = store.get("legacy_presets")
+        if isinstance(leg, dict) and preset_name in leg:
+            lb = leg.get(preset_name)
+            if isinstance(lb, dict):
+                stripped = _strip_draft_keys_from_export_pool_blob(lb, dn)
+                if _export_pool_blob_is_empty(stripped):
+                    leg.pop(preset_name, None)
+                    pr[preset_name] = dict(empty_shell)
+                else:
+                    leg[preset_name] = stripped
+                changed = True
+    if not changed:
+        return False
+    save_export_pool_store(dr, store)
+    return True
 
 
 def sanitize_replace_state_export_pool_styles(
@@ -7355,6 +7485,7 @@ PREVIEW_WARM_INITIAL_SEC = 30.0
 PREVIEW_WARM_WINDOW_SEC = 50.0
 PREVIEW_WARM_SCRUB_FOLLOW_SEC = 12.0
 PREVIEW_WARM_SCRUB_THROTTLE_MS = 220
+SCRUB_PREVIEW_FETCH_THROTTLE_MS = 48
 PREVIEW_PLAY_WARM_AHEAD_SEC = 24.0
 PREVIEW_PLAY_WARM_THROTTLE_MS = 180
 PREVIEW_PLAY_SUBTITLE_THROTTLE_MS = 80
@@ -8834,6 +8965,12 @@ def populate_timeline_panel(
                 except Exception:
                     pass
         _scrubbing[0] = True
+        scrub_begin = rs.get("_on_playhead_scrub_begin")
+        if callable(scrub_begin):
+            try:
+                scrub_begin()
+            except Exception:
+                pass
         _set_playhead(target_us)
         return None
 
@@ -10139,6 +10276,9 @@ def run_app() -> None:
         "last_worker_ms": 0,
         "warm_interrupted_for_scrub": False,
         "last_scrub_warm_ms": 0.0,
+        "scrub_last_instant_bucket": None,
+        "scrub_fetch_after_id": None,
+        "scrub_fetch_pending_us": None,
         "warm_idle_after_id": None,
         "ui_apply_scheduled": False,
         "ui_apply_pending": None,
@@ -11935,7 +12075,11 @@ def run_app() -> None:
                 return
             preview_state["ui_apply_pending"] = None
             img_b, plan_b, gen_b, sub_us = pending
-            if not _preview_is_playing() and gen_b != int(preview_state.get("gen", 0)):
+            if (
+                not _preview_is_playing()
+                and not _preview_is_scrubbing()
+                and gen_b != int(preview_state.get("gen", 0))
+            ):
                 return
             try:
                 _apply_preview_image(img_b, plan_b, gen_b, subtitle_us=sub_us)
@@ -11978,16 +12122,28 @@ def run_app() -> None:
         subtitle_us: Optional[int] = None,
         silent: bool = False,
     ) -> bool:
-        if gen != int(preview_state.get("gen", 0)):
+        if (
+            not _preview_is_scrubbing()
+            and gen != int(preview_state.get("gen", 0))
+        ):
             return False
         cw, ch = _preview_canvas_inner_size()
-        scaled = _scale_ppm_to_fit(img_bytes, cw, ch)
-        try:
-            photo = tk.PhotoImage(data=scaled)
-        except tk.TclError:
-            if not silent:
-                _preview_show_message("（预览解码失败）")
-            return False
+        if _preview_is_scrubbing():
+            try:
+                photo = tk.PhotoImage(data=img_bytes)
+                photo = _fit_photoimage_to_area(photo, cw, ch)
+            except tk.TclError:
+                if not silent:
+                    _preview_show_message("（预览解码失败）")
+                return False
+        else:
+            scaled = _scale_ppm_to_fit(img_bytes, cw, ch)
+            try:
+                photo = tk.PhotoImage(data=scaled)
+            except tk.TclError:
+                if not silent:
+                    _preview_show_message("（预览解码失败）")
+                return False
         preview_state["photo"] = photo
         preview_canvas.delete("all")
         iw, ih = photo.width(), photo.height()
@@ -12186,6 +12342,10 @@ def run_app() -> None:
 
     def _on_scrub_end(playhead_us: int) -> None:
         preview_state["warm_interrupted_for_scrub"] = False
+        preview_state["scrub_last_instant_bucket"] = None
+        _cancel_scrub_fetch_timer()
+        preview_state["scrub_fetch_pending_us"] = int(playhead_us)
+        _flush_scrub_preview_fetch()
         _schedule_warm_near_playhead(playhead_us)
 
     def _try_instant_scrub_preview(plan: PreviewPlan) -> bool:
@@ -12195,22 +12355,34 @@ def run_app() -> None:
         if not instant:
             return False
         bucket_key = preview_thumb_bucket_key(plan)
-        if _preview_is_playing() and bucket_key is not None:
+        playing = _preview_is_playing()
+        scrubbing = _preview_is_scrubbing()
+        if bucket_key is not None and (playing or scrubbing):
+            if playing:
+                last_key = preview_state.get("play_last_instant_bucket")
+            else:
+                last_key = preview_state.get("scrub_last_instant_bucket")
             if (
-                bucket_key == preview_state.get("play_last_instant_bucket")
+                last_key is not None
+                and bucket_key == last_key
                 and preview_state.get("photo") is not None
             ):
-                timeline_us = _playback_timeline_us()
-                if timeline_us is not None:
-                    _refresh_playback_subtitles(timeline_us)
+                if playing:
+                    timeline_us = _playback_timeline_us()
+                    if timeline_us is not None:
+                        _refresh_playback_subtitles(timeline_us)
                 return True
-            preview_state["play_last_instant_bucket"] = bucket_key
-            timeline_us = _playback_timeline_us()
-            sub_us = (
-                _playback_subtitle_us(timeline_us)
-                if timeline_us is not None
-                else int(plan.playhead_us)
-            )
+            if playing:
+                preview_state["play_last_instant_bucket"] = bucket_key
+            else:
+                preview_state["scrub_last_instant_bucket"] = bucket_key
+        timeline_us = _playback_timeline_us() if playing else None
+        sub_us = (
+            _playback_subtitle_us(timeline_us)
+            if timeline_us is not None
+            else int(plan.playhead_us)
+        )
+        if playing or scrubbing:
             _apply_playback_frame_sync(instant, plan, subtitle_us=sub_us)
             return True
         gen = int(preview_state.get("gen", 0)) + 1
@@ -12233,13 +12405,12 @@ def run_app() -> None:
 
     def _run_fast_preview_fetch(plan: PreviewPlan, us: int) -> None:
         interactive = _preview_is_scrubbing() or _preview_is_playing()
-        if preview_state.get("scrub_busy") and not interactive:
+        if preview_state.get("scrub_busy"):
             return
         playing = _preview_is_playing()
-        if playing:
-            fetch_gen = int(preview_state.get("scrub_fetch_gen") or 0) + 1
-            preview_state["scrub_fetch_gen"] = fetch_gen
-            worker_token = fetch_gen
+        scrubbing = _preview_is_scrubbing()
+        if playing or scrubbing:
+            worker_token = int(preview_state.get("scrub_fetch_gen") or 0)
             apply_gen = int(preview_state.get("gen", 0))
         else:
             apply_gen = int(preview_state.get("gen", 0)) + 1
@@ -12254,15 +12425,20 @@ def run_app() -> None:
             img = fetch_scrub_frame_fast(plan, frame_cache=frame_cache)
 
             def ui() -> None:
-                if playing:
+                if playing or scrubbing:
                     if worker_token != int(preview_state.get("scrub_fetch_gen") or 0):
+                        preview_state["scrub_busy"] = False
                         return
                 elif worker_token != int(preview_state.get("gen", 0)):
+                    preview_state["scrub_busy"] = False
                     return
                 preview_state["scrub_busy"] = False
                 if img:
-                    if playing and bucket_key is not None:
-                        preview_state["play_last_instant_bucket"] = bucket_key
+                    if (playing or scrubbing) and bucket_key is not None:
+                        if playing:
+                            preview_state["play_last_instant_bucket"] = bucket_key
+                        else:
+                            preview_state["scrub_last_instant_bucket"] = bucket_key
                     timeline_us = _playback_timeline_us()
                     sub_us = (
                         _playback_subtitle_us(timeline_us)
@@ -12282,7 +12458,48 @@ def run_app() -> None:
 
             root.after(0, ui)
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="preview-scrub-fetch").start()
+
+    def _cancel_scrub_fetch_timer() -> None:
+        aid = preview_state.get("scrub_fetch_after_id")
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            preview_state["scrub_fetch_after_id"] = None
+
+    def _flush_scrub_preview_fetch() -> None:
+        preview_state["scrub_fetch_after_id"] = None
+        us = preview_state.get("scrub_fetch_pending_us")
+        preview_state["scrub_fetch_pending_us"] = None
+        if us is None:
+            return
+        content = timeline_content_cache[0]
+        if not isinstance(content, dict):
+            return
+        plan = build_preview_plan(content, int(us))
+        if not plan.videos:
+            return
+        if _try_instant_scrub_preview(plan):
+            return
+        if not preview_state.get("scrub_busy"):
+            _run_fast_preview_fetch(plan, int(us))
+
+    def _schedule_scrub_preview_fetch(us: int) -> None:
+        preview_state["scrub_fetch_pending_us"] = int(us)
+        if preview_state.get("scrub_fetch_after_id") is not None:
+            return
+        preview_state["scrub_fetch_after_id"] = root.after(
+            SCRUB_PREVIEW_FETCH_THROTTLE_MS, _flush_scrub_preview_fetch
+        )
+
+    def _on_playhead_scrub_begin() -> None:
+        preview_state["scrub_fetch_gen"] = int(preview_state.get("scrub_fetch_gen") or 0) + 1
+        preview_state["scrub_last_instant_bucket"] = None
+        preview_state["scrub_busy"] = False
+        _cancel_scrub_fetch_timer()
+        preview_state["scrub_fetch_pending_us"] = None
 
     def _request_preview_update(plan: PreviewPlan, us: int) -> None:
         if _try_instant_scrub_preview(plan):
@@ -12328,7 +12545,9 @@ def run_app() -> None:
                 return
             if _preview_is_scrubbing() or _preview_is_playing():
                 _maybe_warm_scrub_strip(plan)
-            if not preview_state.get("scrub_busy") or _preview_is_scrubbing() or _preview_is_playing():
+            if _preview_is_scrubbing():
+                _schedule_scrub_preview_fetch(us)
+            elif not preview_state.get("scrub_busy"):
                 _run_fast_preview_fetch(plan, us)
             return
 
@@ -12339,6 +12558,9 @@ def run_app() -> None:
         preview_state["scrub_busy"] = False
         preview_state["ui_apply_pending"] = None
         preview_state["ui_apply_scheduled"] = False
+        preview_state["scrub_last_instant_bucket"] = None
+        _cancel_scrub_fetch_timer()
+        preview_state["scrub_fetch_pending_us"] = None
         preview_state["last_preview_ppm"] = None
         preview_state["last_preview_plan"] = None
         preview_state["last_preview_subtitle_us"] = None
@@ -12355,6 +12577,7 @@ def run_app() -> None:
         on_playhead_changed(0)
 
     replace_state["_on_playhead_change"] = on_playhead_changed
+    replace_state["_on_playhead_scrub_begin"] = _on_playhead_scrub_begin
     replace_state["_prepare_preview_for_draft_load"] = _prepare_preview_for_draft_load
 
     def _flush_preview_after_scrub(playhead_us: int) -> None:
@@ -13604,6 +13827,60 @@ def run_app() -> None:
             pool_preset_suppress["v"] = False
         _apply_export_pool_preset_choice(POOL_EXPORT_PRESET_DEFAULT)
 
+    def on_clear_active_export_pool_preset() -> None:
+        from tkinter import messagebox
+
+        base_s = draft_root.get().strip()
+        dn = (selected_name or "").strip()
+        cur = (pool_preset_var.get() or "").strip() or POOL_EXPORT_PRESET_DEFAULT
+        preset_label = POOL_EXPORT_PRESET_DEFAULT if is_pool_export_default_menu_preset(cur) else cur
+        if not base_s or not os.path.isdir(base_s):
+            messagebox.showwarning("无法清除", "请先设置有效的草稿根目录。")
+            return
+        if not dn:
+            messagebox.showwarning("无法清除", "请先在左侧列表中选择一个草稿。")
+            return
+        if not draft_export_pool_preset_has_config(base_s, dn, cur):
+            messagebox.showinfo("清除预设", f"预设「{preset_label}」没有已保存的槽位配置。")
+            return
+        if is_pool_export_default_menu_preset(cur):
+            confirm = (
+                "确定清除当前草稿在「(默认)」下保存的全部槽位配置吗？\n"
+                "（不影响其他命名预设；不会修改 draft_content.json）"
+            )
+        else:
+            confirm = (
+                f"确定清除预设「{cur}」下的全部槽位配置吗？\n"
+                "（预设名称会保留，可重新配置；不会修改 draft_content.json）"
+            )
+        if not messagebox.askyesno("清除预设", confirm):
+            return
+        try:
+            ok = clear_export_pool_preset_for_draft(base_s, dn, cur)
+        except OSError as e:
+            messagebox.showerror("清除失败", str(e))
+            return
+        if not ok:
+            messagebox.showinfo("清除预设", f"预设「{preset_label}」没有可清除的配置。")
+            return
+        if is_pool_export_default_menu_preset(cur):
+            replace_state["segment_export_pool"] = {}
+            replace_state["export_pool_sequential_cursor"] = {}
+            try:
+                refresh_timeline_panel_data(None, reset_selection=False, immediate_timeline=True)
+            except Exception:
+                pass
+            ui_sync = replace_state.get("_on_timeline_selection_ui")
+            if callable(ui_sync):
+                try:
+                    ui_sync()
+                except Exception:
+                    pass
+        else:
+            replace_state["segment_export_pool"] = {}
+            replace_state["export_pool_sequential_cursor"] = {}
+            _apply_export_pool_preset_choice(cur)
+
     ctk.CTkButton(
         preset_toolbar,
         text="保存…",
@@ -13623,12 +13900,22 @@ def run_app() -> None:
         fg_color=("gray70", "gray35"),
         hover_color=("gray60", "gray28"),
         command=on_delete_export_pool_preset,
+    ).pack(side="left", padx=(0, 3))
+    ctk.CTkButton(
+        preset_toolbar,
+        text="清除预设",
+        width=72,
+        height=26,
+        font=ctk.CTkFont(size=11),
+        fg_color=("gray70", "gray35"),
+        hover_color=("gray60", "gray28"),
+        command=on_clear_active_export_pool_preset,
     ).pack(side="left", padx=(0, 0))
     ctk.CTkLabel(
         preset_toolbar_host,
         text=(
             "「(默认)」＝本稿工作台槽位（可改、会保存到本地）；"
-            "命名预设下改动会写回该预设。"
+            "命名预设下改动会写回该预设；「清除预设」只清空槽位，「删除」才移除预设名。"
         ),
         font=ctk.CTkFont(size=10),
         text_color=("gray45", "gray62"),
