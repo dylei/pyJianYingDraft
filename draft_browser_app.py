@@ -11,6 +11,7 @@ Windows 下可将单个素材文件或素材文件夹从资源管理器拖到时
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import copy
@@ -4359,6 +4360,27 @@ def _draft_list_item_wraplength(
     if panel_width is not None and panel_width >= 96:
         base_w = max(96, int(panel_width) - 44)
     return max(96, base_w - max(0, indent) - max(0, reserved_right))
+
+
+@contextmanager
+def _suspend_ctk_scrollable_paint(scroll_frame: Any):
+    """批量增删 ScrollableFrame 子控件时压低中间重绘，避免列表项逐条闪现。"""
+    pc = getattr(scroll_frame, "_parent_canvas", None)
+    saved_height: Any = None
+    if pc is not None:
+        try:
+            saved_height = pc.cget("height")
+            pc.configure(height=1)
+        except tk.TclError:
+            pc = None
+    try:
+        yield
+    finally:
+        if pc is not None and saved_height is not None:
+            try:
+                pc.configure(height=saved_height)
+            except tk.TclError:
+                pass
 
 
 _DRAFT_LIST_ROW_PAD = 4
@@ -10292,36 +10314,37 @@ def run_app() -> None:
     def _redraw_template_list(*, reset_scroll: bool = False) -> None:
         """用已缓存的 template_tree_roots 重绘树（展开/折叠、切回 Tab 时用，不请求服务器）。"""
         template_buttons.clear()
-        for w in template_list_frame.winfo_children():
-            w.destroy()
-        if not template_client:
-            template_status_var.set("模板客户端未加载（请从仓库根目录运行）")
-            ctk.CTkLabel(template_list_frame, text="模板模块不可用", text_color="orange").pack(pady=20)
-            _redraw_template_list_scroll(reset_scroll=reset_scroll)
-            return
-        if not auth_client or not auth_client.user_id:
-            template_status_var.set("请先登录后再拉取爆款模板")
-            ctk.CTkLabel(template_list_frame, text="请先登录", text_color=("gray45", "gray60")).pack(pady=20)
-            _redraw_template_list_scroll(reset_scroll=reset_scroll)
-            return
-        if not template_list_fetched["ok"]:
-            template_status_var.set("切换到本页后从服务器拉取模板列表")
-            ctk.CTkLabel(
-                template_list_frame,
-                text="（尚未加载）",
-                text_color=("gray45", "gray60"),
-            ).pack(pady=20)
-            _redraw_template_list_scroll(reset_scroll=reset_scroll)
-            return
-        if not template_tree_roots:
-            template_status_var.set("暂无模板（服务器返回空列表）")
-            ctk.CTkLabel(template_list_frame, text="（暂无模板）", text_color=("gray45", "gray60")).pack(pady=20)
-        else:
-            from shared.hot_template_client import count_hot_templates
+        with _suspend_ctk_scrollable_paint(template_list_frame):
+            for w in template_list_frame.winfo_children():
+                w.destroy()
+            if not template_client:
+                template_status_var.set("模板客户端未加载（请从仓库根目录运行）")
+                ctk.CTkLabel(template_list_frame, text="模板模块不可用", text_color="orange").pack(pady=20)
+                _redraw_template_list_scroll(reset_scroll=reset_scroll)
+                return
+            if not auth_client or not auth_client.user_id:
+                template_status_var.set("请先登录后再拉取爆款模板")
+                ctk.CTkLabel(template_list_frame, text="请先登录", text_color=("gray45", "gray60")).pack(pady=20)
+                _redraw_template_list_scroll(reset_scroll=reset_scroll)
+                return
+            if not template_list_fetched["ok"]:
+                template_status_var.set("切换到本页后从服务器拉取模板列表")
+                ctk.CTkLabel(
+                    template_list_frame,
+                    text="（尚未加载）",
+                    text_color=("gray45", "gray60"),
+                ).pack(pady=20)
+                _redraw_template_list_scroll(reset_scroll=reset_scroll)
+                return
+            if not template_tree_roots:
+                template_status_var.set("暂无模板（服务器返回空列表）")
+                ctk.CTkLabel(template_list_frame, text="（暂无模板）", text_color=("gray45", "gray60")).pack(pady=20)
+            else:
+                from shared.hot_template_client import count_hot_templates
 
-            n_tpl = count_hot_templates(template_tree_roots)
-            template_status_var.set(f"共 {n_tpl} 个可下载模板")
-            render_hot_template_tree(template_tree_roots, indent=0)
+                n_tpl = count_hot_templates(template_tree_roots)
+                template_status_var.set(f"共 {n_tpl} 个可下载模板")
+                render_hot_template_tree(template_tree_roots, indent=0)
         _redraw_template_list_scroll(reset_scroll=reset_scroll)
 
     def _collect_template_branch_ids(nodes: List[Any]) -> set[str]:
@@ -10382,30 +10405,31 @@ def run_app() -> None:
                 template_fetch_busy["on"] = False
                 template_list_fetched["ok"] = True
                 template_buttons.clear()
-                for w in template_list_frame.winfo_children():
-                    w.destroy()
-                if err:
-                    template_status_var.set(err)
-                    ctk.CTkLabel(
-                        template_list_frame,
-                        text=err,
-                        text_color=("gray45", "gray60"),
-                        wraplength=240,
-                        justify="left",
-                    ).pack(pady=20, padx=8)
-                else:
-                    template_tree_roots = list(roots or [])
-                    if not template_tree_roots:
-                        template_status_var.set("暂无模板（服务器返回空列表）")
+                with _suspend_ctk_scrollable_paint(template_list_frame):
+                    for w in template_list_frame.winfo_children():
+                        w.destroy()
+                    if err:
+                        template_status_var.set(err)
                         ctk.CTkLabel(
-                            template_list_frame, text="（暂无模板）", text_color=("gray45", "gray60")
-                        ).pack(pady=20)
+                            template_list_frame,
+                            text=err,
+                            text_color=("gray45", "gray60"),
+                            wraplength=240,
+                            justify="left",
+                        ).pack(pady=20, padx=8)
                     else:
-                        from shared.hot_template_client import count_hot_templates
+                        template_tree_roots = list(roots or [])
+                        if not template_tree_roots:
+                            template_status_var.set("暂无模板（服务器返回空列表）")
+                            ctk.CTkLabel(
+                                template_list_frame, text="（暂无模板）", text_color=("gray45", "gray60")
+                            ).pack(pady=20)
+                        else:
+                            from shared.hot_template_client import count_hot_templates
 
-                        n_tpl = count_hot_templates(template_tree_roots)
-                        template_status_var.set(f"共 {n_tpl} 个可下载模板")
-                        render_hot_template_tree(template_tree_roots, indent=0)
+                            n_tpl = count_hot_templates(template_tree_roots)
+                            template_status_var.set(f"共 {n_tpl} 个可下载模板")
+                            render_hot_template_tree(template_tree_roots, indent=0)
                 _redraw_template_list_scroll(reset_scroll=reset_scroll)
 
             try:
@@ -10566,7 +10590,14 @@ def run_app() -> None:
         if callable(start_preview):
             start_preview(selected_library_media)
 
-    def render_library_subtree(folder_path: str, *, indent: int, is_root: bool = False) -> None:
+    def render_library_subtree(
+        folder_path: str,
+        *,
+        indent: int,
+        is_root: bool = False,
+        parent_container: Any = None,
+    ) -> None:
+        container = parent_container if parent_container is not None else library_tree_frame
         norm_key = _norm_library_path(folder_path)
         display_name = os.path.basename(folder_path.rstrip(os.sep)) or folder_path
         if is_root:
@@ -10574,27 +10605,42 @@ def run_app() -> None:
         subdirs = list_library_subdirs(folder_path)
         if subdirs:
             expanded = norm_key in expanded_library_folders
-            row = ctk.CTkFrame(library_tree_frame, fg_color="transparent")
+            row = ctk.CTkFrame(container, fg_color="transparent")
             row.pack(fill="x", pady=2, padx=(4 + max(0, indent), 4))
+            children_holder = ctk.CTkFrame(container, fg_color="transparent")
 
-            def _mk_toggle(path_key: str = norm_key) -> Any:
-                def _inner() -> None:
-                    if path_key in expanded_library_folders:
-                        expanded_library_folders.discard(path_key)
-                    else:
-                        expanded_library_folders.add(path_key)
-                    refresh_library_tree(reselect_folder=False)
+            def _toggle_folder(
+                path_key: str = norm_key,
+                toggle_btn: Any = None,
+                holder: Any = children_holder,
+                header_row: Any = row,
+            ) -> None:
+                if path_key in expanded_library_folders:
+                    expanded_library_folders.discard(path_key)
+                    holder.pack_forget()
+                    if toggle_btn is not None:
+                        toggle_btn.configure(text=draft_tree_toggle_symbol(False))
+                else:
+                    expanded_library_folders.add(path_key)
+                    holder.pack(fill="x", after=header_row)
+                    if toggle_btn is not None:
+                        toggle_btn.configure(text=draft_tree_toggle_symbol(True))
+                _redraw_library_tree_scroll(reset_scroll=False)
 
-                return _inner
-
-            ctk.CTkButton(
+            sym = draft_tree_toggle_symbol(expanded)
+            toggle_btn = ctk.CTkButton(
                 row,
-                text=draft_tree_toggle_symbol(expanded),
+                text=sym,
                 width=32,
                 height=32,
                 font=draft_tree_toggle_font,
-                command=_mk_toggle(),
-            ).pack(side="left", padx=(0, 4))
+            )
+            toggle_btn.configure(
+                command=lambda pk=norm_key, tb=toggle_btn, h=children_holder, rw=row: _toggle_folder(
+                    pk, tb, h, rw
+                )
+            )
+            toggle_btn.pack(side="left", padx=(0, 4))
             mid = ctk.CTkFrame(row, fg_color="transparent")
             mid.pack(side="left", fill="x", expand=True)
             wrap = _draft_list_item_wraplength(indent=indent, reserved_right=36)
@@ -10613,14 +10659,15 @@ def run_app() -> None:
             pb._wrap_reserved = 36  # type: ignore[attr-defined]
             pb.pack(fill="x")
             library_buttons.append(pb)
+            for sub in subdirs:
+                render_library_subtree(sub, indent=indent + 8, parent_container=children_holder)
             if expanded:
-                for sub in subdirs:
-                    render_library_subtree(sub, indent=indent + 8)
+                children_holder.pack(fill="x", after=row)
         else:
             pad_l = _DRAFT_LIST_TOP_LEAF_PAD + max(0, indent)
             wrap = _draft_list_item_wraplength(indent=indent)
             box = _make_draft_list_click_box(
-                library_tree_frame,
+                container,
                 display_name,
                 row_kind="leaf",
                 on_click=lambda p=folder_path: select_library_folder(p),
@@ -10634,30 +10681,31 @@ def run_app() -> None:
 
     def refresh_library_tree(*, reselect_folder: bool = True) -> None:
         library_buttons.clear()
-        for w in library_tree_frame.winfo_children():
-            w.destroy()
         valid_roots = [r for r in library_roots if os.path.isdir(r)]
         if len(valid_roots) != len(library_roots):
             library_roots[:] = valid_roots
             save_material_library_roots(library_roots)
-        if not library_roots:
-            library_status_var.set("尚未添加文件夹，请点击「添加文件夹」")
-            ctk.CTkLabel(
-                library_tree_frame,
-                text="（暂无根目录）",
-                text_color=("gray45", "gray60"),
-            ).pack(pady=20)
-            library_media_path_var.set("")
-            library_media_buttons.clear()
-            for w in library_media_list_frame.winfo_children():
+        with _suspend_ctk_scrollable_paint(library_tree_frame):
+            for w in library_tree_frame.winfo_children():
                 w.destroy()
-            _detail_set("请在左侧「素材库」中添加本地文件夹，然后点击目录树中的文件夹查看素材。")
-            _redraw_library_tree_scroll(reset_scroll=True)
-            _redraw_library_media_scroll(reset_scroll=True)
-            return
-        library_status_var.set(f"已添加 {len(library_roots)} 个根文件夹")
-        for root_path in library_roots:
-            render_library_subtree(root_path, indent=0, is_root=True)
+            if not library_roots:
+                library_status_var.set("尚未添加文件夹，请点击「添加文件夹」")
+                ctk.CTkLabel(
+                    library_tree_frame,
+                    text="（暂无根目录）",
+                    text_color=("gray45", "gray60"),
+                ).pack(pady=20)
+                library_media_path_var.set("")
+                library_media_buttons.clear()
+                for w in library_media_list_frame.winfo_children():
+                    w.destroy()
+                _detail_set("请在左侧「素材库」中添加本地文件夹，然后点击目录树中的文件夹查看素材。")
+                _redraw_library_tree_scroll(reset_scroll=True)
+                _redraw_library_media_scroll(reset_scroll=True)
+                return
+            library_status_var.set(f"已添加 {len(library_roots)} 个根文件夹")
+            for root_path in library_roots:
+                render_library_subtree(root_path, indent=0, is_root=True)
         if reselect_folder and selected_library_path and os.path.isdir(selected_library_path):
             select_library_folder(selected_library_path)
         else:
@@ -15863,32 +15911,53 @@ def run_app() -> None:
         _draft_list_scan_cache["root"] = ""
         _draft_list_scan_cache["payload"] = None
 
-    def render_hot_template_tree(nodes: List[Any], *, indent: int) -> None:
+    def render_hot_template_tree(
+        nodes: List[Any],
+        *,
+        indent: int,
+        parent_container: Any = None,
+    ) -> None:
+        container = parent_container if parent_container is not None else template_list_frame
         for node in nodes:
             if node.is_folder:
                 children = list(node.children or ())
                 expanded = node.template_id in expanded_template_folders
-                row = ctk.CTkFrame(template_list_frame, fg_color="transparent")
+                row = ctk.CTkFrame(container, fg_color="transparent")
                 row.pack(fill="x", pady=2, padx=(4 + max(0, indent), 4))
+                children_holder = ctk.CTkFrame(container, fg_color="transparent")
 
-                def _mk_toggle(folder_id: str = node.template_id) -> Any:
-                    def _inner() -> None:
-                        if folder_id in expanded_template_folders:
-                            expanded_template_folders.discard(folder_id)
-                        else:
-                            expanded_template_folders.add(folder_id)
-                        _redraw_template_list()
+                def _toggle_folder(
+                    folder_id: str = node.template_id,
+                    toggle_btn: Any = None,
+                    holder: Any = children_holder,
+                    header_row: Any = row,
+                ) -> None:
+                    if folder_id in expanded_template_folders:
+                        expanded_template_folders.discard(folder_id)
+                        holder.pack_forget()
+                        if toggle_btn is not None:
+                            toggle_btn.configure(text=draft_tree_toggle_symbol(False))
+                    else:
+                        expanded_template_folders.add(folder_id)
+                        holder.pack(fill="x", after=header_row)
+                        if toggle_btn is not None:
+                            toggle_btn.configure(text=draft_tree_toggle_symbol(True))
+                    _redraw_template_list_scroll(reset_scroll=False)
 
-                    return _inner
-
-                ctk.CTkButton(
+                sym = draft_tree_toggle_symbol(expanded)
+                toggle_btn = ctk.CTkButton(
                     row,
-                    text=draft_tree_toggle_symbol(expanded),
+                    text=sym,
                     width=32,
                     height=32,
                     font=draft_tree_toggle_font,
-                    command=_mk_toggle(),
-                ).pack(side="left", padx=(0, 4))
+                )
+                toggle_btn.configure(
+                    command=lambda fid=node.template_id, tb=toggle_btn, h=children_holder, rw=row: _toggle_folder(
+                        fid, tb, h, rw
+                    )
+                )
+                toggle_btn.pack(side="left", padx=(0, 4))
                 mid = ctk.CTkFrame(row, fg_color="transparent")
                 mid.pack(side="left", fill="x", expand=True)
                 wrap = _draft_list_item_wraplength(indent=indent, reserved_right=36)
@@ -15899,7 +15968,9 @@ def run_app() -> None:
                     mid,
                     node.name,
                     row_kind="parent",
-                    on_click=_mk_toggle(),
+                    on_click=lambda fid=node.template_id, tb=toggle_btn, h=children_holder, rw=row: _toggle_folder(
+                        fid, tb, h, rw
+                    ),
                     wraplength=wrap,
                     subtitle=f"· {n_sub} 个模板" if n_sub else "",
                 )
@@ -15907,14 +15978,15 @@ def run_app() -> None:
                 pb._wrap_reserved = 36  # type: ignore[attr-defined]
                 pb.pack(fill="x")
                 template_buttons.append(pb)
+                render_hot_template_tree(children, indent=indent + 8, parent_container=children_holder)
                 if expanded:
-                    render_hot_template_tree(children, indent=indent + 8)
+                    children_holder.pack(fill="x", after=row)
             elif node.is_template:
                 pad_l = 12 + max(0, indent)
                 wrap = _draft_list_item_wraplength(indent=indent)
                 subtitle = node.updated_at or ""
                 box = _make_draft_list_click_box(
-                    template_list_frame,
+                    container,
                     node.name,
                     row_kind="template",
                     on_click=lambda n=node: download_template_node(n),
@@ -16445,8 +16517,6 @@ def run_app() -> None:
     ) -> None:
         nonlocal draft_buttons, selected_name
         prev_selected = selected_name
-        for w in list_frame.winfo_children():
-            w.destroy()
         draft_buttons = []
         if reselect_draft:
             selected_name = None
@@ -16461,122 +16531,150 @@ def run_app() -> None:
             selected_name = prev_selected
 
         base = draft_root.get().strip()
-        if not base:
-            ctk.CTkLabel(list_frame, text="请选择草稿目录").pack(pady=20)
-            if reselect_draft:
-                _detail_set("在上方「浏览」中选择剪映草稿文件夹。\n\n常见路径：\n%LOCALAPPDATA%\\JianyingPro\\User Data\\Projects\\com.lveditor.draft")
-            _redraw_list_scroll(reset_scroll=reset_list_scroll)
-            return
-        if not os.path.isdir(base):
-            ctk.CTkLabel(list_frame, text="目录无效", text_color="orange").pack(pady=20)
-            _redraw_list_scroll(reset_scroll=reset_list_scroll)
-            return
-
-        if rescan_folders or _draft_list_scan_cache.get("root") != base or not _draft_list_scan_cache.get("payload"):
-            tree_data = scan_draft_list_tree_data(base)
-            _draft_list_scan_cache["root"] = base
-            _draft_list_scan_cache["payload"] = tree_data
-        else:
-            tree_data = _draft_list_scan_cache["payload"]
-
-        items = tree_data["items"]
-        if not items:
-            ctk.CTkLabel(list_frame, text="（空）").pack(pady=20)
-            if reselect_draft:
-                _detail_set("当前根目录下没有草稿文件夹。")
-            _redraw_list_scroll(reset_scroll=reset_list_scroll)
-            return
-
-        by_parent: Dict[str, List[str]] = dict(tree_data["by_parent"])
-        sort_keys: Dict[str, Tuple[float, int]] = dict(tree_data["sort_keys"])
-        top_level: List[str] = list(tree_data["top_level"])
-
-        def add_leaf_button(
-            container: Any,
-            folder_name: str,
-            *,
-            indent: int,
-            parent_indent: Optional[int] = None,
-        ) -> None:
-            if parent_indent is not None:
-                pad_l = _draft_list_child_pad_left(parent_indent)
-                wrap_indent = max(0, pad_l - _DRAFT_LIST_TOP_LEAF_PAD)
+        tree_data: Optional[Dict[str, Any]] = None
+        if base and os.path.isdir(base):
+            if rescan_folders or _draft_list_scan_cache.get("root") != base or not _draft_list_scan_cache.get("payload"):
+                tree_data = scan_draft_list_tree_data(base)
+                _draft_list_scan_cache["root"] = base
+                _draft_list_scan_cache["payload"] = tree_data
             else:
-                pad_l = _DRAFT_LIST_TOP_LEAF_PAD + max(0, indent)
-                wrap_indent = indent
-            wrap = _draft_list_item_wraplength(indent=wrap_indent)
-            b = _make_draft_list_click_box(
-                container,
-                folder_name,
-                row_kind="leaf",
-                on_click=lambda n=folder_name: show_draft(n),
-                wraplength=wrap,
-                title_font=draft_list_title_font,
-            )
-            b._wrap_indent = wrap_indent  # type: ignore[attr-defined]
-            b.pack(fill="x", pady=2, padx=(pad_l, 4))
-            draft_buttons.append(b)
+                tree_data = _draft_list_scan_cache.get("payload")
 
-        def render_draft_subtree(
-            folder_name: str,
-            *,
-            indent: int,
-            parent_indent: Optional[int] = None,
-        ) -> None:
-            """递归展示父子草稿（支持 A → A_1 → A_1_1 等多级）。"""
-            children = list(by_parent.get(folder_name) or [])
-            if children:
-                expanded = folder_name in expanded_draft_parents
-                row = ctk.CTkFrame(list_frame, fg_color="transparent")
-                row.pack(fill="x", pady=2, padx=(_DRAFT_LIST_ROW_PAD + max(0, indent), 4))
+        with _suspend_ctk_scrollable_paint(list_frame):
+            for w in list_frame.winfo_children():
+                w.destroy()
 
-                def _mk_toggle(pn: str = folder_name) -> Any:
-                    def _inner() -> None:
-                        if pn in expanded_draft_parents:
-                            expanded_draft_parents.discard(pn)
-                        else:
-                            expanded_draft_parents.add(pn)
-                        refresh_list(reselect_draft=False, rescan_folders=False)
+            if not base:
+                ctk.CTkLabel(list_frame, text="请选择草稿目录").pack(pady=20)
+                if reselect_draft:
+                    _detail_set(
+                        "在上方「浏览」中选择剪映草稿文件夹。\n\n"
+                        "常见路径：\n%LOCALAPPDATA%\\JianyingPro\\User Data\\Projects\\com.lveditor.draft"
+                    )
+                _redraw_list_scroll(reset_scroll=reset_list_scroll)
+                return
+            if not os.path.isdir(base):
+                ctk.CTkLabel(list_frame, text="目录无效", text_color="orange").pack(pady=20)
+                _redraw_list_scroll(reset_scroll=reset_list_scroll)
+                return
 
-                    return _inner
+            items = (tree_data or {}).get("items") if isinstance(tree_data, dict) else None
+            if not items:
+                ctk.CTkLabel(list_frame, text="（空）").pack(pady=20)
+                if reselect_draft:
+                    _detail_set("当前根目录下没有草稿文件夹。")
+                _redraw_list_scroll(reset_scroll=reset_list_scroll)
+                return
 
-                sym = draft_tree_toggle_symbol(expanded)
-                ctk.CTkButton(
-                    row,
-                    text=sym,
-                    width=32,
-                    height=32,
-                    font=draft_tree_toggle_font,
-                    command=_mk_toggle(),
-                ).pack(side="left", padx=(0, 4))
-                mid = ctk.CTkFrame(row, fg_color="transparent")
-                mid.pack(side="left", fill="x", expand=True)
-                n_sub = len(children)
-                wrap = _draft_list_item_wraplength(indent=indent, reserved_right=36)
-                pb = _make_draft_list_click_box(
-                    mid,
+            by_parent: Dict[str, List[str]] = dict(tree_data["by_parent"])
+            sort_keys: Dict[str, Tuple[float, int]] = dict(tree_data["sort_keys"])
+            top_level: List[str] = list(tree_data["top_level"])
+
+            def add_leaf_button(
+                container: Any,
+                folder_name: str,
+                *,
+                indent: int,
+                parent_indent: Optional[int] = None,
+            ) -> None:
+                if parent_indent is not None:
+                    pad_l = _draft_list_child_pad_left(parent_indent)
+                    wrap_indent = max(0, pad_l - _DRAFT_LIST_TOP_LEAF_PAD)
+                else:
+                    pad_l = _DRAFT_LIST_TOP_LEAF_PAD + max(0, indent)
+                    wrap_indent = indent
+                wrap = _draft_list_item_wraplength(indent=wrap_indent)
+                b = _make_draft_list_click_box(
+                    container,
                     folder_name,
-                    row_kind="parent",
+                    row_kind="leaf",
                     on_click=lambda n=folder_name: show_draft(n),
                     wraplength=wrap,
-                    subtitle=f"· {n_sub} 个子稿",
                     title_font=draft_list_title_font,
-                    subtitle_font=draft_list_sub_font,
                 )
-                pb._wrap_indent = indent  # type: ignore[attr-defined]
-                pb._wrap_reserved = 36  # type: ignore[attr-defined]
-                pb.pack(fill="x")
-                draft_buttons.append(pb)
+                b._wrap_indent = wrap_indent  # type: ignore[attr-defined]
+                b.pack(fill="x", pady=2, padx=(pad_l, 4))
+                draft_buttons.append(b)
 
-                if expanded:
+            def render_draft_subtree(
+                folder_name: str,
+                *,
+                indent: int,
+                parent_indent: Optional[int] = None,
+                parent_container: Any = None,
+            ) -> None:
+                """递归展示父子草稿（支持 A → A_1 → A_1_1 等多级）。"""
+                container = parent_container if parent_container is not None else list_frame
+                children = list(by_parent.get(folder_name) or [])
+                if children:
+                    expanded = folder_name in expanded_draft_parents
+                    row = ctk.CTkFrame(container, fg_color="transparent")
+                    row.pack(fill="x", pady=2, padx=(_DRAFT_LIST_ROW_PAD + max(0, indent), 4))
+                    children_holder = ctk.CTkFrame(container, fg_color="transparent")
+
+                    def _toggle_parent(
+                        pn: str = folder_name,
+                        toggle_btn: Any = None,
+                        holder: Any = children_holder,
+                        header_row: Any = row,
+                    ) -> None:
+                        if pn in expanded_draft_parents:
+                            expanded_draft_parents.discard(pn)
+                            holder.pack_forget()
+                            if toggle_btn is not None:
+                                toggle_btn.configure(text=draft_tree_toggle_symbol(False))
+                        else:
+                            expanded_draft_parents.add(pn)
+                            holder.pack(fill="x", after=header_row)
+                            if toggle_btn is not None:
+                                toggle_btn.configure(text=draft_tree_toggle_symbol(True))
+                        _redraw_list_scroll(reset_scroll=False)
+
+                    sym = draft_tree_toggle_symbol(expanded)
+                    toggle_btn = ctk.CTkButton(
+                        row,
+                        text=sym,
+                        width=32,
+                        height=32,
+                        font=draft_tree_toggle_font,
+                    )
+                    toggle_btn.configure(
+                        command=lambda pn=folder_name, tb=toggle_btn, h=children_holder, rw=row: _toggle_parent(
+                            pn, tb, h, rw
+                        )
+                    )
+                    toggle_btn.pack(side="left", padx=(0, 4))
+                    mid = ctk.CTkFrame(row, fg_color="transparent")
+                    mid.pack(side="left", fill="x", expand=True)
+                    n_sub = len(children)
+                    wrap = _draft_list_item_wraplength(indent=indent, reserved_right=36)
+                    pb = _make_draft_list_click_box(
+                        mid,
+                        folder_name,
+                        row_kind="parent",
+                        on_click=lambda n=folder_name: show_draft(n),
+                        wraplength=wrap,
+                        subtitle=f"· {n_sub} 个子稿",
+                        title_font=draft_list_title_font,
+                        subtitle_font=draft_list_sub_font,
+                    )
+                    pb._wrap_indent = indent  # type: ignore[attr-defined]
+                    pb._wrap_reserved = 36  # type: ignore[attr-defined]
+                    pb.pack(fill="x")
+                    draft_buttons.append(pb)
+
                     ch_sorted = sorted(children, key=lambda c: sort_keys.get(c, (0.0, 0)), reverse=True)
                     for ch in ch_sorted:
-                        render_draft_subtree(ch, indent=indent + 8, parent_indent=indent)
-            else:
-                add_leaf_button(list_frame, folder_name, indent=indent, parent_indent=parent_indent)
+                        render_draft_subtree(
+                            ch, indent=indent + 8, parent_indent=indent, parent_container=children_holder
+                        )
+                    if expanded:
+                        children_holder.pack(fill="x", after=row)
+                else:
+                    add_leaf_button(container, folder_name, indent=indent, parent_indent=parent_indent)
 
-        for name in top_level:
-            render_draft_subtree(name, indent=0)
+            for name in top_level:
+                render_draft_subtree(name, indent=0)
 
         if reselect_draft:
             if prev_selected and os.path.isdir(os.path.join(base, prev_selected)):
