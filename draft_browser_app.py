@@ -4,7 +4,7 @@
 Windows 下可将单个素材文件或素材文件夹从资源管理器拖到时间轴片段彩色条上，效果与弹窗中保存「单个文件」或「素材目录」一致（需安装 windnd）；
 每个导出槽位仅保留最后一次配置：「单个文件」与「素材目录」互斥，后保存的生效；可设新素材截取起点（片头 / 随机 / 自定义秒）。
 下拉「(默认)」表示使用本稿槽位工作台（working_pool），与命名预设一样可编辑并持久化到本地；旧版曾显示为「(保持原样)」，程序会自动识别。命名预设下改动会写回该预设。「导出生成子草稿」默认勾选：导出 MP4 时复制为子草稿并在子稿上套用预设，底稿不动；取消勾选时会在**每次导出前**对当前草稿临时套用槽位/花字/贴纸配置再导出，随后**自动还原** draft_content.json，不增加子文件夹（与「生成草稿」按钮无关，该按钮仍会复制子稿）。花字/贴纸请在时间轴点轨道名或片段后使用「替换…」配置。
-父子关系索引与导出 MP4 区选项（备份、字幕、子草稿、条数、文件名前缀等）记忆在 %LOCALAPPDATA%\\pyJianYingDraft_browser\\（export_mp4_ui_preference.json），草稿文件夹仍在剪映根目录下平铺。
+父子关系索引、导出 MP4 区选项（备份、字幕、子草稿、条数、文件名前缀等）与主窗口布局比例记忆在 %LOCALAPPDATA%\\pyJianYingDraft_browser\\（export_mp4_ui_preference.json、window_layout_preference.json 等），草稿文件夹仍在剪映根目录下平铺。
 音频槽选视频时自动用 ffmpeg 抽音轨为 MP3。
 运行: pip install customtkinter Send2Trash requests windnd && python draft_browser_app.py
 """
@@ -42,6 +42,7 @@ _VIDEO_REPLACE_EXTS = frozenset({".mp4", ".m4v", ".mov", ".mkv", ".avi", ".gif",
 _AUDIO_REPLACE_EXTS = frozenset(
     {".mp3", ".wav", ".m4a", ".aac", ".flac", ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm"}
 )
+_LIBRARY_MEDIA_EXTS = frozenset(set(_VIDEO_REPLACE_EXTS) | set(_AUDIO_REPLACE_EXTS))
 
 
 def list_replace_candidates_in_dir(dir_path: str, track_type: str) -> List[str]:
@@ -1089,8 +1090,8 @@ def _parse_ppm_dimensions(ppm_bytes: bytes) -> Optional[Tuple[int, int]]:
     return w, h
 
 
-def _probe_video_display_size_ffmpeg_frame(path: str) -> Optional[Tuple[int, int]]:
-    """用 ffmpeg 解码一帧（默认 autorotate）得到实际画面宽高，比 rotation 元数据更可靠。"""
+def _extract_video_first_frame_ppm(path: str) -> Optional[bytes]:
+    """用 ffmpeg 解码首帧（默认 autorotate）为 PPM，用于封面与比例检测。"""
     ff = find_ffmpeg()
     if not ff:
         return None
@@ -1098,7 +1099,7 @@ def _probe_video_display_size_ffmpeg_frame(path: str) -> Optional[Tuple[int, int
     if not os.path.isfile(path_abs):
         return None
 
-    def _run(extra_input_args: List[str]) -> Optional[Tuple[int, int]]:
+    def _run(extra_input_args: List[str]) -> Optional[bytes]:
         cmd = [
             ff,
             "-hide_banner",
@@ -1110,6 +1111,8 @@ def _probe_video_display_size_ffmpeg_frame(path: str) -> Optional[Tuple[int, int
             "-frames:v",
             "1",
             "-an",
+            "-vf",
+            "format=rgb24",
             "-f",
             "image2pipe",
             "-vcodec",
@@ -1122,12 +1125,30 @@ def _probe_video_display_size_ffmpeg_frame(path: str) -> Optional[Tuple[int, int
             return None
         if proc.returncode != 0 or not proc.stdout:
             return None
-        return _parse_ppm_dimensions(proc.stdout)
+        return proc.stdout
 
     out = _run(["-ss", "0.1"])
     if out:
         return out
     return _run([])
+
+
+def _probe_video_display_size_ffmpeg_frame(path: str) -> Optional[Tuple[int, int]]:
+    """用 ffmpeg 解码一帧（默认 autorotate）得到实际画面宽高，比 rotation 元数据更可靠。"""
+    ppm = _extract_video_first_frame_ppm(path)
+    if not ppm:
+        return None
+    return _parse_ppm_dimensions(ppm)
+
+
+def _compute_preview_fit_size(
+    src_w: int, src_h: int, avail_w: int, avail_h: int
+) -> Tuple[int, int]:
+    """等比缩放至预览区内最大尺寸（letterbox 内接矩形）。"""
+    if src_w <= 0 or src_h <= 0 or avail_w <= 0 or avail_h <= 0:
+        return max(80, int(avail_w)), max(80, int(avail_h))
+    scale = min(float(avail_w) / src_w, float(avail_h) / src_h)
+    return max(1, int(src_w * scale)), max(1, int(src_h * scale))
 
 
 def _resolve_video_display_pixel_size(
@@ -3734,6 +3755,93 @@ def save_draft_root_preference(root_p: str) -> None:
     os.replace(tmp, path)
 
 
+_DEFAULT_WINDOW_WIDTH = 1320
+_DEFAULT_WINDOW_HEIGHT = 680
+_DEFAULT_PANEL_LEFT_WIDTH = 280
+_DEFAULT_PANEL_PREVIEW_WIDTH = 280
+_WINDOW_LAYOUT_MIN_WIDTH = 920
+_WINDOW_LAYOUT_MIN_HEIGHT = 480
+_PANEL_MIN_SIDE_WIDTH = 168
+_PANEL_MIN_CENTER_WIDTH = 300
+
+
+def _window_layout_pref_path() -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "window_layout_preference.json"
+
+
+def load_window_layout_preferences() -> Dict[str, Any]:
+    """读取主窗口尺寸与三栏分割比例（无效或缺失的键由调用方用默认值处理）。"""
+    defaults: Dict[str, Any] = {
+        "window_width": _DEFAULT_WINDOW_WIDTH,
+        "window_height": _DEFAULT_WINDOW_HEIGHT,
+        "panel_left_width": _DEFAULT_PANEL_LEFT_WIDTH,
+        "panel_preview_width": _DEFAULT_PANEL_PREVIEW_WIDTH,
+    }
+    path = _window_layout_pref_path()
+    if not path.is_file():
+        return dict(defaults)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return dict(defaults)
+        out = dict(defaults)
+        for key in (
+            "window_width",
+            "window_height",
+            "window_x",
+            "window_y",
+            "panel_left_width",
+            "panel_preview_width",
+            "panel_sash0",
+            "panel_sash1",
+        ):
+            if key not in data:
+                continue
+            val = data[key]
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                continue
+            out[key] = int(val)
+        out["window_width"] = max(
+            _WINDOW_LAYOUT_MIN_WIDTH, min(4096, int(out["window_width"]))
+        )
+        out["window_height"] = max(
+            _WINDOW_LAYOUT_MIN_HEIGHT, min(4096, int(out["window_height"]))
+        )
+        out["panel_left_width"] = max(
+            _PANEL_MIN_SIDE_WIDTH, min(800, int(out["panel_left_width"]))
+        )
+        out["panel_preview_width"] = max(
+            _PANEL_MIN_SIDE_WIDTH, min(800, int(out["panel_preview_width"]))
+        )
+        return out
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return dict(defaults)
+
+
+def save_window_layout_preferences(updates: Dict[str, Any]) -> None:
+    """合并写入 window_layout_preference.json（只覆盖 updates 中的键）。"""
+    path = _window_layout_pref_path()
+    merged: Dict[str, Any] = {}
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+            if isinstance(prev, dict):
+                merged = dict(prev)
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    for k, v in updates.items():
+        merged[k] = v
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 _DEFAULT_PREVIEW_MP4_DIR = r"D:\下载\【竖屏预览版】-剪映模板"
 
 
@@ -3756,6 +3864,109 @@ def load_preview_mp4_dir_preference() -> str:
         except (OSError, json.JSONDecodeError, TypeError):
             pass
     return _DEFAULT_PREVIEW_MP4_DIR
+
+
+def _material_library_pref_path() -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "material_library_roots.json"
+
+
+def load_material_library_roots() -> List[str]:
+    path = _material_library_pref_path()
+    if not path.is_file():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        roots = data.get("roots") or []
+        if not isinstance(roots, list):
+            return []
+        out: List[str] = []
+        seen: set[str] = set()
+        for r in roots:
+            p = os.path.normpath(str(r).strip())
+            if not p or p in seen:
+                continue
+            if os.path.isdir(p):
+                out.append(p)
+                seen.add(p)
+        return out
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+
+
+def save_material_library_roots(roots: List[str]) -> None:
+    path = _material_library_pref_path()
+    tmp = path.with_suffix(".json.tmp")
+    norm_roots: List[str] = []
+    seen: set[str] = set()
+    for r in roots:
+        p = os.path.normpath(str(r).strip())
+        if not p or p in seen:
+            continue
+        norm_roots.append(p)
+        seen.add(p)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"roots": norm_roots}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _norm_library_path(path: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
+def list_library_subdirs(dir_path: str) -> List[str]:
+    if not dir_path or not os.path.isdir(dir_path):
+        return []
+    found: List[str] = []
+    try:
+        for name in os.listdir(dir_path):
+            fp = os.path.join(dir_path, name)
+            if os.path.isdir(fp):
+                found.append(fp)
+    except OSError:
+        return []
+    found.sort(key=lambda p: os.path.basename(p).lower())
+    return found
+
+
+def list_library_media_files(dir_path: str) -> List[str]:
+    if not dir_path or not os.path.isdir(dir_path):
+        return []
+    found: List[str] = []
+    try:
+        for name in os.listdir(dir_path):
+            fp = os.path.join(dir_path, name)
+            if not os.path.isfile(fp):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in _LIBRARY_MEDIA_EXTS:
+                found.append(fp)
+    except OSError:
+        return []
+    found.sort(key=lambda p: os.path.basename(p).lower())
+    return found
+
+
+def library_media_kind(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _VIDEO_REPLACE_EXTS:
+        return "video"
+    if ext in _AUDIO_REPLACE_EXTS:
+        return "audio"
+    return "other"
+
+
+def _fmt_file_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    if num_bytes < 1024 * 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.1f} MB"
+    return f"{num_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
 def save_preview_mp4_dir_preference(dir_p: str) -> None:
@@ -7092,7 +7303,15 @@ def _win_find_window_title_contains(substr: str) -> Optional[int]:
     return found[0] if found else None
 
 
-def _win_embed_child_window(child_hwnd: int, parent_hwnd: int, width: int, height: int) -> None:
+def _win_embed_child_window(
+    child_hwnd: int,
+    parent_hwnd: int,
+    width: int,
+    height: int,
+    *,
+    offset_x: int = 0,
+    offset_y: int = 0,
+) -> None:
     import ctypes
 
     user32 = ctypes.windll.user32
@@ -7114,8 +7333,8 @@ def _win_embed_child_window(child_hwnd: int, parent_hwnd: int, width: int, heigh
     user32.SetWindowPos(
         child_hwnd,
         0,
-        0,
-        0,
+        max(0, int(offset_x)),
+        max(0, int(offset_y)),
         max(40, int(width)),
         max(40, int(height)),
         swp_no_zorder | swp_showwindow,
@@ -7139,15 +7358,22 @@ def _win_disable_embed_keyboard_focus(child_hwnd: int) -> None:
         pass
 
 
-def _win_resize_embedded_window(child_hwnd: int, width: int, height: int) -> None:
+def _win_resize_embedded_window(
+    child_hwnd: int,
+    width: int,
+    height: int,
+    *,
+    offset_x: int = 0,
+    offset_y: int = 0,
+) -> None:
     import ctypes
 
     user32 = ctypes.windll.user32
     user32.SetWindowPos(
         child_hwnd,
         0,
-        0,
-        0,
+        max(0, int(offset_x)),
+        max(0, int(offset_y)),
         max(40, int(width)),
         max(40, int(height)),
         0x0004,
@@ -7265,28 +7491,39 @@ class _MergedPreviewFfplaySession:
         self.hwnd = None
         return True
 
-    def try_embed(self, parent_hwnd: int, width: int, height: int) -> bool:
+    def try_embed(
+        self,
+        parent_hwnd: int,
+        width: int,
+        height: int,
+        *,
+        offset_x: int = 0,
+        offset_y: int = 0,
+    ) -> bool:
         if not self.alive():
             return False
         if sys.platform != "win32":
             return True
         if self.hwnd:
-            if sys.platform == "win32":
-                try:
-                    import ctypes
-                    if not ctypes.windll.user32.IsWindow(int(self.hwnd)):
-                        self.hwnd = None
-                        return False
-                except Exception:
+            try:
+                import ctypes
+                if not ctypes.windll.user32.IsWindow(int(self.hwnd)):
                     self.hwnd = None
                     return False
-            _win_resize_embedded_window(self.hwnd, width, height)
+            except Exception:
+                self.hwnd = None
+                return False
+            _win_resize_embedded_window(
+                self.hwnd, width, height, offset_x=offset_x, offset_y=offset_y
+            )
             return True
         hwnd = _win_find_window_title_contains(self.window_title)
         if hwnd is None:
             return False
         try:
-            _win_embed_child_window(hwnd, parent_hwnd, width, height)
+            _win_embed_child_window(
+                hwnd, parent_hwnd, width, height, offset_x=offset_x, offset_y=offset_y
+            )
         except OSError:
             return False
         self.hwnd = hwnd
@@ -8315,6 +8552,67 @@ def _ctk_readonly_text_set(widget: Any, text: str) -> None:
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
         widget.configure(state="disabled")
+    except Exception:
+        pass
+
+
+def _tk_widget_is_editable_text_input(widget: Any) -> bool:
+    """仅当焦点在可编辑文本框上时返回 True（只读 CTkTextbox / disabled Text 不算）。"""
+    if widget is None:
+        return False
+    try:
+        import customtkinter as ctk_mod
+    except ImportError:
+        ctk_mod = None
+    try:
+        if ctk_mod is not None and isinstance(widget, ctk_mod.CTkTextbox):
+            return str(widget.cget("state")) != "disabled"
+        if ctk_mod is not None and isinstance(widget, ctk_mod.CTkEntry):
+            return True
+        cls = str(widget.winfo_class())
+        if cls in ("Entry", "TEntry", "Spinbox"):
+            return True
+        if cls == "Text":
+            try:
+                if str(widget.cget("state")) == "disabled":
+                    return False
+            except Exception:
+                pass
+            parent = widget
+            for _ in range(8):
+                try:
+                    parent = parent.master
+                except Exception:
+                    break
+                if parent is None:
+                    break
+                if ctk_mod is not None and isinstance(parent, ctk_mod.CTkTextbox):
+                    try:
+                        return str(parent.cget("state")) != "disabled"
+                    except Exception:
+                        return False
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _bind_readonly_ctk_textbox_no_focus_steal(widget: Any, refocus_cb: Any) -> None:
+    """只读说明区：点击后不把键盘焦点留在文本框内。"""
+    try:
+        widget.configure(takefocus=False)
+        inner = widget._textbox
+        inner.configure(takefocus=0)
+
+        def _return_keyboard_focus(_event: Any = None) -> None:
+            try:
+                if callable(refocus_cb):
+                    refocus_cb()
+            except Exception:
+                pass
+
+        widget.bind("<FocusIn>", lambda _e: widget.after_idle(_return_keyboard_focus), add="+")
+        inner.bind("<FocusIn>", lambda _e: widget.after_idle(_return_keyboard_focus), add="+")
     except Exception:
         pass
 
@@ -9461,11 +9759,23 @@ def run_app() -> None:
 
     root = ctk.CTk()
     root.title("爆款智剪")
-    win_w, win_h = 1320, 680
-    root.minsize(920, 480)
-    root.geometry(f"{win_w}x{win_h}")
-    root.update_idletasks()
-    _center_window_on_screen(root, win_w, win_h)
+    _window_layout = load_window_layout_preferences()
+    win_w = int(_window_layout.get("window_width") or _DEFAULT_WINDOW_WIDTH)
+    win_h = int(_window_layout.get("window_height") or _DEFAULT_WINDOW_HEIGHT)
+    root.minsize(_WINDOW_LAYOUT_MIN_WIDTH, _WINDOW_LAYOUT_MIN_HEIGHT)
+    win_x = _window_layout.get("window_x")
+    win_y = _window_layout.get("window_y")
+    if (
+        isinstance(win_x, int)
+        and isinstance(win_y, int)
+        and win_x >= 0
+        and win_y >= 0
+    ):
+        root.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
+    else:
+        root.geometry(f"{win_w}x{win_h}")
+        root.update_idletasks()
+        _center_window_on_screen(root, win_w, win_h)
     threading.Thread(target=_cleanup_stale_preview_merge_cache, daemon=True, name="preview-cache-cleanup").start()
 
     _ensure_local_pyjianyingdraft_on_path()
@@ -9677,8 +9987,84 @@ def run_app() -> None:
     main = ctk.CTkFrame(root, fg_color="transparent")
     main.pack(fill="both", expand=True, padx=10, pady=(2, 8))
 
-    panel_paned, left, right, preview_col = _create_three_column_layout(main)
+    panel_paned, left, right, preview_col = _create_three_column_layout(
+        main,
+        left_width=int(_window_layout.get("panel_left_width") or _DEFAULT_PANEL_LEFT_WIDTH),
+        preview_width=int(
+            _window_layout.get("panel_preview_width") or _DEFAULT_PANEL_PREVIEW_WIDTH
+        ),
+    )
     panel_paned.pack(fill="both", expand=True)
+
+    _layout_save_after: List[Optional[str]] = [None]
+
+    def _collect_window_layout_updates() -> Dict[str, int]:
+        try:
+            root.update_idletasks()
+            rw = max(_WINDOW_LAYOUT_MIN_WIDTH, int(root.winfo_width()))
+            rh = max(_WINDOW_LAYOUT_MIN_HEIGHT, int(root.winfo_height()))
+            sash0 = int(panel_paned.sash_coord(0))
+            sash1 = int(panel_paned.sash_coord(1))
+            if sash1 <= sash0 + _PANEL_MIN_CENTER_WIDTH:
+                sash1 = sash0 + _PANEL_MIN_CENTER_WIDTH
+            return {
+                "window_width": rw,
+                "window_height": rh,
+                "window_x": int(root.winfo_x()),
+                "window_y": int(root.winfo_y()),
+                "panel_sash0": sash0,
+                "panel_sash1": sash1,
+                "panel_left_width": sash0,
+                "panel_preview_width": max(_PANEL_MIN_SIDE_WIDTH, rw - sash1),
+            }
+        except (tk.TclError, ValueError, TypeError):
+            return {}
+
+    def _persist_window_layout(_event: Any = None) -> None:
+        aid = _layout_save_after[0]
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+
+        def _flush() -> None:
+            _layout_save_after[0] = None
+            updates = _collect_window_layout_updates()
+            if not updates:
+                return
+            try:
+                save_window_layout_preferences(updates)
+            except OSError:
+                pass
+
+        _layout_save_after[0] = root.after(400, _flush)
+
+    def _restore_panel_sash_layout() -> None:
+        sash0 = _window_layout.get("panel_sash0")
+        sash1 = _window_layout.get("panel_sash1")
+        if not isinstance(sash0, int) or not isinstance(sash1, int):
+            return
+        if sash1 <= sash0 + _PANEL_MIN_CENTER_WIDTH:
+            return
+        try:
+            panel_paned.update_idletasks()
+            total = int(panel_paned.winfo_width())
+            if total < _WINDOW_LAYOUT_MIN_WIDTH:
+                return
+            s0 = max(_PANEL_MIN_SIDE_WIDTH, min(sash0, total - _PANEL_MIN_CENTER_WIDTH - _PANEL_MIN_SIDE_WIDTH))
+            s1 = max(
+                s0 + _PANEL_MIN_CENTER_WIDTH,
+                min(sash1, total - _PANEL_MIN_SIDE_WIDTH),
+            )
+            panel_paned.sash_place(0, s0, 0)
+            panel_paned.sash_place(1, s1, 0)
+        except (tk.TclError, ValueError, TypeError):
+            pass
+
+    root.after_idle(_restore_panel_sash_layout)
+    root.bind("<Configure>", _persist_window_layout, add="+")
+    panel_paned.bind("<ButtonRelease-1>", _persist_window_layout, add="+")
     right.grid_columnconfigure(0, weight=1)
     # 草稿信息固定高度；时间轴占剩余空间；导出区固定高度
     right.grid_rowconfigure(0, weight=0, minsize=48)
@@ -9690,7 +10076,9 @@ def run_app() -> None:
     left_tab_bar.pack(fill="x", padx=8, pady=(10, 6))
     left_tab_bar.grid_columnconfigure(0, weight=1)
     left_tab_bar.grid_columnconfigure(1, weight=1)
+    left_tab_bar.grid_columnconfigure(2, weight=1)
 
+    library_panel = ctk.CTkFrame(left, fg_color="transparent")
     draft_panel = ctk.CTkFrame(left, fg_color="transparent")
     draft_panel.pack(fill="both", expand=True)
     template_panel = ctk.CTkFrame(left, fg_color="transparent")
@@ -9706,6 +10094,14 @@ def run_app() -> None:
                 border_color=("gray70", "gray40"),
             )
 
+    tab_library_btn = ctk.CTkButton(
+        left_tab_bar,
+        text="素材库",
+        height=32,
+        font=ctk.CTkFont(size=13, weight="bold"),
+        command=lambda: _set_left_tab("library"),
+    )
+    tab_library_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
     tab_drafts_btn = ctk.CTkButton(
         left_tab_bar,
         text="草稿箱",
@@ -9713,7 +10109,7 @@ def run_app() -> None:
         font=ctk.CTkFont(size=13, weight="bold"),
         command=lambda: _set_left_tab("drafts"),
     )
-    tab_drafts_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+    tab_drafts_btn.grid(row=0, column=1, sticky="ew", padx=3)
     tab_templates_btn = ctk.CTkButton(
         left_tab_bar,
         text="爆款模板",
@@ -9721,7 +10117,8 @@ def run_app() -> None:
         font=ctk.CTkFont(size=13, weight="bold"),
         command=lambda: _set_left_tab("templates"),
     )
-    tab_templates_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+    tab_templates_btn.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+    _style_left_tab_btn(tab_library_btn, active=False)
     _style_left_tab_btn(tab_drafts_btn, active=True)
     _style_left_tab_btn(tab_templates_btn, active=False)
 
@@ -9750,6 +10147,44 @@ def run_app() -> None:
     list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
     draft_buttons: List[Any] = []
     template_buttons: List[Any] = []
+    library_buttons: List[Any] = []
+    library_media_buttons: List[Any] = []
+    _library_media_preview_handlers: Dict[str, Any] = {}
+
+    library_toolbar = ctk.CTkFrame(library_panel, fg_color="transparent")
+    library_toolbar.pack(fill="x", padx=10, pady=(0, 6))
+    library_status_var = ctk.StringVar(value="添加本地文件夹后按目录浏览音视频素材")
+    ctk.CTkLabel(
+        library_toolbar,
+        textvariable=library_status_var,
+        font=ctk.CTkFont(size=11),
+        text_color=("gray45", "gray60"),
+        anchor="w",
+        wraplength=240,
+        justify="left",
+    ).pack(fill="x", pady=(0, 4))
+    library_toolbar_btns = ctk.CTkFrame(library_toolbar, fg_color="transparent")
+    library_toolbar_btns.pack(fill="x")
+    library_tree_frame = ctk.CTkScrollableFrame(library_panel, label_text="素材目录", corner_radius=10)
+    library_tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    library_roots: List[str] = list(load_material_library_roots())
+    expanded_library_folders: set[str] = set()
+    selected_library_path: Optional[str] = None
+    selected_library_media: Optional[str] = None
+    _workspace_export_strip_ref: List[Any] = [None]
+    _mdl2_chevron = "Segoe MDL2 Assets" in tkfont.families()
+    draft_tree_toggle_font = (
+        ctk.CTkFont(family="Segoe MDL2 Assets", size=11)
+        if _mdl2_chevron
+        else ctk.CTkFont(size=12)
+    )
+    draft_list_title_font = ctk.CTkFont(size=13)
+    draft_list_sub_font = ctk.CTkFont(size=11)
+
+    def draft_tree_toggle_symbol(expanded: bool) -> str:
+        if _mdl2_chevron:
+            return "\uE70D" if expanded else "\uE76C"
+        return "\u2304" if expanded else "\u203A"
 
     template_toolbar = ctk.CTkFrame(template_panel, fg_color="transparent")
     template_toolbar.pack(fill="x", padx=10, pady=(0, 6))
@@ -9768,7 +10203,7 @@ def run_app() -> None:
     template_fetch_busy = {"on": False}
     template_download_busy = {"on": False}
     template_list_fetched = {"ok": False}
-    collapsed_template_folders: set[str] = set()
+    expanded_template_folders: set[str] = set()
     template_tree_roots: List[Any] = []
     selected_template_id: Optional[str] = None
 
@@ -9799,7 +10234,7 @@ def run_app() -> None:
                 pw = 0
         if pw < 80:
             return
-        for boxes in (draft_buttons, template_buttons):
+        for boxes in (draft_buttons, template_buttons, library_buttons):
             for box in boxes:
                 lbl = getattr(box, "_title_lbl", None)
                 if lbl is None:
@@ -9834,15 +10269,24 @@ def run_app() -> None:
         lines = [f"模板：{node.name}", f"ID：{node.template_id}"]
         if node.updated_at:
             lines.append(f"更新：{node.updated_at}")
-        lines.extend(
-            [
-                "",
-                "点击后将下载 ZIP 并解压到剪映草稿根目录。",
-                "请先在「草稿箱」中设置草稿根目录（com.lveditor.draft）。",
-            ]
-        )
-        detail.delete("1.0", "end")
-        detail.insert("1.0", "\n".join(lines))
+        base = draft_root.get().strip()
+        local_folder: Optional[str] = None
+        if base and os.path.isdir(base):
+            from shared.hot_template_client import find_local_hot_template_folder
+
+            local_folder = find_local_hot_template_folder(
+                base,
+                template_id=node.template_id,
+                template_name=node.name,
+            )
+        if local_folder:
+            lines.append(f"本地草稿：{local_folder}")
+        lines.extend(["", "请先在「草稿箱」中设置草稿根目录（com.lveditor.draft）。"])
+        if local_folder:
+            lines.append("点击后将询问是否重新下载；选「否」直接打开已有草稿。")
+        else:
+            lines.append("点击后将下载 ZIP 并解压到剪映草稿根目录。")
+        _detail_set("\n".join(lines))
         refresh_timeline_panel_data(None)
 
     def _redraw_template_list(*, reset_scroll: bool = False) -> None:
@@ -9879,6 +10323,25 @@ def run_app() -> None:
             template_status_var.set(f"共 {n_tpl} 个可下载模板")
             render_hot_template_tree(template_tree_roots, indent=0)
         _redraw_template_list_scroll(reset_scroll=reset_scroll)
+
+    def _collect_template_branch_ids(nodes: List[Any]) -> set[str]:
+        keys: set[str] = set()
+        for node in nodes:
+            if getattr(node, "is_folder", False):
+                children = list(node.children or ())
+                if children:
+                    keys.add(node.template_id)
+                    keys.update(_collect_template_branch_ids(children))
+        return keys
+
+    def _template_tree_expand_all() -> None:
+        expanded_template_folders.clear()
+        expanded_template_folders.update(_collect_template_branch_ids(template_tree_roots))
+        _redraw_template_list(reset_scroll=False)
+
+    def _template_tree_collapse_all() -> None:
+        expanded_template_folders.clear()
+        _redraw_template_list(reset_scroll=False)
 
     def refresh_template_list(*, reset_scroll: bool = False) -> None:
         """从服务器拉取模板树（首次进入 Tab / 点刷新）。"""
@@ -9952,22 +10415,426 @@ def run_app() -> None:
 
         threading.Thread(target=_bg, daemon=True, name="hot-template-fetch").start()
 
+    def _redraw_library_media_scroll(*, reset_scroll: bool = False) -> None:
+        try:
+            library_media_list_frame.update_idletasks()
+            pc = getattr(library_media_list_frame, "_parent_canvas", None)
+            if pc is not None:
+                pc.update_idletasks()
+                bb = pc.bbox("all")
+                if bb:
+                    pc.configure(scrollregion=bb)
+                if reset_scroll:
+                    pc.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _redraw_library_tree_scroll(*, reset_scroll: bool = False) -> None:
+        try:
+            library_tree_frame.update_idletasks()
+            pc = getattr(library_tree_frame, "_parent_canvas", None)
+            if pc is not None:
+                pc.update_idletasks()
+                bb = pc.bbox("all")
+                if bb:
+                    pc.configure(scrollregion=bb)
+                if reset_scroll:
+                    pc.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def highlight_library_tree_selection() -> None:
+        sel_key = _norm_library_path(selected_library_path or "")
+        for b in library_buttons:
+            kn = getattr(b, "_row_kind", "leaf")
+            base_fg = getattr(b, "_base_fg", _DRAFT_LIST_COLORS.get(kn, _DRAFT_LIST_COLORS["leaf"])[0])
+            path_key = str(getattr(b, "_path_key", "") or "")
+            if path_key and path_key == sel_key:
+                b._selected = True  # type: ignore[attr-defined]
+                b.configure(fg_color=_DRAFT_LIST_COLORS["selected"][0])
+            else:
+                b._selected = False  # type: ignore[attr-defined]
+                b.configure(fg_color=base_fg)
+
+    def highlight_library_media_selection() -> None:
+        sel_key = _norm_library_path(selected_library_media or "")
+        for b in library_media_buttons:
+            kn = getattr(b, "_row_kind", "leaf")
+            base_fg = getattr(b, "_base_fg", _DRAFT_LIST_COLORS.get(kn, _DRAFT_LIST_COLORS["leaf"])[0])
+            path_key = str(getattr(b, "_path_key", "") or "")
+            if path_key and path_key == sel_key:
+                b._selected = True  # type: ignore[attr-defined]
+                b.configure(fg_color=_DRAFT_LIST_COLORS["selected"][0])
+            else:
+                b._selected = False  # type: ignore[attr-defined]
+                b.configure(fg_color=base_fg)
+
+    def show_library_folder_detail(folder_path: str, media_paths: List[str]) -> None:
+        lines = [
+            f"文件夹：{folder_path}",
+            f"本层音视频：{len(media_paths)} 个（不含子文件夹内文件）",
+            "",
+            "双击右侧列表中的文件可用系统默认程序打开。",
+        ]
+        _detail_set("\n".join(lines))
+
+    def show_library_media_detail(media_path: str) -> None:
+        kind = library_media_kind(media_path)
+        kind_label = "视频" if kind == "video" else "音频" if kind == "audio" else "文件"
+        try:
+            size = os.path.getsize(media_path)
+            size_txt = _fmt_file_size(size)
+        except OSError:
+            size_txt = "—"
+        lines = [
+            f"文件：{os.path.basename(media_path)}",
+            f"类型：{kind_label}",
+            f"大小：{size_txt}",
+            f"路径：{media_path}",
+            "",
+            "双击可用系统默认程序打开。",
+        ]
+        _detail_set("\n".join(lines))
+
+    def select_library_folder(folder_path: str) -> None:
+        nonlocal selected_library_path, selected_library_media
+        if not folder_path or not os.path.isdir(folder_path):
+            return
+        selected_library_path = os.path.normpath(folder_path)
+        selected_library_media = None
+        stop_preview = _library_media_preview_handlers.get("stop")
+        if callable(stop_preview):
+            stop_preview()
+        highlight_library_tree_selection()
+        media_paths = list_library_media_files(selected_library_path)
+        library_media_path_var.set(selected_library_path)
+        show_library_folder_detail(selected_library_path, media_paths)
+        library_media_buttons.clear()
+        for w in library_media_list_frame.winfo_children():
+            w.destroy()
+        if not media_paths:
+            ctk.CTkLabel(
+                library_media_list_frame,
+                text="（该文件夹内没有音视频文件）",
+                text_color=("gray45", "gray60"),
+            ).pack(pady=20)
+        else:
+            try:
+                pw = int(library_media_list_frame.winfo_width())
+            except (tk.TclError, ValueError, TypeError):
+                pw = 0
+            wrap = _draft_list_item_wraplength(indent=0, panel_width=pw if pw >= 80 else None)
+            for fp in media_paths:
+                kind = library_media_kind(fp)
+                kind_label = "视频" if kind == "video" else "音频"
+                try:
+                    size_txt = _fmt_file_size(os.path.getsize(fp))
+                except OSError:
+                    size_txt = "—"
+                box = _make_draft_list_click_box(
+                    library_media_list_frame,
+                    os.path.basename(fp),
+                    row_kind="leaf",
+                    on_click=lambda p=fp: select_library_media_file(p),
+                    wraplength=wrap,
+                    subtitle=f"· {kind_label} · {size_txt}",
+                    title_font=draft_list_title_font,
+                    subtitle_font=draft_list_sub_font,
+                )
+                box._path_key = _norm_library_path(fp)  # type: ignore[attr-defined]
+                box.pack(fill="x", pady=2, padx=4)
+
+                def _dbl_open(_event: Any = None, p: str = fp) -> None:
+                    try:
+                        os.startfile(p)  # type: ignore[attr-defined]
+                    except OSError:
+                        pass
+
+                for w in (box, box._title_lbl):  # type: ignore[attr-defined]
+                    w.bind("<Double-Button-1>", _dbl_open)
+                library_media_buttons.append(box)
+        _redraw_library_media_scroll(reset_scroll=True)
+
+    def select_library_media_file(media_path: str) -> None:
+        nonlocal selected_library_media
+        if not media_path or not os.path.isfile(media_path):
+            return
+        selected_library_media = os.path.normpath(media_path)
+        highlight_library_media_selection()
+        show_library_media_detail(selected_library_media)
+        start_preview = _library_media_preview_handlers.get("start")
+        if callable(start_preview):
+            start_preview(selected_library_media)
+
+    def render_library_subtree(folder_path: str, *, indent: int, is_root: bool = False) -> None:
+        norm_key = _norm_library_path(folder_path)
+        display_name = os.path.basename(folder_path.rstrip(os.sep)) or folder_path
+        if is_root:
+            display_name = folder_path
+        subdirs = list_library_subdirs(folder_path)
+        if subdirs:
+            expanded = norm_key in expanded_library_folders
+            row = ctk.CTkFrame(library_tree_frame, fg_color="transparent")
+            row.pack(fill="x", pady=2, padx=(4 + max(0, indent), 4))
+
+            def _mk_toggle(path_key: str = norm_key) -> Any:
+                def _inner() -> None:
+                    if path_key in expanded_library_folders:
+                        expanded_library_folders.discard(path_key)
+                    else:
+                        expanded_library_folders.add(path_key)
+                    refresh_library_tree(reselect_folder=False)
+
+                return _inner
+
+            ctk.CTkButton(
+                row,
+                text=draft_tree_toggle_symbol(expanded),
+                width=32,
+                height=32,
+                font=draft_tree_toggle_font,
+                command=_mk_toggle(),
+            ).pack(side="left", padx=(0, 4))
+            mid = ctk.CTkFrame(row, fg_color="transparent")
+            mid.pack(side="left", fill="x", expand=True)
+            wrap = _draft_list_item_wraplength(indent=indent, reserved_right=36)
+            pb = _make_draft_list_click_box(
+                mid,
+                display_name,
+                row_kind="parent" if not is_root else "leaf",
+                on_click=lambda p=folder_path: select_library_folder(p),
+                wraplength=wrap,
+                subtitle=f"· {len(subdirs)} 个子文件夹",
+                title_font=draft_list_title_font,
+                subtitle_font=draft_list_sub_font,
+            )
+            pb._path_key = norm_key  # type: ignore[attr-defined]
+            pb._wrap_indent = indent  # type: ignore[attr-defined]
+            pb._wrap_reserved = 36  # type: ignore[attr-defined]
+            pb.pack(fill="x")
+            library_buttons.append(pb)
+            if expanded:
+                for sub in subdirs:
+                    render_library_subtree(sub, indent=indent + 8)
+        else:
+            pad_l = _DRAFT_LIST_TOP_LEAF_PAD + max(0, indent)
+            wrap = _draft_list_item_wraplength(indent=indent)
+            box = _make_draft_list_click_box(
+                library_tree_frame,
+                display_name,
+                row_kind="leaf",
+                on_click=lambda p=folder_path: select_library_folder(p),
+                wraplength=wrap,
+                title_font=draft_list_title_font,
+            )
+            box._path_key = norm_key  # type: ignore[attr-defined]
+            box._wrap_indent = indent  # type: ignore[attr-defined]
+            box.pack(fill="x", pady=2, padx=(pad_l, 4))
+            library_buttons.append(box)
+
+    def refresh_library_tree(*, reselect_folder: bool = True) -> None:
+        library_buttons.clear()
+        for w in library_tree_frame.winfo_children():
+            w.destroy()
+        valid_roots = [r for r in library_roots if os.path.isdir(r)]
+        if len(valid_roots) != len(library_roots):
+            library_roots[:] = valid_roots
+            save_material_library_roots(library_roots)
+        if not library_roots:
+            library_status_var.set("尚未添加文件夹，请点击「添加文件夹」")
+            ctk.CTkLabel(
+                library_tree_frame,
+                text="（暂无根目录）",
+                text_color=("gray45", "gray60"),
+            ).pack(pady=20)
+            library_media_path_var.set("")
+            library_media_buttons.clear()
+            for w in library_media_list_frame.winfo_children():
+                w.destroy()
+            _detail_set("请在左侧「素材库」中添加本地文件夹，然后点击目录树中的文件夹查看素材。")
+            _redraw_library_tree_scroll(reset_scroll=True)
+            _redraw_library_media_scroll(reset_scroll=True)
+            return
+        library_status_var.set(f"已添加 {len(library_roots)} 个根文件夹")
+        for root_path in library_roots:
+            render_library_subtree(root_path, indent=0, is_root=True)
+        if reselect_folder and selected_library_path and os.path.isdir(selected_library_path):
+            select_library_folder(selected_library_path)
+        else:
+            highlight_library_tree_selection()
+        _redraw_library_tree_scroll(reset_scroll=False)
+
+    def _collect_library_branch_paths(folder_path: str) -> set[str]:
+        keys: set[str] = set()
+        norm_key = _norm_library_path(folder_path)
+        subdirs = list_library_subdirs(folder_path)
+        if subdirs:
+            keys.add(norm_key)
+            for sub in subdirs:
+                keys.update(_collect_library_branch_paths(sub))
+        return keys
+
+    def _library_tree_expand_all() -> None:
+        keys: set[str] = set()
+        for root_path in library_roots:
+            if os.path.isdir(root_path):
+                keys.update(_collect_library_branch_paths(root_path))
+        expanded_library_folders.clear()
+        expanded_library_folders.update(keys)
+        refresh_library_tree(reselect_folder=False)
+
+    def _library_tree_collapse_all() -> None:
+        expanded_library_folders.clear()
+        refresh_library_tree(reselect_folder=False)
+
+    def add_library_root_folder() -> None:
+        from tkinter import filedialog
+
+        picked = filedialog.askdirectory(title="选择素材库根文件夹")
+        if not picked:
+            return
+        norm = os.path.normpath(picked)
+        if norm in library_roots:
+            select_library_folder(norm)
+            return
+        library_roots.append(norm)
+        save_material_library_roots(library_roots)
+        refresh_library_tree(reselect_folder=False)
+        select_library_folder(norm)
+
+    def remove_library_root_folder() -> None:
+        from tkinter import messagebox
+
+        nonlocal selected_library_path, selected_library_media
+
+        if not library_roots:
+            return
+        target: Optional[str] = None
+        if selected_library_path:
+            sel_key = _norm_library_path(selected_library_path)
+            for r in library_roots:
+                r_key = _norm_library_path(r)
+                if sel_key == r_key or sel_key.startswith(r_key + os.sep):
+                    target = r
+                    break
+        if target is None:
+            target = library_roots[-1]
+        if not messagebox.askyesno("移除根文件夹", f"从素材库移除根目录？\n\n{target}"):
+            return
+        library_roots[:] = [r for r in library_roots if r != target]
+        save_material_library_roots(library_roots)
+        if selected_library_path:
+            sel_key = _norm_library_path(selected_library_path)
+            tgt_key = _norm_library_path(target)
+            if sel_key == tgt_key or sel_key.startswith(tgt_key + os.sep):
+                selected_library_path = None
+                selected_library_media = None
+        refresh_library_tree(reselect_folder=False)
+
+    def _apply_main_workspace_mode(mode: str) -> None:
+        export_strip = _workspace_export_strip_ref[0]
+        stop_preview = _library_media_preview_handlers.get("stop")
+        if callable(stop_preview):
+            stop_preview()
+        if mode == "library":
+            timeline_block.grid_remove()
+            if export_strip is not None:
+                export_strip.grid_remove()
+            library_media_block.grid()
+        else:
+            library_media_block.grid_remove()
+            timeline_block.grid()
+            if export_strip is not None:
+                export_strip.grid()
+
     def _set_left_tab(tab: str) -> None:
-        tab = "templates" if tab == "templates" else "drafts"
+        tab = tab if tab in ("library", "drafts", "templates") else "drafts"
         left_tab_var.set(tab)
+        _style_left_tab_btn(tab_library_btn, active=tab == "library")
         _style_left_tab_btn(tab_drafts_btn, active=tab == "drafts")
         _style_left_tab_btn(tab_templates_btn, active=tab == "templates")
-        if tab == "drafts":
-            template_panel.pack_forget()
+        library_panel.pack_forget()
+        draft_panel.pack_forget()
+        template_panel.pack_forget()
+        if tab == "library":
+            library_panel.pack(fill="both", expand=True)
+            _apply_main_workspace_mode("library")
+            refresh_library_tree(reselect_folder=True)
+        elif tab == "drafts":
             draft_panel.pack(fill="both", expand=True)
+            _apply_main_workspace_mode("draft")
         else:
-            draft_panel.pack_forget()
             template_panel.pack(fill="both", expand=True)
+            _apply_main_workspace_mode("draft")
             if not template_list_fetched["ok"]:
                 refresh_template_list(reset_scroll=True)
             else:
                 _redraw_template_list(reset_scroll=False)
 
+    ctk.CTkButton(
+        library_toolbar_btns,
+        text="添加文件夹",
+        width=96,
+        height=28,
+        command=add_library_root_folder,
+    ).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(
+        library_toolbar_btns,
+        text="移除根目录",
+        width=96,
+        height=28,
+        fg_color="transparent",
+        border_width=1,
+        command=remove_library_root_folder,
+    ).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(
+        library_toolbar_btns,
+        text="刷新",
+        width=72,
+        height=28,
+        fg_color="transparent",
+        border_width=1,
+        command=lambda: refresh_library_tree(reselect_folder=True),
+    ).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(
+        library_toolbar_btns,
+        text="全部展开",
+        width=72,
+        height=28,
+        fg_color="transparent",
+        border_width=1,
+        command=_library_tree_expand_all,
+    ).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(
+        library_toolbar_btns,
+        text="全部收起",
+        width=72,
+        height=28,
+        fg_color="transparent",
+        border_width=1,
+        command=_library_tree_collapse_all,
+    ).pack(side="left")
+
+    template_expand_btn = ctk.CTkButton(
+        template_toolbar,
+        text="全部展开",
+        width=72,
+        height=28,
+        fg_color="transparent",
+        border_width=1,
+        command=_template_tree_expand_all,
+    )
+    template_expand_btn.pack(side="right", padx=(6, 0))
+    template_collapse_btn = ctk.CTkButton(
+        template_toolbar,
+        text="全部收起",
+        width=72,
+        height=28,
+        fg_color="transparent",
+        border_width=1,
+        command=_template_tree_collapse_all,
+    )
+    template_collapse_btn.pack(side="right", padx=(6, 0))
     ctk.CTkButton(
         template_toolbar,
         text="刷新",
@@ -9979,9 +10846,62 @@ def run_app() -> None:
     ).pack(side="right", padx=(8, 0))
 
     detail = ctk.CTkTextbox(
-        right, font=ctk.CTkFont(family="Consolas", size=12), wrap="word", height=52, activate_scrollbars=True
+        right,
+        font=ctk.CTkFont(family="Consolas", size=12),
+        wrap="word",
+        height=52,
+        activate_scrollbars=True,
+        takefocus=False,
     )
     detail.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 4))
+
+    def _detail_set(text: str) -> None:
+        _ctk_readonly_text_set(detail, text)
+
+    def _detail_append(text: str) -> None:
+        try:
+            detail.configure(state="normal")
+            cur = detail.get("1.0", "end-1c")
+        except Exception:
+            cur = ""
+        finally:
+            try:
+                detail.configure(state="disabled")
+            except Exception:
+                pass
+        _ctk_readonly_text_set(detail, cur + text)
+
+    _detail_set("")
+
+    library_media_block = ctk.CTkFrame(right, fg_color="transparent")
+    library_media_block.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 2))
+    library_media_block.grid_columnconfigure(0, weight=1)
+    library_media_block.grid_rowconfigure(1, weight=1)
+    library_media_block.grid_remove()
+    library_media_header = ctk.CTkFrame(library_media_block, fg_color="transparent")
+    library_media_header.grid(row=0, column=0, sticky="ew")
+    library_media_header.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(
+        library_media_header,
+        text="当前文件夹素材",
+        font=ctk.CTkFont(size=13, weight="bold"),
+        anchor="w",
+    ).grid(row=0, column=0, sticky="w")
+    library_media_path_var = ctk.StringVar(value="")
+    ctk.CTkLabel(
+        library_media_header,
+        textvariable=library_media_path_var,
+        font=ctk.CTkFont(size=11),
+        text_color=("gray45", "gray60"),
+        anchor="w",
+    ).grid(row=1, column=0, sticky="w", pady=(0, 2))
+    library_media_list_frame = ctk.CTkScrollableFrame(
+        library_media_block,
+        label_text="音视频文件",
+        corner_radius=8,
+        fg_color=("gray92", "gray20"),
+    )
+    library_media_list_frame.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
 
     timeline_block = ctk.CTkFrame(right, fg_color="transparent")
     timeline_block.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 2))
@@ -10347,6 +11267,10 @@ def run_app() -> None:
         "merge_ffplay_fallback": False,
         "merge_ffplay_start_sec": None,
         "merge_embed_after_id": None,
+        "library_preview_path": None,
+        "library_preview_dur_us": None,
+        "library_preview_video_size": None,
+        "library_preview_cover_gen": 0,
         "audio_chunk_t0_us": None,
         "audio_chunk_end_us": None,
         "audio_chunk_path": None,
@@ -10404,6 +11328,18 @@ def run_app() -> None:
         except tk.TclError:
             cw, ch = PREVIEW_MAX_WIDTH, 360
         return cw, ch
+
+    def _merge_ffplay_viewport() -> Tuple[int, int, int, int]:
+        """嵌入 ffplay 的 (宽, 高, 偏移x, 偏移y)；素材库按首帧比例 letterbox。"""
+        cw, ch = _preview_host_inner_size()
+        if preview_state.get("play_mode") == "library":
+            sz = preview_state.get("library_preview_video_size")
+            if isinstance(sz, (tuple, list)) and len(sz) == 2:
+                vw, vh = int(sz[0]), int(sz[1])
+                if vw > 0 and vh > 0:
+                    fw, fh = _compute_preview_fit_size(vw, vh, cw, ch)
+                    return fw, fh, max(0, (cw - fw) // 2), max(0, (ch - fh) // 2)
+        return cw, ch, 0, 0
 
     def _merge_ffplay_session() -> _MergedPreviewFfplaySession:
         sess = preview_state.get("merge_ffplay_session")
@@ -10530,7 +11466,7 @@ def run_app() -> None:
             sess.close()
         preview_state["merge_ffplay_embedded"] = False
         preview_state["merge_ffplay_start_sec"] = start_sec
-        cw, ch = _preview_host_inner_size()
+        fw, fh, fox, foy = _merge_ffplay_viewport()
         token = int(preview_state.get("merge_ffplay_token") or 0) + 1
         preview_state["merge_ffplay_token"] = token
         title = _merge_preview_ffplay_title(str(token))
@@ -10538,8 +11474,8 @@ def run_app() -> None:
         if sys.platform == "win32" and player.spawn(
             str(merge_path),
             window_title=title,
-            width=cw,
-            height=ch,
+            width=fw,
+            height=fh,
             start_sec=start_sec,
             accurate_seek=use_accurate_seek,
         ):
@@ -10575,13 +11511,13 @@ def run_app() -> None:
         player = preview_state.get("merge_ffplay_session")
         if not isinstance(player, _MergedPreviewFfplaySession) or not player.alive():
             return False
-        cw, ch = _preview_host_inner_size()
+        fw, fh, fox, foy = _merge_ffplay_viewport()
         try:
             parent_hwnd = int(preview_video_host.winfo_id())
         except tk.TclError:
             return False
         try:
-            if not player.try_embed(parent_hwnd, cw, ch):
+            if not player.try_embed(parent_hwnd, fw, fh, offset_x=fox, offset_y=foy):
                 return False
         except Exception:
             return False
@@ -10661,7 +11597,7 @@ def run_app() -> None:
         if not preview_state.get("play_prime_ready"):
             return
         us = int(preview_state.get("play_arm_us") or preview_state.get("play_start_us") or 0)
-        use_merge = preview_state.get("play_mode") == "merge"
+        use_merge = preview_state.get("play_mode") in ("merge", "library")
         if use_merge and preview_state.get("draft_preview_mp4"):
             cur = _current_playhead_us()
             if abs(cur - us) > 1000:
@@ -10772,7 +11708,7 @@ def run_app() -> None:
         us = int(preview_state.get("play_arm_us") or preview_state.get("play_start_us") or 0)
         content = timeline_content_cache[0]
         procs = preview_state.get("play_audio_procs") or []
-        use_merge = preview_state.get("play_mode") == "merge"
+        use_merge = preview_state.get("play_mode") in ("merge", "library")
         if use_merge:
             file_sec = max(0.0, us / 1_000_000.0)
             last_sec = preview_state.get("merge_ffplay_start_sec")
@@ -11030,7 +11966,7 @@ def run_app() -> None:
         preview_state["merge_ffplay_start_sec"] = None
         preview_state["play_wall_t0"] = None
         _invalidate_playback_arm_polls()
-        if preview_state.get("draft_preview_mp4") or preview_state.get("play_mode") == "merge":
+        if preview_state.get("draft_preview_mp4") or preview_state.get("play_mode") in ("merge", "library"):
             _bump_merge_ffplay_generation()
 
     def _pause_preview_playback() -> None:
@@ -11101,6 +12037,12 @@ def run_app() -> None:
             worker.close()
         preview_state["play_video_worker"] = None
         preview_state["play_video_worker_started"] = False
+        preview_state["library_preview_path"] = None
+        preview_state["library_preview_dur_us"] = None
+        preview_state["library_preview_video_size"] = None
+        preview_state["library_preview_cover_gen"] = int(
+            preview_state.get("library_preview_cover_gen") or 0
+        ) + 1
         preview_state["play_mode"] = "live"
         preview_state["draft_preview_mp4"] = False
         preview_state["draft_preview_mp4_end_us"] = None
@@ -11615,6 +12557,41 @@ def run_app() -> None:
         preview_state["play_after_id"] = None
         if not _preview_is_playing():
             return
+        if preview_state.get("play_mode") == "library":
+            tick_ms = 40
+            if preview_state.get("play_wall_t0") is None:
+                if preview_state.get("play_clock_arm_after_id") is not None:
+                    preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
+                return
+            timeline_us = _playback_timeline_us()
+            if timeline_us is None:
+                return
+            total_us = int(preview_state.get("library_preview_dur_us") or 0)
+            if total_us > 0 and timeline_us >= total_us:
+                _stop_preview_playback()
+                return
+            procs = preview_state.get("play_audio_procs") or []
+            if procs and not any(p is not None and p.poll() is None for p in procs):
+                _stop_preview_playback()
+                return
+            _sync_library_preview_timecode(timeline_us, total_us)
+            player = preview_state.get("merge_ffplay_session")
+            if (
+                isinstance(player, _MergedPreviewFfplaySession)
+                and player.alive()
+                and preview_state.get("merge_ffplay_embedded")
+                and player.hwnd
+            ):
+                fw, fh, fox, foy = _merge_ffplay_viewport()
+                try:
+                    _win_resize_embedded_window(
+                        player.hwnd, fw, fh, offset_x=fox, offset_y=foy
+                    )
+                except Exception:
+                    pass
+            if _preview_is_playing():
+                preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
+            return
         content = timeline_content_cache[0]
         if not isinstance(content, dict):
             _stop_preview_playback()
@@ -11946,6 +12923,28 @@ def run_app() -> None:
         if _preview_is_playing():
             _pause_preview_playback()
             return
+        if preview_state.get("play_mode") == "library":
+            path = preview_state.get("library_preview_path")
+            if not path or not os.path.isfile(str(path)):
+                return
+            pause_us = preview_state.get("play_pause_timeline_us")
+            us = int(pause_us if pause_us is not None else 0)
+            preview_state["playing"] = True
+            preview_state["play_start_us"] = us
+            preview_state["play_arm_us"] = us
+            preview_state["play_wall_t0"] = None
+            preview_state["play_prime_ready"] = True
+            preview_state["play_pause_timeline_us"] = None
+            preview_state["play_audio_output_ready"] = False
+            preview_state["merge_ffplay_start_sec"] = None
+            _preview_play_btn_set("⏸")
+            if not _start_merged_preview_ffplay(start_sec=max(0.0, us / 1_000_000.0), force=True):
+                _stop_preview_playback()
+                _preview_show_message("无法预览（请安装 ffplay）")
+                return
+            _schedule_playback_arm(us)
+            _preview_play_tick()
+            return
         content = timeline_content_cache[0]
         if not isinstance(content, dict):
             return
@@ -12033,16 +13032,123 @@ def run_app() -> None:
     preview_play_btn.pack(side="right", padx=(4, 6), pady=4)
     preview_state["play_btn"] = preview_play_btn
 
+    def _sync_library_preview_timecode(elapsed_us: int, total_us: int) -> None:
+        fps = 30.0
+        elapsed_us = max(0, int(elapsed_us))
+        total_us = max(0, int(total_us))
+        if total_us > 0:
+            preview_time_var.set(
+                f"{_fmt_player_timecode(elapsed_us, fps=fps)} / {_fmt_player_timecode(total_us, fps=fps)}"
+            )
+        else:
+            preview_time_var.set(
+                f"{_fmt_player_timecode(elapsed_us, fps=fps)} / --:--:--:--"
+            )
+
+    def _begin_library_media_preview(media_path: str) -> None:
+        """素材库选中文件：先显示首帧封面，空格再 ffplay 预览（音/视频）。"""
+        _stop_preview_playback()
+        media_path = os.path.normpath(str(media_path or "").strip())
+        if not media_path or not os.path.isfile(media_path):
+            return
+        kind = library_media_kind(media_path)
+        dur_us = _probe_media_duration_us(media_path) or 0
+        cover_gen = int(preview_state.get("library_preview_cover_gen") or 0) + 1
+        preview_state["library_preview_cover_gen"] = cover_gen
+        preview_state["play_mode"] = "library"
+        preview_state["library_preview_path"] = media_path
+        preview_state["library_preview_dur_us"] = dur_us
+        preview_state["library_preview_video_size"] = None
+        preview_state["draft_preview_mp4"] = False
+        preview_state["merge_path"] = media_path
+        preview_state["merge_t0_us"] = 0
+        preview_state["merge_chunk_t0_us"] = 0
+        preview_state["merge_chunk_end_us"] = dur_us
+        preview_state["merge_next_path"] = None
+        preview_state["playing"] = False
+        preview_state["play_start_us"] = 0
+        preview_state["play_arm_us"] = 0
+        preview_state["play_wall_t0"] = None
+        preview_state["play_prime_ready"] = False
+        preview_state["play_audio_output_ready"] = False
+        preview_state["play_pause_timeline_us"] = None
+        preview_state["merge_ffplay_start_sec"] = None
+        _hide_merge_ffplay_ui()
+        _preview_play_btn_set("▶")
+        base_name = os.path.basename(media_path)
+        kind_label = "视频" if kind == "video" else "音频" if kind == "audio" else "文件"
+        hint = "空格开始播放"
+
+        if kind == "audio":
+            _preview_show_message(f"音频预览\n{base_name}\n{hint}")
+            try:
+                preview_info_var.set(f"素材预览 · {kind_label} · {base_name} · {hint}")
+            except Exception:
+                pass
+            _sync_library_preview_timecode(0, dur_us)
+            return
+
+        if kind != "video":
+            _preview_show_message(f"{kind_label}预览\n{base_name}\n{hint}")
+            try:
+                preview_info_var.set(f"素材预览 · {kind_label} · {base_name} · {hint}")
+            except Exception:
+                pass
+            _sync_library_preview_timecode(0, dur_us)
+            return
+
+        _preview_show_message("（加载封面…）")
+        try:
+            preview_info_var.set(f"素材预览 · {kind_label} · {base_name} · {hint}")
+        except Exception:
+            pass
+        _sync_library_preview_timecode(0, dur_us)
+
+        def _bg() -> None:
+            ppm = _extract_video_first_frame_ppm(media_path)
+            dims = _parse_ppm_dimensions(ppm) if ppm else None
+            if not dims:
+                dims = _probe_video_display_size_ffmpeg_frame(media_path)
+
+            def _ui() -> None:
+                if cover_gen != int(preview_state.get("library_preview_cover_gen") or 0):
+                    return
+                if preview_state.get("library_preview_path") != media_path:
+                    return
+                if dims and dims[0] > 0 and dims[1] > 0:
+                    preview_state["library_preview_video_size"] = (int(dims[0]), int(dims[1]))
+                if ppm:
+                    plan = PreviewPlan(
+                        playhead_us=0,
+                        videos=(),
+                        texts=(),
+                        sticker_count=0,
+                        info="",
+                    )
+                    gen = int(preview_state.get("gen", 0))
+                    try:
+                        _apply_preview_image(ppm, plan, gen)
+                    except Exception:
+                        _preview_show_message(f"视频预览\n{base_name}\n{hint}")
+                else:
+                    _preview_show_message(f"视频预览\n{base_name}\n{hint}")
+
+            try:
+                root.after(0, _ui)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=_bg, daemon=True, name="library-preview-cover").start()
+
+    _library_media_preview_handlers["start"] = _begin_library_media_preview
+    _library_media_preview_handlers["stop"] = _stop_preview_playback
+
     def _preview_focus_in_text_input() -> bool:
         try:
             fw = root.focus_get()
         except tk.TclError:
             return False
-        if fw is None:
-            return False
-        if isinstance(fw, (ctk.CTkEntry, ctk.CTkTextbox)):
-            return True
-        return str(fw.winfo_class()) in ("Entry", "Text", "TEntry", "Spinbox")
+        return _tk_widget_is_editable_text_input(fw)
 
     def _on_preview_space_key(_event: tk.Event) -> Optional[str]:
         if _preview_focus_in_text_input():
@@ -12051,6 +13157,7 @@ def run_app() -> None:
         return "break"
 
     root.bind_all("<KeyPress-space>", _on_preview_space_key, add="+")
+    _bind_readonly_ctk_textbox_no_focus_steal(detail, _refocus_preview_keyboard)
     replace_state["_stop_preview_playback"] = _stop_preview_playback
     replace_state["_pause_preview_playback"] = _pause_preview_playback
     replace_state["_invalidate_playback_seek"] = _invalidate_playback_seek
@@ -12192,12 +13299,22 @@ def run_app() -> None:
         ):
             player = preview_state.get("merge_ffplay_session")
             if isinstance(player, _MergedPreviewFfplaySession) and player.hwnd:
-                cw, ch = _preview_host_inner_size()
-                _win_resize_embedded_window(player.hwnd, cw, ch)
-                preview_sub_overlay.configure(width=cw, height=PREVIEW_SUB_BAR_HEIGHT)
+                fw, fh, fox, foy = _merge_ffplay_viewport()
+                _win_resize_embedded_window(player.hwnd, fw, fh, offset_x=fox, offset_y=foy)
+                host_w, _host_h = _preview_host_inner_size()
+                preview_sub_overlay.configure(width=host_w, height=PREVIEW_SUB_BAR_HEIGHT)
                 timeline_us = _playback_timeline_us()
                 if timeline_us is not None:
                     _refresh_playback_subtitles(timeline_us)
+        elif (
+            preview_state.get("play_mode") == "library"
+            and preview_state.get("merge_ffplay_embedded")
+            and not preview_state.get("merge_ffplay_fallback")
+        ):
+            player = preview_state.get("merge_ffplay_session")
+            if isinstance(player, _MergedPreviewFfplaySession) and player.hwnd:
+                fw, fh, fox, foy = _merge_ffplay_viewport()
+                _win_resize_embedded_window(player.hwnd, fw, fh, offset_x=fox, offset_y=foy)
         if preview_state.get("last_preview_ppm") is None:
             return
         cw, ch = _preview_canvas_inner_size()
@@ -12595,7 +13712,17 @@ def run_app() -> None:
     def _on_root_close_preview() -> None:
         _stop_preview_playback()
 
-    root.protocol("WM_DELETE_WINDOW", lambda: (_on_root_close_preview(), root.destroy()))
+    def _on_root_close() -> None:
+        _on_root_close_preview()
+        updates = _collect_window_layout_updates()
+        if updates:
+            try:
+                save_window_layout_preferences(updates)
+            except OSError:
+                pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_root_close)
 
     timeline_status_area = ctk.CTkFrame(timeline_block, fg_color="transparent")
     timeline_status_area.grid(row=2, column=0, sticky="ew", padx=4, pady=(2, 0))
@@ -12649,6 +13776,10 @@ def run_app() -> None:
     )
     _ctk_readonly_text_set(timeline_sel_label, _hint0)
     _ctk_readonly_text_set(timeline_replace_highlight_label, "")
+    _bind_readonly_ctk_textbox_no_focus_steal(timeline_sel_label, _refocus_preview_keyboard)
+    _bind_readonly_ctk_textbox_no_focus_steal(
+        timeline_replace_highlight_label, _refocus_preview_keyboard
+    )
 
     def refresh_timeline_segment_status_if_selected() -> None:
         """重绘时间轴后，若仍选中片段则按当前 segment_export_pool 等信息刷新下方说明。"""
@@ -12678,6 +13809,7 @@ def run_app() -> None:
     export_strip = ctk.CTkFrame(right, fg_color="transparent")
     export_strip.grid(row=2, column=0, sticky="ew", padx=10, pady=(2, 8))
     export_strip.grid_columnconfigure(0, weight=1)
+    _workspace_export_strip_ref[0] = export_strip
 
     def _slot_index_1based(ref: MediaSegmentRef) -> int:
         refs = replace_state.get("refs") or []
@@ -14724,40 +15856,27 @@ def run_app() -> None:
     mp4_child_chk.pack(side="left", padx=(0, 12))
     _export_busy_widgets.extend([backup_chk, gen_sub_chk, mp4_child_chk])
 
-    collapsed_parents: set[str] = set()
+    expanded_draft_parents: set[str] = set()
     _draft_list_scan_cache: Dict[str, Any] = {"root": "", "payload": None}
-    _mdl2_chevron = "Segoe MDL2 Assets" in tkfont.families()
-    draft_tree_toggle_font = (
-        ctk.CTkFont(family="Segoe MDL2 Assets", size=11)
-        if _mdl2_chevron
-        else ctk.CTkFont(size=12)
-    )
-    draft_list_title_font = ctk.CTkFont(size=13)
-    draft_list_sub_font = ctk.CTkFont(size=11)
 
     def _invalidate_draft_list_scan_cache() -> None:
         _draft_list_scan_cache["root"] = ""
         _draft_list_scan_cache["payload"] = None
 
-    def draft_tree_toggle_symbol(expanded: bool) -> str:
-        if _mdl2_chevron:
-            return "\uE70D" if expanded else "\uE76C"
-        return "\u2304" if expanded else "\u203A"
-
     def render_hot_template_tree(nodes: List[Any], *, indent: int) -> None:
         for node in nodes:
             if node.is_folder:
                 children = list(node.children or ())
-                expanded = node.template_id not in collapsed_template_folders
+                expanded = node.template_id in expanded_template_folders
                 row = ctk.CTkFrame(template_list_frame, fg_color="transparent")
                 row.pack(fill="x", pady=2, padx=(4 + max(0, indent), 4))
 
                 def _mk_toggle(folder_id: str = node.template_id) -> Any:
                     def _inner() -> None:
-                        if folder_id in collapsed_template_folders:
-                            collapsed_template_folders.discard(folder_id)
+                        if folder_id in expanded_template_folders:
+                            expanded_template_folders.discard(folder_id)
                         else:
-                            collapsed_template_folders.add(folder_id)
+                            expanded_template_folders.add(folder_id)
                         _redraw_template_list()
 
                     return _inner
@@ -14822,7 +15941,28 @@ def run_app() -> None:
             messagebox.showwarning("下载模板", "请先在「草稿箱」中设置有效的剪映草稿根目录。")
             return
         show_template_summary(node)
-        if not messagebox.askyesno(
+        from shared.hot_template_client import (
+            find_local_hot_template_folder,
+            import_template_zip_file,
+            record_hot_template_local_folder,
+        )
+
+        local_folder = find_local_hot_template_folder(
+            base,
+            template_id=node.template_id,
+            template_name=node.name,
+        )
+        if local_folder:
+            if not messagebox.askyesno(
+                "下载模板",
+                f"该模板已下载到本地草稿「{local_folder}」。\n\n是否重新下载？\n选「否」将直接打开已有草稿。",
+            ):
+                selected_template_id = node.template_id
+                _set_left_tab("drafts")
+                refresh_list(reset_list_scroll=False)
+                show_draft(local_folder)
+                return
+        elif not messagebox.askyesno(
             "下载模板",
             f"下载并导入到草稿目录？\n\n{node.name}",
         ):
@@ -14854,7 +15994,6 @@ def run_app() -> None:
             zip_path: Optional[str] = None
             try:
                 import tempfile
-                from shared.hot_template_client import import_template_zip_file
 
                 fd, zip_path = tempfile.mkstemp(prefix="jy_tpl_", suffix=".zip")
                 os.close(fd)
@@ -14892,6 +16031,8 @@ def run_app() -> None:
                     template_status_var.set(err)
                     messagebox.showerror("下载模板", err)
                     return
+                if folder_name:
+                    record_hot_template_local_folder(base, tid, folder_name)
                 template_status_var.set(f"已导入「{folder_name}」")
                 _set_left_tab("drafts")
                 _invalidate_draft_list_scan_cache()
@@ -15149,8 +16290,7 @@ def run_app() -> None:
         highlight_selection()
         base = draft_root.get().strip()
         if not base or not os.path.isdir(base):
-            detail.delete("1.0", "end")
-            detail.insert("1.0", "请先设置有效的草稿根目录。")
+            _detail_set("请先设置有效的草稿根目录。")
             replace_state["refs"] = []
             replace_state["style_refs"] = []
             replace_state["encrypted"] = False
@@ -15170,8 +16310,7 @@ def run_app() -> None:
         replace_state["encrypted"] = False
         replace_state["content_ok"] = False
         replace_state["timeline_draft_dir"] = ""
-        detail.delete("1.0", "end")
-        detail.insert("1.0", "正在加载草稿…")
+        _detail_set("正在加载草稿…")
         timeline_duration_var.set("正在加载草稿…")
 
         def _bg() -> None:
@@ -15188,8 +16327,7 @@ def run_app() -> None:
                 if selected_name != folder_name:
                     return
                 if err:
-                    detail.delete("1.0", "end")
-                    detail.insert("1.0", f"加载草稿失败：\n{err}")
+                    _detail_set(f"加载草稿失败：\n{err}")
                     timeline_duration_var.set("")
                     refresh_timeline_panel_data(None)
                     return
@@ -15200,14 +16338,14 @@ def run_app() -> None:
                 media_warn = payload.get("media_warn")
                 content_path = str(payload["content_path"])
 
-                detail.delete("1.0", "end")
-                detail.insert("1.0", "\n".join(summary.lines))
+                detail_lines = list(summary.lines)
+                if isinstance(raw_timeline, dict) and media_warn:
+                    detail_lines.extend(["", media_warn])
+                _detail_set("\n".join(detail_lines))
                 replace_state["encrypted"] = encrypted
                 replace_state["content_ok"] = bool(summary.content_ok)
                 if isinstance(raw_timeline, dict):
                     replace_state["timeline_draft_dir"] = dpath
-                    if media_warn:
-                        detail.insert("end", f"\n\n{media_warn}")
 
                 def _finish_draft_load() -> None:
                     if load_gen != int(replace_state.get("draft_load_gen") or 0):
@@ -15244,7 +16382,7 @@ def run_app() -> None:
                                 if err_msg:
                                     replace_state["refs"] = []
                                     try:
-                                        detail.insert("end", f"\n\n【替换音视频槽解析失败】{err_msg}")
+                                        _detail_append(f"\n\n【替换音视频槽解析失败】{err_msg}")
                                     except tk.TclError:
                                         pass
                                     return
@@ -15326,8 +16464,7 @@ def run_app() -> None:
         if not base:
             ctk.CTkLabel(list_frame, text="请选择草稿目录").pack(pady=20)
             if reselect_draft:
-                detail.delete("1.0", "end")
-                detail.insert("1.0", "在上方「浏览」中选择剪映草稿文件夹。\n\n常见路径：\n%LOCALAPPDATA%\\JianyingPro\\User Data\\Projects\\com.lveditor.draft")
+                _detail_set("在上方「浏览」中选择剪映草稿文件夹。\n\n常见路径：\n%LOCALAPPDATA%\\JianyingPro\\User Data\\Projects\\com.lveditor.draft")
             _redraw_list_scroll(reset_scroll=reset_list_scroll)
             return
         if not os.path.isdir(base):
@@ -15346,8 +16483,7 @@ def run_app() -> None:
         if not items:
             ctk.CTkLabel(list_frame, text="（空）").pack(pady=20)
             if reselect_draft:
-                detail.delete("1.0", "end")
-                detail.insert("1.0", "当前根目录下没有草稿文件夹。")
+                _detail_set("当前根目录下没有草稿文件夹。")
             _redraw_list_scroll(reset_scroll=reset_list_scroll)
             return
 
@@ -15390,16 +16526,16 @@ def run_app() -> None:
             """递归展示父子草稿（支持 A → A_1 → A_1_1 等多级）。"""
             children = list(by_parent.get(folder_name) or [])
             if children:
-                expanded = folder_name not in collapsed_parents
+                expanded = folder_name in expanded_draft_parents
                 row = ctk.CTkFrame(list_frame, fg_color="transparent")
                 row.pack(fill="x", pady=2, padx=(_DRAFT_LIST_ROW_PAD + max(0, indent), 4))
 
                 def _mk_toggle(pn: str = folder_name) -> Any:
                     def _inner() -> None:
-                        if pn in collapsed_parents:
-                            collapsed_parents.discard(pn)
+                        if pn in expanded_draft_parents:
+                            expanded_draft_parents.discard(pn)
                         else:
-                            collapsed_parents.add(pn)
+                            expanded_draft_parents.add(pn)
                         refresh_list(reselect_draft=False, rescan_folders=False)
 
                     return _inner
@@ -15446,17 +16582,56 @@ def run_app() -> None:
             if prev_selected and os.path.isdir(os.path.join(base, prev_selected)):
                 show_draft(prev_selected)
             else:
-                detail.delete("1.0", "end")
-                detail.insert(
-                    "1.0",
+                _detail_set(
                     "请从左侧选择草稿。\n\n"
                     "「替换素材」与导出槽位会改当前草稿的素材引用；导出 MP4 仅在勾选「导出生成子草稿」时复制为子稿；"
-                    "未勾选时临时套用槽位导出后自动还原 draft_content.json。父子关系记在本地应用数据中。",
+                    "未勾选时临时套用槽位导出后自动还原 draft_content.json。父子关系记在本地应用数据中。"
                 )
         else:
             highlight_selection()
 
         _redraw_list_scroll(reset_scroll=reset_list_scroll)
+
+    def _collect_draft_branch_parents(by_parent: Dict[str, List[str]]) -> set[str]:
+        return {parent for parent, children in by_parent.items() if children}
+
+    def _draft_tree_expand_all() -> None:
+        base = draft_root.get().strip()
+        if not base or not os.path.isdir(base):
+            return
+        if _draft_list_scan_cache.get("root") != base or not _draft_list_scan_cache.get("payload"):
+            tree_data = scan_draft_list_tree_data(base)
+        else:
+            tree_data = _draft_list_scan_cache["payload"]
+        by_parent = dict(tree_data.get("by_parent") or {})
+        expanded_draft_parents.clear()
+        expanded_draft_parents.update(_collect_draft_branch_parents(by_parent))
+        refresh_list(reselect_draft=False, rescan_folders=False)
+
+    def _draft_tree_collapse_all() -> None:
+        expanded_draft_parents.clear()
+        refresh_list(reselect_draft=False, rescan_folders=False)
+
+    draft_list_toolbar = ctk.CTkFrame(draft_panel, fg_color="transparent")
+    draft_list_toolbar.pack(fill="x", padx=10, pady=(0, 4), before=list_frame._parent_frame)
+    ctk.CTkButton(
+        draft_list_toolbar,
+        text="全部展开",
+        width=72,
+        height=28,
+        fg_color="transparent",
+        border_width=1,
+        command=_draft_tree_expand_all,
+    ).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(
+        draft_list_toolbar,
+        text="全部收起",
+        width=72,
+        height=28,
+        fg_color="transparent",
+        border_width=1,
+        command=_draft_tree_collapse_all,
+    ).pack(side="left")
 
     def _commit_path_entry(_event: Any = None) -> None:
         """路径框手动修改后失焦或按回车时同步到 StringVar 并写入本地偏好。"""

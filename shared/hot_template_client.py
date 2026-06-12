@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 # ratio: 0.0~1.0 为确定进度；None 表示总大小未知（仅更新文案）
@@ -149,6 +151,110 @@ def _sanitize_draft_folder_name(name: str) -> Optional[str]:
     if not name or re.search(r'[<>:"/\\|?*]', name) or name in (".", ".."):
         return None
     return name
+
+
+def _normalized_draft_root_key(draft_root: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(draft_root)))
+
+
+def _hot_template_local_map_path(draft_root: str) -> Path:
+    ada = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(ada) / "pyJianYingDraft_browser"
+    d.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(_normalized_draft_root_key(draft_root).encode("utf-8")).hexdigest()[:24]
+    return d / f"hot_template_local_{digest}.json"
+
+
+def _load_hot_template_local_map(draft_root: str) -> Dict[str, str]:
+    path = _hot_template_local_map_path(draft_root)
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        by_id = data.get("by_template_id") if isinstance(data, dict) else {}
+        if not isinstance(by_id, dict):
+            return {}
+        return {str(k): str(v) for k, v in by_id.items() if k and v}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def record_hot_template_local_folder(draft_root: str, template_id: str, folder_name: str) -> None:
+    tid = _as_str(template_id)
+    fname = _as_str(folder_name)
+    if not draft_root or not tid or not fname:
+        return
+    path = _hot_template_local_map_path(draft_root)
+    by_id = _load_hot_template_local_map(draft_root)
+    by_id[tid] = fname
+    data = {
+        "version": 1,
+        "draft_root": _normalized_draft_root_key(draft_root),
+        "by_template_id": by_id,
+    }
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _is_valid_draft_folder(draft_root: str, folder_name: str) -> bool:
+    folder_path = os.path.join(draft_root, folder_name)
+    return os.path.isdir(folder_path) and os.path.isfile(os.path.join(folder_path, "draft_content.json"))
+
+
+def _folder_matches_template_base(folder_name: str, base_name: str) -> bool:
+    if not base_name:
+        return False
+    if folder_name == base_name:
+        return True
+    prefix = base_name + "_"
+    if folder_name.startswith(prefix):
+        rest = folder_name[len(prefix) :]
+        return rest.isdigit()
+    return False
+
+
+def find_local_hot_template_folder(
+    draft_root: str,
+    *,
+    template_id: str = "",
+    template_name: str = "",
+) -> Optional[str]:
+    """查找模板对应的本地草稿文件夹名；优先读导入记录，再按名称匹配。"""
+    if not draft_root or not os.path.isdir(draft_root):
+        return None
+    tid = _as_str(template_id)
+    local_map = _load_hot_template_local_map(draft_root)
+    if tid and tid in local_map:
+        mapped = local_map[tid]
+        if _is_valid_draft_folder(draft_root, mapped):
+            return mapped
+    base_names: List[str] = []
+    for candidate in (template_name, os.path.basename(tid.replace("\\", "/").replace("/", os.sep))):
+        sanitized = _sanitize_draft_folder_name(candidate)
+        if sanitized and sanitized not in base_names:
+            base_names.append(sanitized)
+    if not base_names:
+        return None
+    matches: List[Tuple[str, float]] = []
+    try:
+        for name in os.listdir(draft_root):
+            if not _is_valid_draft_folder(draft_root, name):
+                continue
+            if any(_folder_matches_template_base(name, base) for base in base_names):
+                try:
+                    mtime = os.path.getmtime(os.path.join(draft_root, name))
+                except OSError:
+                    mtime = 0.0
+                matches.append((name, mtime))
+    except OSError:
+        return None
+    if not matches:
+        return None
+    matches.sort(key=lambda x: x[1], reverse=True)
+    return matches[0][0]
 
 
 def _unique_draft_folder_name(draft_root: str, base_name: str) -> str:
