@@ -628,7 +628,7 @@ def summarize_draft(draft_dir: str) -> DraftSummary:
     else:
         for i, tr in enumerate(tracks):
             tname = tr.get("name", f"轨道{i + 1}")
-            ttype = tr.get("type", "?")
+            ttype = _track_type_zh(tr.get("type", "?"))
             segs = tr.get("segments") or []
             lines.append(f"· {tname}  [{ttype}]  — {len(segs)} 个片段")
 
@@ -809,12 +809,12 @@ def list_style_segments_from_content(content: Dict[str, Any]) -> List[StyleSegme
                 mat = texts_by_id.get(mid) or {}
                 cur_rid = _text_effect_id_from_material(mat)
                 lab = _timeline_segment_label(seg, materials)
-                label = f"[text] {tname} · 片段{i + 1} · {_fmt_tc_us(t0, t1)} · {lab}"
+                label = f"[{_track_type_zh('text')}] {tname} · 片段{i + 1} · {_fmt_tc_us(t0, t1)} · {lab}"
             else:
                 mat = stickers_by_id.get(mid) or {}
                 cur_rid = _sticker_resource_id_from_material(mat)
                 hint = cur_rid[:16] if cur_rid else mid[:8]
-                label = f"[sticker] {tname} · 片段{i + 1} · {_fmt_tc_us(t0, t1)} · {hint}"
+                label = f"[{_track_type_zh('sticker')}] {tname} · 片段{i + 1} · {_fmt_tc_us(t0, t1)} · {hint}"
             out.append(
                 StyleSegmentRef(
                     track_type=ttype,
@@ -5460,6 +5460,23 @@ def _media_track_ordinal_at_index(content: Dict[str, Any], track_idx: int) -> Op
     return mo
 
 
+_TRACK_TYPE_ZH: Dict[str, str] = {
+    "video": "视频",
+    "audio": "音频",
+    "text": "文本",
+    "sticker": "贴纸",
+    "effect": "特效",
+    "filter": "滤镜",
+}
+
+
+def _track_type_zh(ttype: Any) -> str:
+    key = str(ttype or "").strip().lower()
+    if not key:
+        return "?"
+    return _TRACK_TYPE_ZH.get(key, str(ttype))
+
+
 def find_replace_ref_for_timeline_segment(
     refs: List[MediaSegmentRef],
     track: Dict[str, Any],
@@ -5550,7 +5567,7 @@ def _style_segment_ref_from_timeline(
                 break
         cur_rid = _text_effect_id_from_material(mat) if mat else ""
         lab = _timeline_segment_label(seg, materials)
-        label = f"[text] {tname} · 片段{segment_index_raw + 1} · {_fmt_tc_us(t0, t1)} · {lab}"
+        label = f"[{_track_type_zh('text')}] {tname} · 片段{segment_index_raw + 1} · {_fmt_tc_us(t0, t1)} · {lab}"
     else:
         mat = {}
         for m in materials.get("stickers") or []:
@@ -5559,7 +5576,7 @@ def _style_segment_ref_from_timeline(
                 break
         cur_rid = _sticker_resource_id_from_material(mat) if mat else ""
         hint = cur_rid[:16] if cur_rid else mid[:8]
-        label = f"[sticker] {tname} · 片段{segment_index_raw + 1} · {_fmt_tc_us(t0, t1)} · {hint}"
+        label = f"[{_track_type_zh('sticker')}] {tname} · 片段{segment_index_raw + 1} · {_fmt_tc_us(t0, t1)} · {hint}"
     return StyleSegmentRef(
         track_type=ttype,
         track_name=tname,
@@ -6511,9 +6528,12 @@ def _terminate_subprocess(proc: subprocess.Popen) -> None:
 
 
 def kill_playback_audio_procs(procs: Optional[List[subprocess.Popen]]) -> None:
-    for proc in procs or []:
-        if proc is not None and proc.poll() is None:
-            _terminate_subprocess(proc)
+    alive = [p for p in (procs or []) if p is not None and p.poll() is None]
+    if not alive:
+        return
+    # ffmpeg→ffplay 管道：先停消费者(ffplay)再停生产者，避免 pause 时 terminate 卡住 UI
+    for proc in reversed(alive):
+        _terminate_subprocess(proc)
 
 
 def _ffmpeg_playback_layer_filter(index: int, layer: PreviewAudioLayer) -> str:
@@ -7506,6 +7526,24 @@ def _win_resize_embedded_window(
     )
 
 
+def _win_post_space_key(hwnd: int) -> bool:
+    """向嵌入的 ffplay 窗口发送空格（ffplay 默认空格暂停/继续）。"""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(int(hwnd)):
+            return False
+        vk = 0x20
+        user32.PostMessageW(int(hwnd), 0x0100, vk, 0)
+        user32.PostMessageW(int(hwnd), 0x0101, vk, 0)
+        return True
+    except Exception:
+        return False
+
+
 def spawn_merged_preview_player(
     merge_path: str,
     *,
@@ -8470,6 +8508,43 @@ def fetch_scrub_frame_fast(
     return proc.stdout
 
 
+def fetch_local_mp4_frame_ppm(
+    path: str,
+    sec: float,
+    *,
+    max_width: int = PREVIEW_MAX_WIDTH,
+) -> Optional[bytes]:
+    """从本地 MP4 指定时间抽一帧（暂停时冻结画面）。"""
+    ff = find_ffmpeg()
+    path_abs = os.path.abspath(str(path or ""))
+    if not ff or not os.path.isfile(path_abs):
+        return None
+    cmd = [
+        ff,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *_ffmpeg_hybrid_seek_args(path_abs, max(0.0, float(sec))),
+        "-frames:v",
+        "1",
+        "-an",
+        "-vf",
+        f"scale={max_width}:-2:flags=fast_bilinear,format=rgb24",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "ppm",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=12)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0 or not proc.stdout or proc.stdout[0:1] != b"P":
+        return None
+    return proc.stdout
+
+
 def prefetch_playback_ahead_frames(
     content: Dict[str, Any],
     start_us: int,
@@ -9038,8 +9113,12 @@ def populate_timeline_panel(
         nm_raw = tr.get("name", "")
         tname = "" if nm_raw is None else (nm_raw if isinstance(nm_raw, str) else str(nm_raw))
         tname = tname.strip()
-        sel["track_summary"] = f"{tname or ttype} [{ttype}] · 共 {nseg} 个片段"
-        _set_status(f"已选轨道：{tr.get('name')} [{tr.get('type')}] · 共 {nseg} 个片段", replace_highlight="")
+        ttype_zh = _track_type_zh(ttype)
+        sel["track_summary"] = f"{tname or ttype_zh} [{ttype_zh}] · 共 {nseg} 个片段"
+        _set_status(
+            f"已选轨道：{tr.get('name')} [{_track_type_zh(tr.get('type'))}] · 共 {nseg} 个片段",
+            replace_highlight="",
+        )
         apply_selection_visual()
         _notify_timeline_selection_ui()
 
@@ -9161,7 +9240,8 @@ def populate_timeline_panel(
         y = y0 + ti * (row_h + row_gap)
         tname = str(tr.get("name", "?"))
         ttype = str(tr.get("type", "?"))
-        label_txt = f"{tname}\n[{ttype}]"
+        ttype_zh = _track_type_zh(ttype)
+        label_txt = f"{tname}\n[{ttype_zh}]"
         tag_t = f"tid{ti}"
         lr = canvas.create_rectangle(
             0,
@@ -9754,7 +9834,7 @@ def populate_timeline_panel(
 class _DraftImportProgressDialog:
     """模板下载/导入进度（主线程创建，后台线程通过 root.after 更新）。"""
 
-    __slots__ = ("_root", "_win", "_label_var", "_bar", "_indeterminate", "_pulse_after")
+    __slots__ = ("_root", "_win", "_label_var", "_bar", "_indeterminate", "_pulse_after", "_closed", "_destroy_after")
 
     def __init__(self, parent: Any, *, title: str = "导入草稿") -> None:
         import customtkinter as ctk
@@ -9762,6 +9842,8 @@ class _DraftImportProgressDialog:
         self._root = parent
         self._indeterminate = False
         self._pulse_after: Optional[str] = None
+        self._destroy_after: Optional[str] = None
+        self._closed = False
         win = ctk.CTkToplevel(parent)
         win.title(title)
         win.transient(parent)
@@ -9802,11 +9884,32 @@ class _DraftImportProgressDialog:
                 pass
             self._pulse_after = None
 
+    def _cancel_destroy(self) -> None:
+        aid = self._destroy_after
+        if aid is not None:
+            try:
+                self._root.after_cancel(aid)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            self._destroy_after = None
+
+    def _win_alive(self) -> bool:
+        win = self._win
+        if win is None:
+            return False
+        try:
+            return bool(win.winfo_exists())
+        except tk.TclError:
+            return False
+
     def _start_pulse(self) -> None:
         if self._pulse_after is not None:
             return
 
         def _tick(step: float = 0.04) -> None:
+            if self._closed or not self._win_alive():
+                self._pulse_after = None
+                return
             if not self._indeterminate:
                 self._pulse_after = None
                 return
@@ -9827,11 +9930,11 @@ class _DraftImportProgressDialog:
         _tick()
 
     def update(self, ratio: Optional[float], message: str) -> None:
+        if self._closed:
+            return
+
         def _ui() -> None:
-            try:
-                if not self._win.winfo_exists():
-                    return
-            except tk.TclError:
+            if self._closed or not self._win_alive():
                 return
             self._label_var.set(message)
             if ratio is None:
@@ -9856,16 +9959,44 @@ class _DraftImportProgressDialog:
             pass
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
         def _ui() -> None:
             self._stop_pulse()
+            win = self._win
+            self._win = None
+            if win is None:
+                return
             try:
-                self._win.grab_release()
+                win.grab_release()
+            except tk.TclError:
+                pass
+            # CustomTkinter 在 CTkToplevel 创建后会 after(5/10ms) deiconify/restore focus；
+            # 立即 destroy 会留下对已销毁窗口的回调。先 withdraw 并延迟销毁。
+            try:
+                win.withdraw()
             except tk.TclError:
                 pass
             try:
-                self._win.destroy()
+                self._root.focus_force()
             except tk.TclError:
                 pass
+
+            def _destroy() -> None:
+                self._destroy_after = None
+                try:
+                    if win.winfo_exists():
+                        win.destroy()
+                except tk.TclError:
+                    pass
+
+            self._cancel_destroy()
+            try:
+                self._destroy_after = self._root.after(30, _destroy)
+            except tk.TclError:
+                _destroy()
 
         try:
             self._root.after(0, _ui)
@@ -10107,7 +10238,6 @@ def run_app() -> None:
             login_btn.configure(text="登录")
 
     draft_root = ctk.StringVar(value=initial_draft_root_for_ui())
-    preview_mp4_dir = ctk.StringVar(value=load_preview_mp4_dir_preference())
     selected_name: Optional[str] = None
 
     main = ctk.CTkFrame(root, fg_color="transparent")
@@ -10247,27 +10377,6 @@ def run_app() -> None:
     _style_left_tab_btn(tab_library_btn, active=False)
     _style_left_tab_btn(tab_drafts_btn, active=True)
     _style_left_tab_btn(tab_templates_btn, active=False)
-
-    path_entry = ctk.CTkEntry(draft_panel, placeholder_text="草稿根目录…", height=30)
-    path_entry.pack(fill="x", padx=10, pady=(0, 6))
-
-    preview_mp4_row = ctk.CTkFrame(draft_panel, fg_color="transparent")
-    preview_mp4_row.pack(fill="x", padx=10, pady=(0, 6))
-    ctk.CTkLabel(
-        preview_mp4_row,
-        text="预览 MP4 目录",
-        font=ctk.CTkFont(size=11),
-        text_color=("gray45", "gray60"),
-        anchor="w",
-    ).pack(fill="x", pady=(0, 2))
-    preview_mp4_entry_row = ctk.CTkFrame(preview_mp4_row, fg_color="transparent")
-    preview_mp4_entry_row.pack(fill="x")
-    preview_mp4_entry = ctk.CTkEntry(
-        preview_mp4_entry_row,
-        placeholder_text="与草稿同名的 MP4 所在目录…",
-        height=30,
-    )
-    preview_mp4_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
     list_frame = ctk.CTkScrollableFrame(draft_panel, label_text="草稿列表", corner_radius=10)
     list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -11350,7 +11459,9 @@ def run_app() -> None:
         anchor="w",
         wraplength=248,
         justify="left",
-    ).pack(anchor="w", padx=10, pady=(0, 6))
+    ).pack(anchor="w", padx=10, pady=(0, 4))
+    preview_actions_row = ctk.CTkFrame(preview_col, fg_color="transparent")
+    preview_actions_row.pack(fill="x", padx=10, pady=(0, 6))
     preview_state: Dict[str, Any] = {
         "photo": None,
         "frame_cache": _PreviewFrameCache(max_items=96),
@@ -11410,6 +11521,7 @@ def run_app() -> None:
         "play_last_instant_bucket": None,
         "play_last_sub_refresh_ms": 0.0,
         "scrub_fetch_gen": 0,
+        "play_tick_gen": 0,
         "play_prime_gen": 0,
         "play_mode": "live",
         "draft_preview_mp4": False,
@@ -11448,7 +11560,70 @@ def run_app() -> None:
         "audio_pause_timeline_us": None,
         "playback_session_active": False,
         "play_pause_timeline_us": None,
+        "cloud_preview_fetch_busy": False,
+        "cloud_preview_fetch_gen": 0,
+        "pending_timeline_preview_after_load": None,
+        "merge_ffplay_frozen": False,
     }
+
+    def _current_timeline_content() -> Optional[Dict[str, Any]]:
+        raw = timeline_content_cache[0]
+        return raw if isinstance(raw, dict) else None
+
+    def _cancel_cloud_preview_fetch() -> None:
+        preview_state["cloud_preview_fetch_busy"] = False
+        preview_state["cloud_preview_fetch_gen"] = int(preview_state.get("cloud_preview_fetch_gen") or 0) + 1
+        preview_state["cloud_preview_draft_name"] = None
+        preview_state["template_preview_node_id"] = None
+
+    def _on_draft_cloud_preview_ready(mp4_path: str, folder_name: str, us: int) -> None:
+        content = _current_timeline_content() or {}
+        try:
+            preview_info_var.set(f"草稿 · {folder_name} · 云端预览")
+        except Exception:
+            pass
+        _play_draft_preview_mp4(content, us, mp4_path=mp4_path)
+
+    def _on_draft_cloud_preview_fail(msg: str, folder_name: str, us: int) -> None:
+        content = _current_timeline_content()
+        if content is None:
+            preview_state["pending_timeline_preview_after_load"] = {
+                "us": int(us),
+                "folder_name": folder_name,
+                "cloud_unavailable": True,
+            }
+            _preview_show_message(f"（{msg}，草稿加载完成后将尝试时间轴预览）")
+            try:
+                preview_info_var.set(f"草稿 · {folder_name} · {msg}")
+            except Exception:
+                pass
+            return
+        try:
+            preview_info_var.set(f"草稿 · {folder_name} · {msg} · 时间轴预览")
+        except Exception:
+            pass
+        _continue_draft_timeline_preview_playback(
+            content, us, cloud_unavailable=True, prefer_timeline=True
+        )
+
+    def _maybe_resume_pending_timeline_preview() -> None:
+        pending = preview_state.get("pending_timeline_preview_after_load")
+        if not isinstance(pending, dict):
+            return
+        folder_name = (replace_state.get("timeline_draft_name") or "").strip()
+        if folder_name != str(pending.get("folder_name") or "").strip():
+            return
+        content = _current_timeline_content()
+        if content is None:
+            return
+        preview_state["pending_timeline_preview_after_load"] = None
+        us = int(pending.get("us") or 0)
+        _continue_draft_timeline_preview_playback(
+            content,
+            us,
+            cloud_unavailable=bool(pending.get("cloud_unavailable")),
+            prefer_timeline=True,
+        )
 
     def _current_draft_dir() -> str:
         d = (replace_state.get("timeline_draft_dir") or "").strip()
@@ -11463,9 +11638,6 @@ def run_app() -> None:
 
     def _draft_preview_mp4_path() -> str:
         folder_name = (replace_state.get("timeline_draft_name") or "").strip()
-        local = _find_draft_preview_mp4(folder_name, preview_mp4_dir.get().strip())
-        if local:
-            return local
         if folder_name:
             from shared.hot_template_client import template_preview_cache_path
 
@@ -11787,7 +11959,10 @@ def run_app() -> None:
                 ):
                     _schedule_playback_arm(us)
                 return
-        if not use_merge and not _playback_video_ready(us):
+        if not use_merge and preview_state.get("play_mode") == "scrub":
+            if not preview_state.get("play_prime_ready"):
+                return
+        elif not use_merge and not _playback_video_ready(us):
             return
         content = timeline_content_cache[0]
         hits = (
@@ -12008,6 +12183,11 @@ def run_app() -> None:
     def _preview_is_playing() -> bool:
         return bool(preview_state.get("playing"))
 
+    def _playback_tick_still_valid(tick_gen: int) -> bool:
+        return _preview_is_playing() and tick_gen == int(
+            preview_state.get("play_tick_gen") or 0
+        )
+
     def _preview_play_btn_set(text: str) -> None:
         btn = preview_state.get("play_btn")
         if btn is not None:
@@ -12016,8 +12196,89 @@ def run_app() -> None:
             except tk.TclError:
                 pass
 
-    def _stop_playback_audio() -> None:
-        _bump_merge_ffplay_generation()
+    def _merge_preview_file_sec_at_timeline(timeline_us: int) -> float:
+        t0 = int(preview_state.get("merge_t0_us") or 0)
+        return max(0.0, (int(timeline_us) - t0) / 1_000_000.0)
+
+    def _freeze_merge_ffplay_to_canvas(pause_us: int) -> bool:
+        """停止 ffplay 并在 canvas 显示暂停时刻的帧（SDL 嵌入窗口无法可靠 PostMessage 暂停）。"""
+        merge_path = preview_state.get("merge_path")
+        if not merge_path or not os.path.isfile(str(merge_path)):
+            return False
+        content = _current_timeline_content()
+        plan = (
+            build_scrub_preview_plan(content, int(pause_us))
+            if isinstance(content, dict)
+            else PreviewPlan(
+                playhead_us=int(pause_us),
+                videos=(),
+                texts=(),
+                sticker_count=0,
+                info="",
+            )
+        )
+        sec = _merge_preview_file_sec_at_timeline(int(pause_us))
+        ppm = fetch_local_mp4_frame_ppm(str(merge_path), sec, max_width=PREVIEW_MAX_WIDTH)
+        _stop_playback_audio()
+        if ppm:
+            try:
+                _apply_preview_image(ppm, plan, int(preview_state.get("gen", 0)), subtitle_us=int(pause_us))
+            except Exception:
+                pass
+        preview_state["merge_ffplay_frozen"] = True
+        preview_state["play_prime_ready"] = ppm is not None
+        return True
+
+    def _resume_frozen_merge_ffplay(us: int) -> bool:
+        merge_path = preview_state.get("merge_path")
+        if not merge_path or not os.path.isfile(str(merge_path)):
+            return False
+        content = _current_timeline_content() or {}
+        us = int(us)
+        preview_state["merge_ffplay_frozen"] = False
+        preview_state["play_tick_gen"] = int(preview_state.get("play_tick_gen") or 0) + 1
+        preview_state["playing"] = True
+        preview_state["play_pause_timeline_us"] = None
+        _preview_play_btn_set("⏸")
+        if preview_state.get("play_mode") == "library":
+            preview_state["play_start_us"] = us
+            preview_state["play_arm_us"] = us
+            preview_state["play_wall_t0"] = None
+            preview_state["play_prime_ready"] = True
+            preview_state["play_audio_output_ready"] = False
+            preview_state["merge_ffplay_start_sec"] = None
+            if not _start_merged_preview_ffplay(start_sec=max(0.0, us / 1_000_000.0), force=True):
+                _stop_preview_playback()
+                return False
+            _schedule_playback_arm(us)
+            _preview_play_tick()
+            return True
+        _begin_draft_preview_mp4_play(content, us, mp4_path=str(merge_path))
+        return True
+
+    def _merge_ffplay_preview_active() -> bool:
+        if not (
+            preview_state.get("draft_preview_mp4")
+            or preview_state.get("play_mode") in ("merge", "library")
+        ):
+            return False
+        sess = preview_state.get("merge_ffplay_session")
+        return isinstance(sess, _MergedPreviewFfplaySession) and sess.alive()
+
+    def _can_resume_merge_preview(us: int) -> bool:
+        if not preview_state.get("playback_session_active"):
+            return False
+        pause_us = preview_state.get("play_pause_timeline_us")
+        if pause_us is None:
+            return False
+        if abs(int(us) - int(pause_us)) > SCRUB_THUMB_STEP_US // 4:
+            return False
+        merge_path = preview_state.get("merge_path")
+        if not merge_path or not os.path.isfile(str(merge_path)):
+            return False
+        return _merge_ffplay_preview_active() or bool(preview_state.get("merge_ffplay_frozen"))
+
+    def _stop_playback_audio(*, keep_merge_ffplay: bool = False) -> None:
         sess = preview_state.get("merge_ffplay_session")
         session_proc = (
             sess.proc
@@ -12025,6 +12286,18 @@ def run_app() -> None:
             else None
         )
         procs = list(preview_state.get("play_audio_procs") or [])
+        if keep_merge_ffplay and session_proc is not None and session_proc.poll() is None:
+            extra = [
+                p
+                for p in procs
+                if p is not None and p is not session_proc and p.poll() is None
+            ]
+            if extra:
+                kill_playback_audio_procs(extra)
+            preview_state["play_audio_procs"] = [session_proc]
+            preview_state["play_audio_proc"] = session_proc
+            return
+        _bump_merge_ffplay_generation()
         _stop_merged_preview_ffplay()
         extra = [
             p
@@ -12143,10 +12416,43 @@ def run_app() -> None:
         if preview_state.get("draft_preview_mp4") or preview_state.get("play_mode") in ("merge", "library"):
             _bump_merge_ffplay_generation()
 
+    def _try_resume_paused_preview() -> bool:
+        """空格续播：保留暂停前的预览画面，不重新拉云端或 prime。"""
+        if _preview_is_playing():
+            return False
+        if not preview_state.get("playback_session_active"):
+            return False
+        pause_us = preview_state.get("play_pause_timeline_us")
+        if pause_us is None:
+            return False
+        us = int(pause_us)
+        content = timeline_content_cache[0]
+        if _can_resume_merge_preview(us):
+            return _resume_frozen_merge_ffplay(us)
+        if not isinstance(content, dict) or not _can_resume_playback(content, us):
+            return False
+        preview_state["play_tick_gen"] = int(preview_state.get("play_tick_gen") or 0) + 1
+        preview_state["playing"] = True
+        _preview_play_btn_set("⏸")
+        _begin_scrub_play(content, us, video_ready=True, resume=True)
+        return True
+
     def _pause_preview_playback() -> None:
-        """暂停：停时钟与音频，保留画面/缩略图/帧缓存（会话仍有效，可快速续播）。"""
+        """暂停：停时钟与独立音频，保留当前预览画面（ffplay 冻结帧或 canvas 帧）。"""
+        pause_us = _playback_timeline_us()
+        if pause_us is None:
+            pause_us = _current_playhead_us()
+        pause_us = int(pause_us)
+        preview_state["play_tick_gen"] = int(preview_state.get("play_tick_gen") or 0) + 1
         preview_state["playing"] = False
+        preview_state["scrub_fetch_gen"] = int(preview_state.get("scrub_fetch_gen") or 0) + 1
+        preview_state["ui_apply_pending"] = None
+        preview_state["ui_apply_scheduled"] = False
+        _cancel_scrub_fetch_timer()
         _invalidate_playback_arm_polls()
+        preview_state["play_audio_ready_gen"] = int(
+            preview_state.get("play_audio_ready_gen") or 0
+        ) + 1
         aid = preview_state.get("play_after_id")
         if aid is not None:
             try:
@@ -12154,20 +12460,13 @@ def run_app() -> None:
             except (tk.TclError, ValueError, TypeError):
                 pass
             preview_state["play_after_id"] = None
-        pause_us = _playback_timeline_us()
-        if pause_us is None:
-            pause_us = int(
-                replace_state.get("playhead_us")
-                or timeline_select.get("playhead_us")
-                or preview_state.get("pending_us")
-                or 0
-            )
-        pause_us = int(pause_us)
+        if not _merge_ffplay_preview_active():
+            _stop_playback_audio()
         preview_state["play_pause_timeline_us"] = pause_us
         preview_state["playback_session_active"] = True
-        _sync_playhead_for_playback(pause_us)
-        _stop_playback_audio()
+        preview_state["play_display_us"] = pause_us
         preview_state["play_wall_t0"] = None
+        _sync_playhead_for_playback(pause_us)
         set_ph = replace_state.get("_set_playhead")
         if callable(set_ph):
             try:
@@ -12179,8 +12478,10 @@ def run_app() -> None:
                     pass
             except Exception:
                 pass
+        if _merge_ffplay_preview_active():
+            _freeze_merge_ffplay_to_canvas(pause_us)
         preview_state["merge_ffplay_start_sec"] = None
-        if preview_state.get("photo") is None:
+        if preview_state.get("photo") is None and not preview_state.get("merge_ffplay_frozen"):
             preview_state["play_prime_ready"] = False
         preview_state["play_audio_output_ready"] = False
         preview_state["play_audio_alive_since"] = None
@@ -12189,13 +12490,19 @@ def run_app() -> None:
         preview_state["play_audio_spawn_mono"] = None
         preview_state["play_audio_audible_mono_until"] = None
         preview_state["play_fast_resume_arm"] = False
-        preview_state["scrub_fetch_gen"] = int(preview_state.get("scrub_fetch_gen") or 0) + 1
         preview_state["scrub_busy"] = False
+        content = timeline_content_cache[0]
+        if isinstance(content, dict):
+            _preview_sync_timecode(pause_us, content)
         _preview_play_btn_set("▶")
-        _refocus_preview_keyboard()
+        try:
+            root.after(0, _refocus_preview_keyboard)
+        except tk.TclError:
+            pass
 
     def _stop_preview_playback() -> None:
         _clear_playback_session()
+        preview_state["play_tick_gen"] = int(preview_state.get("play_tick_gen") or 0) + 1
         preview_state["playing"] = False
         _invalidate_playback_arm_polls()
         aid = preview_state.get("play_after_id")
@@ -12220,6 +12527,7 @@ def run_app() -> None:
         preview_state["play_mode"] = "live"
         preview_state["draft_preview_mp4"] = False
         preview_state["draft_preview_mp4_end_us"] = None
+        preview_state["merge_ffplay_frozen"] = False
         preview_state["merge_path"] = None
         preview_state["merge_next_path"] = None
         preview_state["merge_prefetch_busy"] = False
@@ -12256,8 +12564,6 @@ def run_app() -> None:
         preview_state["audio_prefetch_gen"] = int(preview_state.get("audio_prefetch_gen") or 0) + 1
         preview_state["audio_chunk_t0_us"] = None
         preview_state["audio_chunk_end_us"] = None
-        preview_state["cloud_preview_fetch_busy"] = False
-        preview_state["cloud_preview_fetch_gen"] = int(preview_state.get("cloud_preview_fetch_gen") or 0) + 1
         _preview_play_btn_set("▶")
 
     def _refresh_playback_subtitles(timeline_us: int) -> None:
@@ -12555,6 +12861,16 @@ def run_app() -> None:
             return
         old_key = preview_state.get("play_audio_key")
         need_resync = old_key is not None and old_key != sig
+        if (
+            need_resync
+            and _preview_is_playing()
+            and preview_state.get("play_wall_t0") is not None
+        ):
+            cur_us = _playback_timeline_us()
+            if cur_us is not None:
+                preview_state["play_start_us"] = int(cur_us)
+                preview_state["play_arm_us"] = int(cur_us)
+                preview_state["play_wall_t0"] = time.time()
         if alive:
             _stop_playback_audio()
         layers = tuple(layer for layer, _key in hits)
@@ -12730,8 +13046,9 @@ def run_app() -> None:
 
     def _preview_play_tick() -> None:
         """播放 = 时间轴指针自动前进 + 与拖动相同的预览取帧。"""
+        tick_gen = int(preview_state.get("play_tick_gen") or 0)
         preview_state["play_after_id"] = None
-        if not _preview_is_playing():
+        if not _playback_tick_still_valid(tick_gen):
             return
         if preview_state.get("play_mode") == "library":
             tick_ms = 40
@@ -12765,7 +13082,7 @@ def run_app() -> None:
                     )
                 except Exception:
                     pass
-            if _preview_is_playing():
+            if _playback_tick_still_valid(tick_gen):
                 preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
             return
         content = timeline_content_cache[0]
@@ -12776,67 +13093,98 @@ def run_app() -> None:
         tick_ms = max(16, int(1000.0 / fps))
 
         if preview_state.get("play_wall_t0") is None:
-            if preview_state.get("play_clock_arm_after_id") is not None:
-                if _preview_is_playing():
-                    preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
-                return
+            if preview_state.get("play_clock_arm_after_id") is None:
+                if preview_state.get("play_mode") == "scrub":
+                    preview_state["play_prime_ready"] = True
+                    cur = int(_current_playhead_us())
+                    preview_state["play_arm_us"] = cur
+                    preview_state["play_start_us"] = cur
+                    if not (
+                        _playback_audio_hits(content, cur)
+                        if isinstance(content, dict)
+                        else ()
+                    ):
+                        preview_state["play_audio_output_ready"] = True
+                    _try_start_playback_clock()
+                    if preview_state.get("play_wall_t0") is None:
+                        started = float(
+                            preview_state.get("play_audio_arm_started_at") or time.time()
+                        )
+                        if (time.time() - started) * 1000.0 >= PREVIEW_PLAY_SYNC_TIMEOUT_MS:
+                            preview_state["play_audio_output_ready"] = True
+                            _try_start_playback_clock()
+                        if preview_state.get("play_wall_t0") is None:
+                            _schedule_play_sync_poll()
+            if _playback_tick_still_valid(tick_gen):
+                preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
             return
 
         timeline_us = _playback_timeline_us()
         if timeline_us is None:
+            if _preview_is_playing():
+                preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
             return
 
         total_us = _playback_end_us(content)
-        if timeline_us >= total_us:
+        try:
+            if not _playback_tick_still_valid(tick_gen):
+                return
+            if timeline_us >= total_us:
+                set_ph = replace_state.get("_set_playhead")
+                if callable(set_ph):
+                    try:
+                        set_ph(total_us, notify=True, redraw=True)
+                    except Exception:
+                        pass
+                _stop_preview_playback()
+                return
+
+            if preview_state.get("play_mode") == "scrub":
+                procs = preview_state.get("play_audio_procs") or []
+                if not any(p is not None and p.poll() is None for p in procs):
+                    _ensure_scrub_preview_audio(content, timeline_us)
+            elif preview_state.get("play_mode") == "merge":
+                procs = preview_state.get("play_audio_procs") or []
+                if procs and not any(p is not None and p.poll() is None for p in procs):
+                    _stop_preview_playback()
+                    return
+                _refresh_playback_subtitles_throttled(timeline_us)
+
+            if not _playback_tick_still_valid(tick_gen):
+                return
             set_ph = replace_state.get("_set_playhead")
             if callable(set_ph):
                 try:
-                    set_ph(total_us, notify=True, redraw=True)
+                    set_ph(timeline_us, notify=False, redraw=True)
+                except TypeError:
+                    try:
+                        set_ph(timeline_us, notify=False)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-            _stop_preview_playback()
-            return
+            else:
+                replace_state["playhead_us"] = timeline_us
+                preview_state["pending_us"] = timeline_us
 
-        if preview_state.get("play_mode") == "scrub":
-            procs = preview_state.get("play_audio_procs") or []
-            if not any(p is not None and p.poll() is None for p in procs):
-                _ensure_scrub_preview_audio(content, timeline_us)
-        elif preview_state.get("play_mode") == "merge":
-            procs = preview_state.get("play_audio_procs") or []
-            if procs and not any(p is not None and p.poll() is None for p in procs):
-                _stop_preview_playback()
-                return
-            _refresh_playback_subtitles_throttled(timeline_us)
-
-        set_ph = replace_state.get("_set_playhead")
-        if callable(set_ph):
-            try:
-                set_ph(timeline_us, notify=False, redraw=True)
-            except TypeError:
-                try:
-                    set_ph(timeline_us, notify=False)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        else:
-            replace_state["playhead_us"] = timeline_us
-            preview_state["pending_us"] = timeline_us
-
-        _preview_sync_timecode(timeline_us, content)
-        preview_state["play_last_ph_redraw_us"] = timeline_us
-        if preview_state.get("play_mode") == "scrub":
-            _update_playback_preview_frame(content, timeline_us)
-            _refresh_playback_subtitles_throttled(timeline_us)
-            _maybe_warm_scrub_strip(build_scrub_preview_plan(content, timeline_us))
-
-        if _preview_is_playing():
-            preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
+            _preview_sync_timecode(timeline_us, content)
+            preview_state["play_last_ph_redraw_us"] = timeline_us
+            if preview_state.get("play_mode") == "scrub":
+                _update_playback_preview_frame(content, timeline_us)
+                _refresh_playback_subtitles_throttled(timeline_us)
+                _maybe_warm_scrub_strip(build_scrub_preview_plan(content, timeline_us))
+        except Exception:
+            pass
+        finally:
+            if _playback_tick_still_valid(tick_gen):
+                preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
 
     def _can_resume_playback(content: Dict[str, Any], us: int) -> bool:
         """暂停后续播：canvas/缓存仍有效，无需 prime 或重绘。"""
         if not preview_state.get("playback_session_active"):
             return False
+        if _can_resume_merge_preview(int(us)):
+            return True
         if preview_state.get("photo") is None:
             return False
         pause_us = preview_state.get("play_pause_timeline_us")
@@ -12896,7 +13244,7 @@ def run_app() -> None:
             preview_state["play_audio_ready_ma_sec"] = est_ma
             preview_state["play_audio_output_ready"] = True
             _try_sync_scrub_play_start()
-        if preview_state.get("play_wall_t0") is None:
+        if preview_state.get("play_wall_t0") is None and _preview_is_playing():
             _schedule_play_sync_poll()
 
     def _arm_scrub_playback_sync(
@@ -12904,6 +13252,12 @@ def run_app() -> None:
         us: int,
     ) -> None:
         """canvas 已有画面：spawn 音频，等 M-A 就绪后与时间轴一起开 clock。"""
+        if (
+            _preview_is_playing()
+            and preview_state.get("play_mode") == "scrub"
+            and preview_state.get("play_wall_t0") is not None
+        ):
+            return
         us = int(us)
         _cancel_playback_arm()
         preview_state["play_start_us"] = us
@@ -13043,7 +13397,7 @@ def run_app() -> None:
         start_sec = max(0.0, us / 1_000_000.0)
         if not _start_merged_preview_ffplay(start_sec=start_sec, force=True):
             _stop_preview_playback()
-            _preview_show_message("无法播放预览 MP4（请确认预览目录中有同名文件且已安装 ffplay）")
+            _preview_show_message("无法播放预览 MP4（请确认已安装 ffplay，或先拉取云端预览）")
             return
         try:
             preview_info_var.set(f"预览 MP4 · {_fmt_us_as_timecode(us)}")
@@ -13109,6 +13463,7 @@ def run_app() -> None:
         us = int(_current_playhead_us())
         _sync_playhead_for_playback(us)
         _stop_playback_audio()
+        preview_state["play_tick_gen"] = int(preview_state.get("play_tick_gen") or 0) + 1
         preview_state["playing"] = True
         _preview_play_btn_set("⏸")
         preview_state["draft_preview_mp4"] = True
@@ -13128,13 +13483,14 @@ def run_app() -> None:
         us: int,
         *,
         cloud_unavailable: bool = False,
+        prefer_timeline: bool = False,
     ) -> None:
         """草稿时间轴预览（ffmpeg 合成 / 拖动预览链路）。"""
         if not isinstance(content, dict):
             _preview_show_message("（无法预览：草稿未加载或已加密）")
             return
         us = int(_current_playhead_us())
-        draft_mp4 = _draft_preview_mp4_path()
+        draft_mp4 = "" if prefer_timeline else _draft_preview_mp4_path()
         plan = build_scrub_preview_plan(content, us)
         audio_hits = _playback_audio_hits(content, us)
         if not draft_mp4 and not plan.videos and not audio_hits:
@@ -13154,6 +13510,7 @@ def run_app() -> None:
 
         _sync_playhead_for_playback(us)
         _stop_playback_audio()
+        preview_state["play_tick_gen"] = int(preview_state.get("play_tick_gen") or 0) + 1
         preview_state["playing"] = True
         _preview_play_btn_set("⏸")
 
@@ -13207,6 +13564,8 @@ def run_app() -> None:
         if _preview_is_playing():
             _pause_preview_playback()
             return
+        if _try_resume_paused_preview():
+            return
         if left_tab_var.get() == "templates":
             tpl_node = selected_template_node[0]
             if tpl_node is not None and getattr(tpl_node, "has_preview", False):
@@ -13214,12 +13573,13 @@ def run_app() -> None:
                 if not lib_path or not os.path.isfile(str(lib_path)):
                     _begin_hot_template_cloud_preview(tpl_node, autoplay=True)
                     return
-        if preview_state.get("play_mode") == "library":
+        if preview_state.get("play_mode") == "library" and left_tab_var.get() != "drafts":
             path = preview_state.get("library_preview_path")
             if not path or not os.path.isfile(str(path)):
                 return
             pause_us = preview_state.get("play_pause_timeline_us")
             us = int(pause_us if pause_us is not None else 0)
+            preview_state["play_tick_gen"] = int(preview_state.get("play_tick_gen") or 0) + 1
             preview_state["playing"] = True
             preview_state["play_start_us"] = us
             preview_state["play_arm_us"] = us
@@ -13239,28 +13599,70 @@ def run_app() -> None:
         content = timeline_content_cache[0]
         us = _current_playhead_us()
         folder_name = (replace_state.get("timeline_draft_name") or selected_name or "").strip()
-        draft_mp4 = _draft_preview_mp4_path()
-        if not draft_mp4 and folder_name and left_tab_var.get() == "drafts":
+        if left_tab_var.get() == "drafts" and folder_name:
             abs_url = _cloud_preview_abs_url_for_draft(folder_name)
             if abs_url:
-                empty_content: Dict[str, Any] = content if isinstance(content, dict) else {}
                 _fetch_cloud_preview_mp4(
                     abs_url,
-                    cache_key=f"name:{folder_name}",
+                    cache_key=_draft_cloud_preview_cache_key(folder_name),
                     token_key="cloud_preview_draft_name",
                     token_value=folder_name,
                     status_label=f"草稿 · {folder_name}",
-                    on_ready=lambda path, c=empty_content, u=us: _play_draft_preview_mp4(
-                        c, u, mp4_path=path
+                    on_ready=lambda path, fn=folder_name, u=us: _on_draft_cloud_preview_ready(
+                        path, fn, u
                     ),
-                    on_fail=lambda _msg, c=empty_content, u=us: _continue_draft_timeline_preview_playback(
-                        c, u, cloud_unavailable=True
+                    on_fail=lambda msg, fn=folder_name, u=us: _on_draft_cloud_preview_fail(
+                        msg, fn, u
                     ),
                 )
                 return
-        _continue_draft_timeline_preview_playback(content, us)
+            try:
+                preview_info_var.set(f"草稿 · {folder_name} · 无法请求云端预览")
+            except Exception:
+                pass
+        _continue_draft_timeline_preview_playback(
+            _current_timeline_content(), us, prefer_timeline=True
+        )
         return
 
+    def clear_cloud_preview_cache() -> None:
+        from tkinter import messagebox
+
+        from shared.hot_template_client import clear_template_preview_cache, template_preview_cache_dir
+
+        cache_dir = template_preview_cache_dir()
+        if not messagebox.askyesno(
+            "清除预览缓存",
+            f"将删除云端预览的本地缓存：\n{cache_dir}\n\n"
+            "下次按空格/播放预览时会重新从服务器拉取。是否继续？",
+        ):
+            return
+        _cancel_cloud_preview_fetch()
+        count, nbytes = clear_template_preview_cache()
+        if count <= 0:
+            messagebox.showinfo("清除预览缓存", "当前没有可清除的云端预览缓存。")
+            try:
+                preview_info_var.set("云端预览缓存为空")
+            except Exception:
+                pass
+            return
+        mb = nbytes / (1024.0 * 1024.0)
+        size_txt = f"（约 {mb:.1f} MB）" if nbytes > 0 else ""
+        messagebox.showinfo("清除预览缓存", f"已删除 {count} 个缓存文件{size_txt}。")
+        try:
+            preview_info_var.set(f"已清除 {count} 个云端预览缓存{size_txt}")
+        except Exception:
+            pass
+
+    ctk.CTkButton(
+        preview_actions_row,
+        text="清除预览缓存",
+        height=26,
+        font=ctk.CTkFont(size=11),
+        fg_color="transparent",
+        border_width=1,
+        command=clear_cloud_preview_cache,
+    ).pack(anchor="e")
     preview_play_btn = ctk.CTkButton(
         preview_ctrl,
         text="▶",
@@ -13402,6 +13804,23 @@ def run_app() -> None:
 
         return _walk(template_tree_roots)
 
+    def _find_hot_template_node_by_id(template_id: str) -> Any:
+        target = (template_id or "").strip()
+        if not target:
+            return None
+
+        def _walk(nodes: List[Any]) -> Any:
+            for node in nodes:
+                if getattr(node, "is_template", False) and str(node.template_id) == target:
+                    return node
+                if getattr(node, "is_folder", False):
+                    hit = _walk(list(node.children or ()))
+                    if hit is not None:
+                        return hit
+            return None
+
+        return _walk(template_tree_roots)
+
     def _cloud_preview_abs_url_for_draft(folder_name: str) -> str:
         from shared.hot_template_client import (
             build_template_preview_abs_url,
@@ -13411,13 +13830,27 @@ def run_app() -> None:
         if not template_client or not auth_client or not auth_client.user_id:
             return ""
         node = _find_hot_template_node_by_name(folder_name)
+        if node is None and selected_template_id:
+            node = _find_hot_template_node_by_id(str(selected_template_id))
+        if node is None:
+            sel = selected_template_node[0]
+            if sel is not None and getattr(sel, "is_template", False):
+                node = sel
         if node is not None and getattr(node, "has_preview", False) and getattr(node, "preview_url", ""):
             return build_template_preview_abs_url(template_client.base_url, str(node.preview_url))
+        preview_name = folder_name
+        if node is not None and getattr(node, "name", ""):
+            preview_name = str(node.name)
         return build_template_preview_url_by_name(
             template_client.base_url,
             auth_client.user_id,
-            folder_name,
+            preview_name,
         )
+
+    def _draft_cloud_preview_cache_key(folder_name: str) -> str:
+        if selected_template_id:
+            return f"id:{selected_template_id}"
+        return f"name:{folder_name}"
 
     def _fetch_cloud_preview_mp4(
         abs_url: str,
@@ -13432,6 +13865,11 @@ def run_app() -> None:
         from shared.hot_template_client import fetch_template_preview_mp4, template_preview_cache_path
 
         if preview_state.get("cloud_preview_fetch_busy"):
+            _preview_show_message("（正在拉取云端预览…）")
+            try:
+                preview_info_var.set(f"{status_label} · 拉取预览中…")
+            except Exception:
+                pass
             return
         if not abs_url:
             msg = "暂无预览"
@@ -13440,6 +13878,7 @@ def run_app() -> None:
                 on_fail(msg)
             return
         cache_path = str(template_preview_cache_path(cache_key))
+        use_cache = os.path.isfile(cache_path) and os.path.getsize(cache_path) > 1024
         load_gen = int(preview_state.get("cloud_preview_fetch_gen") or 0) + 1
         preview_state["cloud_preview_fetch_gen"] = load_gen
         preview_state["cloud_preview_fetch_busy"] = True
@@ -13449,14 +13888,33 @@ def run_app() -> None:
             preview_info_var.set(f"{status_label} · 拉取预览中…")
         except Exception:
             pass
+        progress_dlg: Optional[_DraftImportProgressDialog] = None
+        if use_cache:
+            try:
+                preview_info_var.set(f"{status_label} · 使用本地缓存…")
+            except Exception:
+                pass
+        else:
+            progress_dlg = _DraftImportProgressDialog(root, title=f"拉取预览 · {status_label}")
+            progress_dlg.update(0.0, "正在连接…")
+        try:
+            root.update_idletasks()
+        except tk.TclError:
+            pass
+
+        def _report_download(ratio: Optional[float], message: str) -> None:
+            if progress_dlg is not None:
+                progress_dlg.update(ratio, message)
 
         def _bg() -> None:
             ok = False
             err: Optional[str] = None
-            if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 1024:
+            if use_cache:
                 ok = True
             else:
-                ok, err = fetch_template_preview_mp4(abs_url, cache_path)
+                ok, err = fetch_template_preview_mp4(
+                    abs_url, cache_path, on_progress=_report_download
+                )
                 if not ok and err == "暂无预览" and os.path.isfile(cache_path):
                     try:
                         os.remove(cache_path)
@@ -13464,6 +13922,8 @@ def run_app() -> None:
                         pass
 
             def _ui() -> None:
+                if progress_dlg is not None:
+                    progress_dlg.close()
                 preview_state["cloud_preview_fetch_busy"] = False
                 if load_gen != int(preview_state.get("cloud_preview_fetch_gen") or 0):
                     return
@@ -13489,9 +13949,14 @@ def run_app() -> None:
                     _preview_show_message("（预览播放失败）")
 
             try:
-                root.after(0, _ui)
+                root.after(1, _ui)
             except tk.TclError:
                 preview_state["cloud_preview_fetch_busy"] = False
+                if progress_dlg is not None:
+                    try:
+                        progress_dlg.close()
+                    except Exception:
+                        pass
 
         threading.Thread(target=_bg, daemon=True, name="cloud-preview-fetch").start()
 
@@ -13785,7 +14250,11 @@ def run_app() -> None:
             root.update_idletasks()
         except tk.TclError:
             pass
+        if gen != int(preview_state.get("play_prime_gen", -1)):
+            return
         _mark_playback_prime_ready()
+        if preview_state.get("play_wall_t0") is not None:
+            return
         _arm_scrub_playback_sync(content, us)
 
     def _queue_preview_apply(
@@ -14043,6 +14512,13 @@ def run_app() -> None:
         if _preview_is_playing():
             _preview_sync_time_only(us)
             return
+        if (
+            not _preview_is_scrubbing()
+            and preview_state.get("playback_session_active")
+            and not _playback_seeked_since_pause(us)
+        ):
+            _preview_sync_time_only(us)
+            return
         elif _preview_is_scrubbing():
             _preview_sync_time_only(us)
             _interrupt_warm_for_scrub()
@@ -14071,6 +14547,7 @@ def run_app() -> None:
 
     def _prepare_preview_for_draft_load(content: Optional[Dict[str, Any]]) -> None:
         """切换草稿：清空旧画面并拉取新稿 timeline 0 的首帧。"""
+        _stop_preview_playback()
         preview_state["scrub_busy"] = False
         preview_state["ui_apply_pending"] = None
         preview_state["ui_apply_scheduled"] = False
@@ -14091,6 +14568,7 @@ def run_app() -> None:
             return
         _preview_show_message("（加载预览…）")
         on_playhead_changed(0)
+        _maybe_resume_pending_timeline_preview()
 
     replace_state["_on_playhead_change"] = on_playhead_changed
     replace_state["_on_playhead_scrub_begin"] = _on_playhead_scrub_begin
@@ -14691,7 +15169,10 @@ def run_app() -> None:
         main.pack(side="top", fill="both", expand=True, padx=16)
 
         if batch_mode:
-            head = (track_summary or f"[{ref.track_type}] {ref.track_name}").strip()
+            head = (
+                track_summary
+                or f"[{_track_type_zh(ref.track_type)}] {ref.track_name}"
+            ).strip()
             ctk.CTkLabel(
                 main,
                 text=head,
@@ -16368,7 +16849,7 @@ def run_app() -> None:
                     container,
                     node.name,
                     row_kind="template",
-                    on_click=lambda n=node: select_template_node(n),
+                    on_click=lambda n=node: download_template_node(n),
                     wraplength=wrap,
                     subtitle=subtitle,
                 )
@@ -16384,9 +16865,12 @@ def run_app() -> None:
         if node is None:
             messagebox.showinfo("下载模板", "请先在左侧列表中选择一个模板。")
             return
-        if template_download_busy["on"]:
-            return
         if not getattr(node, "is_template", False) or getattr(node, "node_type", "") != "template":
+            return
+        selected_template_node[0] = node
+        selected_template_id = node.template_id
+        highlight_template_selection()
+        if template_download_busy["on"]:
             return
         if not template_client or not auth_client or not auth_client.user_id:
             messagebox.showwarning("下载模板", "请先登录。")
@@ -16503,50 +16987,8 @@ def run_app() -> None:
 
         threading.Thread(target=_bg, daemon=True, name="hot-template-download").start()
 
-    def set_path(p: str) -> None:
-        nonlocal draft_root
-        p = (p or "").strip()
-        draft_root.set(p)
-        path_entry.delete(0, "end")
-        path_entry.insert(0, p)
-        if p:
-            try:
-                save_draft_root_preference(p)
-            except OSError:
-                pass
-        _invalidate_draft_list_scan_cache()
-        refresh_list()
-        refresh_export_pool_preset_bar(reset_memory=True)
-
-    def choose_folder() -> None:
-        from tkinter import filedialog
-
-        p = filedialog.askdirectory(title="选择剪映草稿根目录")
-        if p:
-            set_path(p)
-
-    def set_preview_mp4_dir(p: str) -> None:
-        p = (p or "").strip()
-        preview_mp4_dir.set(p)
-        preview_mp4_entry.delete(0, "end")
-        preview_mp4_entry.insert(0, p)
-        if p:
-            try:
-                save_preview_mp4_dir_preference(p)
-            except OSError:
-                pass
-
-    def choose_preview_mp4_dir() -> None:
-        from tkinter import filedialog
-
-        initial = preview_mp4_dir.get().strip() or _DEFAULT_PREVIEW_MP4_DIR
-        p = filedialog.askdirectory(title="选择预览 MP4 目录", initialdir=initial)
-        if p:
-            set_preview_mp4_dir(p)
-
     btn_row = ctk.CTkFrame(draft_panel, fg_color="transparent")
     btn_row.pack(fill="x", padx=12, pady=(0, 8))
-    ctk.CTkButton(btn_row, text="浏览…", width=100, command=choose_folder).pack(side="left", padx=(0, 8))
     ctk.CTkButton(
         btn_row,
         text="刷新",
@@ -16555,13 +16997,6 @@ def run_app() -> None:
         border_width=1,
         command=lambda: (_invalidate_draft_list_scan_cache(), refresh_list()),
     ).pack(side="left")
-
-    ctk.CTkButton(
-        preview_mp4_entry_row,
-        text="浏览…",
-        width=72,
-        command=choose_preview_mp4_dir,
-    ).pack(side="right")
 
     btn_row2 = ctk.CTkFrame(draft_panel, fg_color="transparent")
     btn_row2.pack(fill="x", padx=12, pady=(0, 8))
@@ -16592,7 +17027,7 @@ def run_app() -> None:
 
         base = draft_root.get().strip()
         if not base or not os.path.isdir(base):
-            messagebox.showerror("无法生成", "请先通过「浏览…」选择有效的剪映草稿根目录（com.lveditor.draft）。")
+            messagebox.showerror("无法生成", "请先配置有效的剪映草稿根目录（com.lveditor.draft）。")
             return
 
         missing = check_tutorial_assets()
@@ -16741,6 +17176,9 @@ def run_app() -> None:
 
     def show_draft(folder_name: str) -> None:
         nonlocal selected_name
+        prev_folder = (replace_state.get("timeline_draft_name") or "").strip()
+        if prev_folder != (folder_name or "").strip():
+            _cancel_cloud_preview_fetch()
         selected_name = folder_name
         highlight_selection()
         base = draft_root.get().strip()
@@ -17114,42 +17552,6 @@ def run_app() -> None:
         command=_draft_tree_collapse_all,
     ).pack(side="left")
 
-    def _commit_path_entry(_event: Any = None) -> None:
-        """路径框手动修改后失焦或按回车时同步到 StringVar 并写入本地偏好。"""
-        p = path_entry.get().strip()
-        if p == (draft_root.get() or "").strip():
-            return
-        draft_root.set(p)
-        if p:
-            try:
-                save_draft_root_preference(p)
-            except OSError:
-                pass
-        _invalidate_draft_list_scan_cache()
-        refresh_list()
-        refresh_export_pool_preset_bar(reset_memory=True)
-
-    def _commit_preview_mp4_dir_entry(_event: Any = None) -> None:
-        p = preview_mp4_entry.get().strip()
-        if p == (preview_mp4_dir.get() or "").strip():
-            return
-        preview_mp4_dir.set(p)
-        if p:
-            try:
-                save_preview_mp4_dir_preference(p)
-            except OSError:
-                pass
-
-    path_entry.bind("<Return>", lambda _e: _commit_path_entry())
-    path_entry.bind("<FocusOut>", lambda _e: _commit_path_entry())
-    preview_mp4_entry.bind("<Return>", lambda _e: _commit_preview_mp4_dir_entry())
-    preview_mp4_entry.bind("<FocusOut>", lambda _e: _commit_preview_mp4_dir_entry())
-
-    # init path
-    if draft_root.get():
-        path_entry.insert(0, draft_root.get())
-    if preview_mp4_dir.get():
-        preview_mp4_entry.insert(0, preview_mp4_dir.get())
     refresh_list()
     refresh_export_pool_preset_bar(reset_memory=True)
 

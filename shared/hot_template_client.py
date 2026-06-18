@@ -136,9 +136,30 @@ def build_template_preview_url_by_name(base_url: str, user_id: Any, template_nam
 
 def template_preview_cache_path(cache_key: str) -> Path:
     digest = hashlib.sha256(_as_str(cache_key).encode("utf-8")).hexdigest()[:20]
-    d = Path(os.environ.get("TEMP") or ".") / "jy_template_preview_cache"
+    d = template_preview_cache_dir()
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{digest}.mp4"
+
+
+def template_preview_cache_dir() -> Path:
+    return Path(os.environ.get("TEMP") or ".") / "jy_template_preview_cache"
+
+
+def clear_template_preview_cache() -> Tuple[int, int]:
+    """删除云端预览 MP4 本地缓存。返回 (文件数, 释放字节数)。"""
+    d = template_preview_cache_dir()
+    if not d.is_dir():
+        return 0, 0
+    count = 0
+    nbytes = 0
+    for f in d.glob("*.mp4"):
+        try:
+            nbytes += int(f.stat().st_size)
+            f.unlink()
+            count += 1
+        except OSError:
+            pass
+    return count, nbytes
 
 
 def fetch_template_preview_mp4(
@@ -146,8 +167,14 @@ def fetch_template_preview_mp4(
     dest_path: str,
     *,
     timeout: float = 120.0,
+    on_progress: Optional[ImportProgressCallback] = None,
 ) -> Tuple[bool, Optional[str]]:
     """GET 预览 MP4 流并写入本地文件。404 或空内容返回 (False, message)。"""
+
+    def report(ratio: Optional[float], message: str) -> None:
+        if on_progress is not None:
+            on_progress(ratio, message)
+
     if requests is None:
         return False, "需要安装 requests：pip install requests"
     url = _as_str(abs_url)
@@ -166,19 +193,37 @@ def fetch_template_preview_mp4(
             if ct and "json" in ct:
                 err = _json_error_from_response(response, default="预览加载失败")
                 return False, err or "预览加载失败"
-            total = 0
+            total_bytes: Optional[int] = None
+            cl = response.headers.get("Content-Length")
+            if cl:
+                try:
+                    total_bytes = max(0, int(cl))
+                except (TypeError, ValueError):
+                    total_bytes = None
+            downloaded = 0
+            report(0.0, "正在下载预览…" if total_bytes else "正在下载预览…")
             with open(dest_path, "wb") as out:
                 for chunk in response.iter_content(chunk_size=65536):
                     if not chunk:
                         continue
-                    if total == 0 and chunk[:1] == b"{":
+                    if downloaded == 0 and chunk[:1] == b"{":
                         err = _json_error_from_bytes(chunk[:8192], default="预览加载失败")
                         if err:
                             return False, err
                     out.write(chunk)
-                    total += len(chunk)
-            if total <= 0:
+                    downloaded += len(chunk)
+                    if total_bytes and total_bytes > 0:
+                        pct = min(100, int(downloaded * 100 / total_bytes))
+                        report(
+                            min(1.0, downloaded / total_bytes),
+                            f"正在下载预览… {pct}%（{_fmt_byte_count(downloaded)} / {_fmt_byte_count(total_bytes)}）",
+                        )
+                    else:
+                        report(None, f"正在下载预览… {_fmt_byte_count(downloaded)}")
+            if downloaded <= 0:
                 return False, "暂无预览"
+            if total_bytes and total_bytes > 0:
+                report(1.0, f"下载完成（{_fmt_byte_count(downloaded)}）")
     except requests.RequestException as exc:
         return False, f"预览加载失败：{exc}"
     except OSError as exc:
