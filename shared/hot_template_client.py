@@ -3,6 +3,7 @@
 爆款模板 — 两层目录：folder（分类）→ template（可下载文件夹）。
 
 列表: GET /api/hot_templates?user_id=...
+预览: GET {BaseURL}{preview_url}  → video/mp4 流（列表节点 has_preview + preview_url）
 下载: GET /api/hot_templates/download?user_id=...&template_id=...  → application/zip
 """
 from __future__ import annotations
@@ -34,6 +35,8 @@ class HotTemplateNode:
     name: str
     node_type: str  # folder | template
     updated_at: str = ""
+    has_preview: bool = False
+    preview_url: str = ""
     children: Tuple["HotTemplateNode", ...] = ()
 
     @property
@@ -75,6 +78,8 @@ def _parse_template_node(row: Any) -> Optional[HotTemplateNode]:
         name=name or tid,
         node_type=ntype,
         updated_at=_as_str(row.get("updated_at") or row.get("update_time")) if ntype == "template" else "",
+        has_preview=bool(row.get("has_preview")) if ntype == "template" else False,
+        preview_url=_as_str(row.get("preview_url")) if ntype == "template" else "",
         children=children,
     )
 
@@ -100,6 +105,85 @@ def count_hot_templates(nodes: Iterable[HotTemplateNode]) -> int:
             n += 1
         n += count_hot_templates(node.children)
     return n
+
+
+def build_template_preview_abs_url(base_url: str, preview_url: str) -> str:
+    """拼接云端预览地址：BaseURL + preview_url，不做二次 URL 编码。"""
+    rel = _as_str(preview_url)
+    if not rel:
+        return ""
+    if rel.startswith("http://") or rel.startswith("https://"):
+        return rel
+    base = _as_str(base_url).rstrip("/")
+    if not base:
+        return rel if rel.startswith("/") else f"/{rel}"
+    if not rel.startswith("/"):
+        rel = f"/{rel}"
+    return f"{base}{rel}"
+
+
+def build_template_preview_url_by_name(base_url: str, user_id: Any, template_name: str) -> str:
+    """按模板名请求预览流：/api/hot_templates/preview?user_id=...&name=..."""
+    from urllib.parse import quote
+
+    base = _as_str(base_url).rstrip("/")
+    uid = quote(_as_str(user_id), safe="")
+    nm = quote(_as_str(template_name), safe="")
+    if not base or not uid or not nm:
+        return ""
+    return f"{base}/api/hot_templates/preview?user_id={uid}&name={nm}"
+
+
+def template_preview_cache_path(cache_key: str) -> Path:
+    digest = hashlib.sha256(_as_str(cache_key).encode("utf-8")).hexdigest()[:20]
+    d = Path(os.environ.get("TEMP") or ".") / "jy_template_preview_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{digest}.mp4"
+
+
+def fetch_template_preview_mp4(
+    abs_url: str,
+    dest_path: str,
+    *,
+    timeout: float = 120.0,
+) -> Tuple[bool, Optional[str]]:
+    """GET 预览 MP4 流并写入本地文件。404 或空内容返回 (False, message)。"""
+    if requests is None:
+        return False, "需要安装 requests：pip install requests"
+    url = _as_str(abs_url)
+    if not url:
+        return False, "缺少预览地址"
+    try:
+        with requests.get(url, stream=True, timeout=timeout) as response:
+            if response.status_code == 404:
+                return False, "暂无预览"
+            if response.status_code != 200:
+                err = _json_error_from_response(response, default="预览加载失败")
+                if err:
+                    return False, err
+                return False, f"预览加载失败（HTTP {response.status_code}）"
+            ct = _as_str(response.headers.get("Content-Type")).lower()
+            if ct and "json" in ct:
+                err = _json_error_from_response(response, default="预览加载失败")
+                return False, err or "预览加载失败"
+            total = 0
+            with open(dest_path, "wb") as out:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    if total == 0 and chunk[:1] == b"{":
+                        err = _json_error_from_bytes(chunk[:8192], default="预览加载失败")
+                        if err:
+                            return False, err
+                    out.write(chunk)
+                    total += len(chunk)
+            if total <= 0:
+                return False, "暂无预览"
+    except requests.RequestException as exc:
+        return False, f"预览加载失败：{exc}"
+    except OSError as exc:
+        return False, f"保存预览失败：{exc}"
+    return True, None
 
 
 def _response_error_message(data: Any, *, default: str) -> str:

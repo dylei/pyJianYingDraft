@@ -5983,6 +5983,91 @@ def _segment_speed(seg: Dict[str, Any]) -> float:
     return max(0.1, min(10.0, spd))
 
 
+_PREVIEW_VIDEO_MIN_ALPHA = 0.01  # 通用：clip.alpha < 1% 时视为不可见
+SCRUB_PREVIEW_MIN_ALPHA = 0.10  # 拖动抽帧：跳过 alpha < 10% 的最上层，用下层可见视频
+
+
+def _interpolate_segment_keyframe_value(
+    seg: Dict[str, Any],
+    property_type: str,
+    seg_offset_us: int,
+    default: float,
+) -> float:
+    """在片段内时间偏移处线性插值关键帧；无关键帧则返回 default。"""
+    kfs = seg.get("common_keyframes")
+    if not isinstance(kfs, list):
+        return default
+    keyframes: List[Tuple[int, float]] = []
+    for kf_list in kfs:
+        if not isinstance(kf_list, dict):
+            continue
+        if str(kf_list.get("property_type") or "") != property_type:
+            continue
+        raw_kfs = kf_list.get("keyframe_list") or kf_list.get("keyframes") or []
+        if not isinstance(raw_kfs, list):
+            continue
+        for kf in raw_kfs:
+            if not isinstance(kf, dict):
+                continue
+            try:
+                t = int(kf.get("time_offset", 0))
+            except (TypeError, ValueError):
+                continue
+            vals = kf.get("values")
+            if not isinstance(vals, list) or not vals:
+                continue
+            try:
+                v = float(vals[0])
+            except (TypeError, ValueError):
+                continue
+            keyframes.append((t, v))
+    if not keyframes:
+        return default
+    keyframes.sort(key=lambda x: x[0])
+    off = max(0, int(seg_offset_us))
+    if off <= keyframes[0][0]:
+        return keyframes[0][1]
+    if off >= keyframes[-1][0]:
+        return keyframes[-1][1]
+    for i in range(len(keyframes) - 1):
+        t0, v0 = keyframes[i]
+        t1, v1 = keyframes[i + 1]
+        if t0 <= off <= t1:
+            if t1 <= t0:
+                return v1
+            ratio = (off - t0) / (t1 - t0)
+            return v0 + (v1 - v0) * ratio
+    return default
+
+
+def _segment_clip_alpha(seg: Dict[str, Any], playhead_us: int) -> float:
+    """视频片段不透明度 0~1（seg.clip.alpha + KFTypeAlpha 关键帧）。"""
+    clip = seg.get("clip")
+    base = 1.0
+    if isinstance(clip, dict):
+        try:
+            base = float(clip.get("alpha", 1.0))
+        except (TypeError, ValueError):
+            base = 1.0
+    trng = seg.get("target_timerange") or {}
+    try:
+        st = int(trng.get("start", 0))
+    except (TypeError, ValueError):
+        st = 0
+    seg_offset_us = max(0, int(playhead_us) - st)
+    alpha = _interpolate_segment_keyframe_value(seg, "KFTypeAlpha", seg_offset_us, base)
+    return max(0.0, min(1.0, float(alpha)))
+
+
+def _segment_video_visible_at_playhead(
+    seg: Dict[str, Any],
+    playhead_us: int,
+    *,
+    min_alpha: float = _PREVIEW_VIDEO_MIN_ALPHA,
+) -> bool:
+    return _segment_clip_alpha(seg, playhead_us) >= float(min_alpha)
+
+
 def _segment_audio_playback_rate(seg: Dict[str, Any]) -> float:
     """源素材秒 / 时间轴秒，与 _segment_source_us_at_playhead 映射一致。"""
     trng = seg.get("target_timerange") or {}
@@ -6093,7 +6178,12 @@ def _text_layer_from_segment(seg: Dict[str, Any], mat: Dict[str, Any]) -> Option
     return PreviewTextLayer(text=text, font_size=font_size, color=color, render_index=render_index)
 
 
-def build_preview_plan(content: Dict[str, Any], playhead_us: int) -> PreviewPlan:
+def build_preview_plan(
+    content: Dict[str, Any],
+    playhead_us: int,
+    *,
+    min_video_alpha: float = _PREVIEW_VIDEO_MIN_ALPHA,
+) -> PreviewPlan:
     """预览（只读）：收集时间轴 T 上的 video/text/sticker，供画面与字幕叠加。"""
     tracks_raw = list(content.get("tracks") or [])
     materials = content.get("materials") if isinstance(content.get("materials"), dict) else {}
@@ -6113,6 +6203,8 @@ def build_preview_plan(content: Dict[str, Any], playhead_us: int) -> PreviewPlan
             if _segment_source_us_at_playhead(seg, ph) is None:
                 continue
             if ttype == "video":
+                if not _segment_video_visible_at_playhead(seg, ph, min_alpha=min_video_alpha):
+                    continue
                 path = _local_media_path_for_segment(seg, materials)
                 if not path or not os.path.isfile(path):
                     continue
@@ -6161,12 +6253,22 @@ def build_preview_plan(content: Dict[str, Any], playhead_us: int) -> PreviewPlan
     )
 
 
-def find_video_at_playhead(content: Dict[str, Any], playhead_us: int) -> Optional[VideoPlayheadHit]:
-    """按 render_index 从高到低找当前时间最前景的视频片段。"""
-    plan = build_preview_plan(content, playhead_us)
+def build_scrub_preview_plan(content: Dict[str, Any], playhead_us: int) -> PreviewPlan:
+    """拖动/播放抽帧用预览计划：跳过 alpha < 10% 的视频层。"""
+    return build_preview_plan(content, playhead_us, min_video_alpha=SCRUB_PREVIEW_MIN_ALPHA)
+
+
+def _scrub_preview_top_layer(plan: PreviewPlan) -> Optional[PreviewVideoLayer]:
     if not plan.videos:
         return None
-    top = plan.videos[-1]
+    return plan.videos[-1]
+
+
+def find_video_at_playhead(content: Dict[str, Any], playhead_us: int) -> Optional[VideoPlayheadHit]:
+    """按 render_index 从高到低找当前时间最前景的视频片段（拖动抽帧阈值）。"""
+    top = _scrub_preview_top_layer(build_scrub_preview_plan(content, playhead_us))
+    if top is None:
+        return None
     return VideoPlayheadHit(path=top.path, source_us=top.source_us, seg_label=top.label)
 
 
@@ -6929,6 +7031,8 @@ def _find_top_video_seg_at(content: Dict[str, Any], playhead_us: int) -> Optiona
             if not isinstance(seg, dict):
                 continue
             if _segment_source_us_at_playhead(seg, ph) is None:
+                continue
+            if not _segment_video_visible_at_playhead(seg, ph):
                 continue
             try:
                 ri = int(seg.get("render_index", 0))
@@ -7855,10 +7959,10 @@ class _PlaybackVideoWorker:
         gen: int,
     ) -> Optional[PreviewPlan]:
         step_us = max(1, int(1_000_000.0 / fps))
-        plan = build_preview_plan(content, max(0, int(timeline_us)))
-        if not plan.videos:
+        plan = build_scrub_preview_plan(content, max(0, int(timeline_us)))
+        top = _scrub_preview_top_layer(plan)
+        if top is None:
             return None
-        top = plan.videos[-1]
         self._reader.sync_layer(top, fps=fps, step_us=step_us, force_seek=True)
         ppm = self._reader.read_ppm()
         if ppm:
@@ -7894,11 +7998,11 @@ class _PlaybackVideoWorker:
                     if delay > 0:
                         stop_ev.wait(min(delay, 0.04))
                     continue
-                plan = build_preview_plan(content, timeline_us)
-                if not plan.videos:
+                plan = build_scrub_preview_plan(content, timeline_us)
+                top = _scrub_preview_top_layer(plan)
+                if top is None:
                     stop_ev.wait(0.02)
                     continue
-                top = plan.videos[-1]
                 self._reader.sync_layer(top, fps=fps, step_us=step_us, force_seek=True)
                 ppm = self._reader.read_ppm()
                 if ppm:
@@ -8183,10 +8287,10 @@ def start_preview_thumbnail_warm(content: Optional[Dict[str, Any]], cache: _Thum
 
 def start_preview_foreground_warm_on_load(content: Dict[str, Any], cache: _ThumbnailStripCache) -> None:
     """草稿加载后预热前景视频缩略图条（拖动预览主要依赖此缓存）。"""
-    plan = build_preview_plan(content, 0)
-    if not plan.videos:
+    plan = build_scrub_preview_plan(content, 0)
+    top = _scrub_preview_top_layer(plan)
+    if top is None:
         return
-    top = plan.videos[-1]
     total_sec = max(8.0, _timeline_end_us(content) / 1_000_000.0)
     duration_sec = min(PREVIEW_WARM_INITIAL_SEC, total_sec)
     _start_warm_path(top.path, cache, start_sec=0.0, duration_sec=duration_sec)
@@ -8204,9 +8308,9 @@ def warm_preview_strip_near_plan(
     window_sec: float = PREVIEW_WARM_SCRUB_FOLLOW_SEC,
 ) -> None:
     """拖动时在播放头附近按需补预热缩略图条。"""
-    if not plan.videos:
+    top = _scrub_preview_top_layer(plan)
+    if top is None:
         return
-    top = plan.videos[-1]
     if cache.has_bucket(top.path, top.source_us):
         return
     half = max(4.0, float(window_sec)) / 2.0
@@ -8217,9 +8321,9 @@ def warm_preview_strip_near_plan(
 
 def warm_preview_for_plan(plan: PreviewPlan, cache: _ThumbnailStripCache) -> None:
     """仅预热最前景视频层（与预览显示一致）。"""
-    if not plan.videos:
+    top = _scrub_preview_top_layer(plan)
+    if top is None:
         return
-    top = plan.videos[-1]
     if cache.has_bucket(top.path, top.source_us):
         return
     half = PREVIEW_WARM_WINDOW_SEC / 2.0
@@ -8234,7 +8338,7 @@ def warm_preview_near_playhead(
     playhead_us: int,
 ) -> None:
     """空闲时在播放头附近补预热。"""
-    warm_preview_for_plan(build_preview_plan(content, playhead_us), cache)
+    warm_preview_for_plan(build_scrub_preview_plan(content, playhead_us), cache)
 
 
 def warm_preview_play_ahead(
@@ -8243,10 +8347,10 @@ def warm_preview_play_ahead(
     cache: _ThumbnailStripCache,
 ) -> None:
     """点击播放时从当前播放头向前预热缩略图条，减少暂停再继续时的取帧空窗。"""
-    plan = build_preview_plan(content, int(playhead_us))
-    if not plan.videos:
+    plan = build_scrub_preview_plan(content, int(playhead_us))
+    top = _scrub_preview_top_layer(plan)
+    if top is None:
         return
-    top = plan.videos[-1]
     center_sec = max(0.0, top.source_us / 1_000_000.0)
     start_sec = max(0.0, center_sec - 1.0)
     _start_warm_path(
@@ -8258,9 +8362,9 @@ def warm_preview_play_ahead(
 
 
 def preview_thumb_bucket_key(plan: PreviewPlan) -> Optional[Tuple[str, int]]:
-    if not plan.videos:
+    top = _scrub_preview_top_layer(plan)
+    if top is None:
         return None
-    top = plan.videos[-1]
     bucket = int(top.source_us // SCRUB_THUMB_STEP_US) * SCRUB_THUMB_STEP_US
     return (os.path.abspath(top.path), bucket)
 
@@ -8293,9 +8397,9 @@ def fetch_instant_scrub_frame(
     exact: bool = False,
 ) -> Optional[bytes]:
     """拖动时从缩略图条取帧；exact=True 时仅当当前 bucket 已预热（播放起跑用）。"""
-    if not plan.videos:
+    top = _scrub_preview_top_layer(plan)
+    if top is None:
         return None
-    top = plan.videos[-1]
     if exact and not thumb_cache.has_bucket(top.path, top.source_us):
         return None
     return thumb_cache.nearest(top.path, top.source_us)
@@ -8307,9 +8411,9 @@ def fetch_play_start_preview_frame(
     frame_cache: _PreviewFrameCache,
 ) -> Optional[bytes]:
     """播放起跑画面：与首次从 t=0 播放相同标准——精确帧或已预热的当前 bucket，不用 distant nearest。"""
-    if not plan.videos:
+    top = _scrub_preview_top_layer(plan)
+    if top is None:
         return None
-    top = plan.videos[-1]
     hit = frame_cache.get(top.path, top.source_us)
     if hit:
         return hit
@@ -8326,9 +8430,9 @@ def fetch_scrub_frame_fast(
     skip_cache: bool = False,
 ) -> Optional[bytes]:
     """单帧预览：混合 seek（与音频 atrim 同精度），避免 -ss 在 -i 前落到关键帧/片段头。"""
-    if not plan.videos:
+    layer = _scrub_preview_top_layer(plan)
+    if layer is None:
         return None
-    layer = plan.videos[-1]
     ff = find_ffmpeg()
     if not ff or not os.path.isfile(layer.path):
         return None
@@ -8379,10 +8483,10 @@ def prefetch_playback_ahead_frames(
         return
     for step in range(1, max(1, int(steps)) + 1):
         t_us = min(int(start_us) + step * SCRUB_THUMB_STEP_US, max(0, total_us - 1))
-        plan = build_preview_plan(content, t_us)
-        if not plan.videos:
+        plan = build_scrub_preview_plan(content, t_us)
+        top = _scrub_preview_top_layer(plan)
+        if top is None:
             break
-        top = plan.videos[-1]
         if frame_cache.get(top.path, top.source_us):
             continue
         fetch_scrub_frame_fast(plan, frame_cache=frame_cache)
@@ -10228,6 +10332,7 @@ def run_app() -> None:
     expanded_template_folders: set[str] = set()
     template_tree_roots: List[Any] = []
     selected_template_id: Optional[str] = None
+    selected_template_node: List[Any] = [None]
 
     def _redraw_template_list_scroll(*, reset_scroll: bool = False) -> None:
         try:
@@ -10291,6 +10396,10 @@ def run_app() -> None:
         lines = [f"模板：{node.name}", f"ID：{node.template_id}"]
         if node.updated_at:
             lines.append(f"更新：{node.updated_at}")
+        if getattr(node, "has_preview", False) and getattr(node, "preview_url", ""):
+            lines.append("预览：云端 MP4（选中后在右侧播放器查看）")
+        else:
+            lines.append("预览：暂无预览")
         base = draft_root.get().strip()
         local_folder: Optional[str] = None
         if base and os.path.isdir(base):
@@ -10304,10 +10413,9 @@ def run_app() -> None:
         if local_folder:
             lines.append(f"本地草稿：{local_folder}")
         lines.extend(["", "请先在「草稿箱」中设置草稿根目录（com.lveditor.draft）。"])
+        lines.append("点「下载模板」将 ZIP 解压到剪映草稿根目录。")
         if local_folder:
-            lines.append("点击后将询问是否重新下载；选「否」直接打开已有草稿。")
-        else:
-            lines.append("点击后将下载 ZIP 并解压到剪映草稿根目录。")
+            lines.append("若已下载过，可选择重新下载或直接打开本地草稿。")
         _detail_set("\n".join(lines))
         refresh_timeline_panel_data(None)
 
@@ -10345,6 +10453,8 @@ def run_app() -> None:
                 n_tpl = count_hot_templates(template_tree_roots)
                 template_status_var.set(f"共 {n_tpl} 个可下载模板")
                 render_hot_template_tree(template_tree_roots, indent=0)
+        if selected_template_node[0] is not None:
+            highlight_template_selection()
         _redraw_template_list_scroll(reset_scroll=reset_scroll)
 
     def _collect_template_branch_ids(nodes: List[Any]) -> set[str]:
@@ -10885,6 +10995,13 @@ def run_app() -> None:
     template_collapse_btn.pack(side="right", padx=(6, 0))
     ctk.CTkButton(
         template_toolbar,
+        text="下载模板",
+        width=80,
+        height=28,
+        command=lambda: download_template_node(selected_template_node[0]),
+    ).pack(side="right", padx=(6, 0))
+    ctk.CTkButton(
+        template_toolbar,
         text="刷新",
         width=72,
         height=28,
@@ -11346,7 +11463,16 @@ def run_app() -> None:
 
     def _draft_preview_mp4_path() -> str:
         folder_name = (replace_state.get("timeline_draft_name") or "").strip()
-        return _find_draft_preview_mp4(folder_name, preview_mp4_dir.get().strip())
+        local = _find_draft_preview_mp4(folder_name, preview_mp4_dir.get().strip())
+        if local:
+            return local
+        if folder_name:
+            from shared.hot_template_client import template_preview_cache_path
+
+            cached = str(template_preview_cache_path(f"name:{folder_name}"))
+            if os.path.isfile(cached) and os.path.getsize(cached) > 1024:
+                return cached
+        return ""
 
     def _playback_end_us(content: Dict[str, Any]) -> int:
         """预览播放结束位置：外部同名 MP4 以文件时长为准，否则用草稿时间轴总长。"""
@@ -11626,7 +11752,7 @@ def run_app() -> None:
         content = timeline_content_cache[0]
         if not isinstance(content, dict):
             return True
-        plan = build_preview_plan(content, int(playhead_us))
+        plan = build_scrub_preview_plan(content, int(playhead_us))
         if plan.videos and preview_state.get("photo") is None:
             return False
         display = preview_state.get("play_display_us")
@@ -12130,6 +12256,8 @@ def run_app() -> None:
         preview_state["audio_prefetch_gen"] = int(preview_state.get("audio_prefetch_gen") or 0) + 1
         preview_state["audio_chunk_t0_us"] = None
         preview_state["audio_chunk_end_us"] = None
+        preview_state["cloud_preview_fetch_busy"] = False
+        preview_state["cloud_preview_fetch_gen"] = int(preview_state.get("cloud_preview_fetch_gen") or 0) + 1
         _preview_play_btn_set("▶")
 
     def _refresh_playback_subtitles(timeline_us: int) -> None:
@@ -12166,7 +12294,7 @@ def run_app() -> None:
 
     def _update_playback_preview_frame(content: Dict[str, Any], timeline_us: int) -> None:
         """播放中仅在新缩略图 bucket 时换帧，避免每 tick 触发 notify/ffmpeg。"""
-        plan = build_preview_plan(content, int(timeline_us))
+        plan = build_scrub_preview_plan(content, int(timeline_us))
         if not plan.videos:
             return
         bucket_key = preview_thumb_bucket_key(plan)
@@ -12469,7 +12597,7 @@ def run_app() -> None:
     def _start_playback_preview_prime(content: Dict[str, Any], playhead_us: int) -> None:
         """播放起跑：当前播放头精确画面就绪后再 spawn 音频、arm 时钟。"""
         us = int(playhead_us)
-        plan = build_preview_plan(content, us)
+        plan = build_scrub_preview_plan(content, us)
         prime_gen = int(preview_state.get("gen", 0))
         preview_state["play_prime_gen"] = prime_gen
         preview_state["play_prime_ready"] = False
@@ -12700,7 +12828,7 @@ def run_app() -> None:
         if preview_state.get("play_mode") == "scrub":
             _update_playback_preview_frame(content, timeline_us)
             _refresh_playback_subtitles_throttled(timeline_us)
-            _maybe_warm_scrub_strip(build_preview_plan(content, timeline_us))
+            _maybe_warm_scrub_strip(build_scrub_preview_plan(content, timeline_us))
 
         if _preview_is_playing():
             preview_state["play_after_id"] = root.after(tick_ms, _preview_play_tick)
@@ -12716,7 +12844,7 @@ def run_app() -> None:
             return False
         if abs(int(us) - int(pause_us)) > SCRUB_THUMB_STEP_US // 4:
             return False
-        plan = build_preview_plan(content, us)
+        plan = build_scrub_preview_plan(content, us)
         return bool(plan.videos or _playback_audio_hits(content, us))
 
     def _can_direct_start_playback(content: Dict[str, Any], us: int) -> bool:
@@ -12728,7 +12856,7 @@ def run_app() -> None:
             return False
         if abs(int(display_us) - int(us)) > SCRUB_THUMB_STEP_US:
             return False
-        plan = build_preview_plan(content, us)
+        plan = build_scrub_preview_plan(content, us)
         return bool(plan.videos or _playback_audio_hits(content, us))
 
     def _try_sync_scrub_play_start() -> None:
@@ -12856,9 +12984,14 @@ def run_app() -> None:
             _ensure_scrub_preview_audio(content, us, force=True, resume=True)
         _preview_play_tick()
 
-    def _begin_draft_preview_mp4_play(content: Dict[str, Any], us: int) -> None:
-        """预览目录存在与草稿同名的 MP4 时：ffplay 单路音画，从时间轴当前位置 seek 播放。"""
-        mp4 = _draft_preview_mp4_path()
+    def _begin_draft_preview_mp4_play(
+        content: Dict[str, Any],
+        us: int,
+        *,
+        mp4_path: Optional[str] = None,
+    ) -> None:
+        """预览 MP4（本地目录或云端缓存）：ffplay 单路音画，从时间轴当前位置 seek 播放。"""
+        mp4 = (mp4_path or "").strip() or _draft_preview_mp4_path()
         if not mp4:
             return
         us = int(_current_playhead_us())
@@ -12967,41 +13100,48 @@ def run_app() -> None:
             _schedule_play_sync_poll()
             _preview_play_tick()
 
-    def _toggle_preview_playback() -> None:
-        if _preview_is_playing():
-            _pause_preview_playback()
-            return
-        if preview_state.get("play_mode") == "library":
-            path = preview_state.get("library_preview_path")
-            if not path or not os.path.isfile(str(path)):
-                return
-            pause_us = preview_state.get("play_pause_timeline_us")
-            us = int(pause_us if pause_us is not None else 0)
-            preview_state["playing"] = True
-            preview_state["play_start_us"] = us
-            preview_state["play_arm_us"] = us
-            preview_state["play_wall_t0"] = None
-            preview_state["play_prime_ready"] = True
-            preview_state["play_pause_timeline_us"] = None
-            preview_state["play_audio_output_ready"] = False
-            preview_state["merge_ffplay_start_sec"] = None
-            _preview_play_btn_set("⏸")
-            if not _start_merged_preview_ffplay(start_sec=max(0.0, us / 1_000_000.0), force=True):
-                _stop_preview_playback()
-                _preview_show_message("无法预览（请安装 ffplay）")
-                return
-            _schedule_playback_arm(us)
-            _preview_play_tick()
-            return
-        content = timeline_content_cache[0]
+    def _play_draft_preview_mp4(
+        content: Dict[str, Any],
+        us: int,
+        *,
+        mp4_path: Optional[str] = None,
+    ) -> None:
+        us = int(_current_playhead_us())
+        _sync_playhead_for_playback(us)
+        _stop_playback_audio()
+        preview_state["playing"] = True
+        _preview_play_btn_set("⏸")
+        preview_state["draft_preview_mp4"] = True
+        _clear_playback_session()
+        old_worker = preview_state.get("play_video_worker")
+        if isinstance(old_worker, (_PlaybackVideoWorker, _MergedPreviewVideoWorker)):
+            old_worker.close()
+        preview_state["play_video_worker"] = None
+        preview_state["play_video_worker_started"] = False
+        preview_state["play_wall_t0"] = None
+        preview_state["play_start_us"] = us
+        preview_state["play_audio_output_ready"] = False
+        _begin_draft_preview_mp4_play(content, us, mp4_path=mp4_path)
+
+    def _continue_draft_timeline_preview_playback(
+        content: Optional[Dict[str, Any]],
+        us: int,
+        *,
+        cloud_unavailable: bool = False,
+    ) -> None:
+        """草稿时间轴预览（ffmpeg 合成 / 拖动预览链路）。"""
         if not isinstance(content, dict):
+            _preview_show_message("（无法预览：草稿未加载或已加密）")
             return
-        us = _current_playhead_us()
+        us = int(_current_playhead_us())
         draft_mp4 = _draft_preview_mp4_path()
-        plan = build_preview_plan(content, us)
+        plan = build_scrub_preview_plan(content, us)
         audio_hits = _playback_audio_hits(content, us)
         if not draft_mp4 and not plan.videos and not audio_hits:
-            _preview_show_message("（当前时间无视频/音频）")
+            if cloud_unavailable:
+                _preview_show_message("（云端暂无预览，且当前时间无视频/音频）")
+            else:
+                _preview_show_message("（当前时间无视频/音频）")
             return
         total_us = _playback_end_us(content)
         if us >= total_us:
@@ -13018,18 +13158,14 @@ def run_app() -> None:
         _preview_play_btn_set("⏸")
 
         if draft_mp4:
-            preview_state["draft_preview_mp4"] = True
-            _clear_playback_session()
-            old_worker = preview_state.get("play_video_worker")
-            if isinstance(old_worker, (_PlaybackVideoWorker, _MergedPreviewVideoWorker)):
-                old_worker.close()
-            preview_state["play_video_worker"] = None
-            preview_state["play_video_worker_started"] = False
-            preview_state["play_wall_t0"] = None
-            preview_state["play_start_us"] = us
-            preview_state["play_audio_output_ready"] = False
-            _begin_draft_preview_mp4_play(content, us)
+            _play_draft_preview_mp4(content, us)
             return
+
+        if cloud_unavailable:
+            try:
+                preview_info_var.set("云端暂无预览 · 使用时间轴预览")
+            except Exception:
+                pass
 
         video_ready = _can_direct_start_playback(content, us) or (
             _can_resume_playback(content, us) and not seeked_since_pause
@@ -13066,6 +13202,64 @@ def run_app() -> None:
             _cancel_warm_idle_timer()
 
         _begin_scrub_play(content, us, video_ready=video_ready, resume=resume)
+
+    def _toggle_preview_playback() -> None:
+        if _preview_is_playing():
+            _pause_preview_playback()
+            return
+        if left_tab_var.get() == "templates":
+            tpl_node = selected_template_node[0]
+            if tpl_node is not None and getattr(tpl_node, "has_preview", False):
+                lib_path = preview_state.get("library_preview_path")
+                if not lib_path or not os.path.isfile(str(lib_path)):
+                    _begin_hot_template_cloud_preview(tpl_node, autoplay=True)
+                    return
+        if preview_state.get("play_mode") == "library":
+            path = preview_state.get("library_preview_path")
+            if not path or not os.path.isfile(str(path)):
+                return
+            pause_us = preview_state.get("play_pause_timeline_us")
+            us = int(pause_us if pause_us is not None else 0)
+            preview_state["playing"] = True
+            preview_state["play_start_us"] = us
+            preview_state["play_arm_us"] = us
+            preview_state["play_wall_t0"] = None
+            preview_state["play_prime_ready"] = True
+            preview_state["play_pause_timeline_us"] = None
+            preview_state["play_audio_output_ready"] = False
+            preview_state["merge_ffplay_start_sec"] = None
+            _preview_play_btn_set("⏸")
+            if not _start_merged_preview_ffplay(start_sec=max(0.0, us / 1_000_000.0), force=True):
+                _stop_preview_playback()
+                _preview_show_message("无法预览（请安装 ffplay）")
+                return
+            _schedule_playback_arm(us)
+            _preview_play_tick()
+            return
+        content = timeline_content_cache[0]
+        us = _current_playhead_us()
+        folder_name = (replace_state.get("timeline_draft_name") or selected_name or "").strip()
+        draft_mp4 = _draft_preview_mp4_path()
+        if not draft_mp4 and folder_name and left_tab_var.get() == "drafts":
+            abs_url = _cloud_preview_abs_url_for_draft(folder_name)
+            if abs_url:
+                empty_content: Dict[str, Any] = content if isinstance(content, dict) else {}
+                _fetch_cloud_preview_mp4(
+                    abs_url,
+                    cache_key=f"name:{folder_name}",
+                    token_key="cloud_preview_draft_name",
+                    token_value=folder_name,
+                    status_label=f"草稿 · {folder_name}",
+                    on_ready=lambda path, c=empty_content, u=us: _play_draft_preview_mp4(
+                        c, u, mp4_path=path
+                    ),
+                    on_fail=lambda _msg, c=empty_content, u=us: _continue_draft_timeline_preview_playback(
+                        c, u, cloud_unavailable=True
+                    ),
+                )
+                return
+        _continue_draft_timeline_preview_playback(content, us)
+        return
 
     preview_play_btn = ctk.CTkButton(
         preview_ctrl,
@@ -13190,6 +13384,163 @@ def run_app() -> None:
 
     _library_media_preview_handlers["start"] = _begin_library_media_preview
     _library_media_preview_handlers["stop"] = _stop_preview_playback
+
+    def _find_hot_template_node_by_name(name: str) -> Any:
+        target = (name or "").strip()
+        if not target:
+            return None
+
+        def _walk(nodes: List[Any]) -> Any:
+            for node in nodes:
+                if getattr(node, "is_template", False) and (node.name or "").strip() == target:
+                    return node
+                if getattr(node, "is_folder", False):
+                    hit = _walk(list(node.children or ()))
+                    if hit is not None:
+                        return hit
+            return None
+
+        return _walk(template_tree_roots)
+
+    def _cloud_preview_abs_url_for_draft(folder_name: str) -> str:
+        from shared.hot_template_client import (
+            build_template_preview_abs_url,
+            build_template_preview_url_by_name,
+        )
+
+        if not template_client or not auth_client or not auth_client.user_id:
+            return ""
+        node = _find_hot_template_node_by_name(folder_name)
+        if node is not None and getattr(node, "has_preview", False) and getattr(node, "preview_url", ""):
+            return build_template_preview_abs_url(template_client.base_url, str(node.preview_url))
+        return build_template_preview_url_by_name(
+            template_client.base_url,
+            auth_client.user_id,
+            folder_name,
+        )
+
+    def _fetch_cloud_preview_mp4(
+        abs_url: str,
+        *,
+        cache_key: str,
+        token_key: str,
+        token_value: str,
+        status_label: str,
+        on_ready: Callable[[str], None],
+        on_fail: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        from shared.hot_template_client import fetch_template_preview_mp4, template_preview_cache_path
+
+        if preview_state.get("cloud_preview_fetch_busy"):
+            return
+        if not abs_url:
+            msg = "暂无预览"
+            _preview_show_message(f"（{msg}）")
+            if on_fail:
+                on_fail(msg)
+            return
+        cache_path = str(template_preview_cache_path(cache_key))
+        load_gen = int(preview_state.get("cloud_preview_fetch_gen") or 0) + 1
+        preview_state["cloud_preview_fetch_gen"] = load_gen
+        preview_state["cloud_preview_fetch_busy"] = True
+        preview_state[token_key] = token_value
+        _preview_show_message("（正在拉取云端预览…）")
+        try:
+            preview_info_var.set(f"{status_label} · 拉取预览中…")
+        except Exception:
+            pass
+
+        def _bg() -> None:
+            ok = False
+            err: Optional[str] = None
+            if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 1024:
+                ok = True
+            else:
+                ok, err = fetch_template_preview_mp4(abs_url, cache_path)
+                if not ok and err == "暂无预览" and os.path.isfile(cache_path):
+                    try:
+                        os.remove(cache_path)
+                    except OSError:
+                        pass
+
+            def _ui() -> None:
+                preview_state["cloud_preview_fetch_busy"] = False
+                if load_gen != int(preview_state.get("cloud_preview_fetch_gen") or 0):
+                    return
+                if preview_state.get(token_key) != token_value:
+                    return
+                if not ok:
+                    msg = err or "暂无预览"
+                    if on_fail:
+                        try:
+                            on_fail(msg)
+                        except Exception:
+                            _preview_show_message(f"（{msg}）")
+                    else:
+                        _preview_show_message(f"（{msg}）")
+                        try:
+                            preview_info_var.set(f"{status_label} · {msg}")
+                        except Exception:
+                            pass
+                    return
+                try:
+                    on_ready(cache_path)
+                except Exception:
+                    _preview_show_message("（预览播放失败）")
+
+            try:
+                root.after(0, _ui)
+            except tk.TclError:
+                preview_state["cloud_preview_fetch_busy"] = False
+
+        threading.Thread(target=_bg, daemon=True, name="cloud-preview-fetch").start()
+
+    def _begin_hot_template_cloud_preview(node: Any, *, autoplay: bool = False) -> None:
+        """爆款模板：从云端 preview_url 拉取 MP4 流，在右侧播放器预览（不读本地预览目录）。"""
+        from shared.hot_template_client import build_template_preview_abs_url
+
+        if not getattr(node, "is_template", False):
+            return
+        if not getattr(node, "has_preview", False) or not getattr(node, "preview_url", ""):
+            _preview_show_message("（暂无预览）")
+            try:
+                preview_info_var.set("爆款模板 · 暂无预览")
+            except Exception:
+                pass
+            preview_time_var.set("00:00:00:00 / 00:00:00:00")
+            return
+        if not template_client:
+            _preview_show_message("（模板客户端未加载）")
+            return
+        abs_url = build_template_preview_abs_url(template_client.base_url, str(node.preview_url))
+        if not abs_url:
+            _preview_show_message("（暂无预览）")
+            return
+        if not autoplay:
+            _stop_preview_playback()
+            refresh_timeline_panel_data(None)
+
+        def _on_ready(path: str) -> None:
+            _begin_library_media_preview(path)
+            try:
+                preview_info_var.set(f"爆款模板 · {node.name} · 空格播放")
+            except Exception:
+                pass
+            if autoplay:
+                try:
+                    root.after(30, _toggle_preview_playback)
+                except tk.TclError:
+                    pass
+
+        preview_state["template_preview_node_id"] = str(node.template_id)
+        _fetch_cloud_preview_mp4(
+            abs_url,
+            cache_key=str(node.template_id),
+            token_key="template_preview_node_id",
+            token_value=str(node.template_id),
+            status_label=f"爆款模板 · {node.name}",
+            on_ready=_on_ready,
+        )
 
     def _preview_focus_in_text_input() -> bool:
         try:
@@ -13617,7 +13968,7 @@ def run_app() -> None:
                     and int(latest) != us
                     and isinstance(timeline_content_cache[0], dict)
                 ):
-                    p2 = build_preview_plan(timeline_content_cache[0], int(latest))
+                    p2 = build_scrub_preview_plan(timeline_content_cache[0], int(latest))
                     if not _try_instant_scrub_preview(p2):
                         _run_fast_preview_fetch(p2, int(latest))
 
@@ -13643,7 +13994,7 @@ def run_app() -> None:
         content = timeline_content_cache[0]
         if not isinstance(content, dict):
             return
-        plan = build_preview_plan(content, int(us))
+        plan = build_scrub_preview_plan(content, int(us))
         if not plan.videos:
             return
         if _try_instant_scrub_preview(plan):
@@ -13688,7 +14039,7 @@ def run_app() -> None:
             preview_info_var.set("")
             return
 
-        plan = build_preview_plan(content, us)
+        plan = build_scrub_preview_plan(content, us)
         if _preview_is_playing():
             _preview_sync_time_only(us)
             return
@@ -15911,6 +16262,29 @@ def run_app() -> None:
         _draft_list_scan_cache["root"] = ""
         _draft_list_scan_cache["payload"] = None
 
+    def highlight_template_selection() -> None:
+        for b in template_buttons:
+            tid = getattr(b, "_template_id", None)
+            kn = getattr(b, "_row_kind", "leaf")
+            base_fg = getattr(b, "_base_fg", _DRAFT_LIST_COLORS.get(kn, _DRAFT_LIST_COLORS["leaf"])[0])
+            sel = selected_template_node[0] is not None and tid == getattr(
+                selected_template_node[0], "template_id", None
+            )
+            b._selected = bool(sel)  # type: ignore[attr-defined]
+            b.configure(
+                fg_color=_DRAFT_LIST_COLORS["selected"][0] if sel else base_fg
+            )
+
+    def select_template_node(node: Any) -> None:
+        nonlocal selected_template_id
+        if not getattr(node, "is_template", False):
+            return
+        selected_template_node[0] = node
+        selected_template_id = node.template_id
+        highlight_template_selection()
+        show_template_summary(node)
+        _begin_hot_template_cloud_preview(node)
+
     def render_hot_template_tree(
         nodes: List[Any],
         *,
@@ -15984,16 +16358,22 @@ def run_app() -> None:
             elif node.is_template:
                 pad_l = 12 + max(0, indent)
                 wrap = _draft_list_item_wraplength(indent=indent)
-                subtitle = node.updated_at or ""
+                subtitle_parts: List[str] = []
+                if node.updated_at:
+                    subtitle_parts.append(node.updated_at)
+                if node.has_preview:
+                    subtitle_parts.append("可预览")
+                subtitle = " · ".join(subtitle_parts)
                 box = _make_draft_list_click_box(
                     container,
                     node.name,
                     row_kind="template",
-                    on_click=lambda n=node: download_template_node(n),
+                    on_click=lambda n=node: select_template_node(n),
                     wraplength=wrap,
                     subtitle=subtitle,
                 )
                 box._wrap_indent = indent  # type: ignore[attr-defined]
+                box._template_id = node.template_id  # type: ignore[attr-defined]
                 box.pack(fill="x", pady=2, padx=(pad_l, 4))
                 template_buttons.append(box)
 
@@ -16001,6 +16381,9 @@ def run_app() -> None:
         nonlocal selected_template_id
         from tkinter import messagebox
 
+        if node is None:
+            messagebox.showinfo("下载模板", "请先在左侧列表中选择一个模板。")
+            return
         if template_download_busy["on"]:
             return
         if not getattr(node, "is_template", False) or getattr(node, "node_type", "") != "template":
